@@ -3,6 +3,8 @@
 #include <walnutpie/warmup_heuristics.hpp>
 
 #include <CLI/CLI.hpp>
+#include <fstream>
+#include <vector>
 #include <Eigen/Dense>
 
 #include <chrono>
@@ -237,6 +239,9 @@ int main(int argc, char** argv) {
   double mass_init_clamp = 0.0;
   bool step_init_heuristic = false;
   bool metric_drift_guard = false;
+  double mass_combine_power = 0.0;
+  double metric_collapse_reset = 0.0;
+  double metric_stall_reset = 0.0;
   double da_gamma = default_warmup.da_gamma();
   double da_t0 = default_warmup.da_t0();
   double da_kappa = default_warmup.da_kappa();
@@ -249,6 +254,7 @@ int main(int argc, char** argv) {
 
   double init = 2.0;
   double step_size_init = 1.0;
+  std::string init_file = "";
 
   std::string lib;
   std::string data;
@@ -292,6 +298,11 @@ int main(int argc, char** argv) {
                    "Maximum error allowed in joint densities")
         ->default_val(max_hamiltonian_error)
         ->check(CLI::PositiveNumber);
+
+    app.add_option("--init-file", init_file,
+                   "Text file with the unconstrained initial position, one "
+                   "coordinate per line (e.g. a Pathfinder draw)")
+        ->default_val(init_file);
 
     app.add_option("--init", init,
                    "Range [-init,init] for uniform parameter initial values")
@@ -361,6 +372,24 @@ int main(int argc, char** argv) {
                    "Clamp gradient-seeded initial masses to [1/clamp, clamp] "
                    "(e.g. 100; 0 = off)")
         ->default_val(mass_init_clamp);
+
+    app.add_option("--metric-stall-reset", metric_stall_reset,
+                   "Reset mass estimators to seeds when max coordinate "
+                   "movement over 100 warmup iterations is below this "
+                   "(0 = off; e.g. 1e-3)")
+        ->default_val(metric_stall_reset);
+
+    app.add_option("--metric-collapse-reset", metric_collapse_reset,
+                   "Reset mass estimators to seeds when observed draw "
+                   "variance falls below this fraction of the metric-implied "
+                   "variance (0 = off; e.g. 0.01)")
+        ->default_val(metric_collapse_reset);
+
+    app.add_option("--mass-combine-power", mass_combine_power,
+                   "Power-mean order for combining Var_draw and 1/Var_score "
+                   "into the mass estimate (0 = geometric [default], 1 = "
+                   "arithmetic, >=64 = max; higher resists collapse)")
+        ->default_val(mass_combine_power);
 
     app.add_flag("--metric-drift-guard", metric_drift_guard,
                  "Aggregate draw/score variances with their seeds in log "
@@ -438,6 +467,9 @@ int main(int argc, char** argv) {
           .mass_shrink_kappa(mass_shrink_kappa)
           .mass_var_floor(mass_var_floor)
           .metric_drift_guard(metric_drift_guard)
+          .mass_combine_power(mass_combine_power)
+          .metric_collapse_reset(metric_collapse_reset)
+          .metric_stall_reset(metric_stall_reset)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
@@ -450,10 +482,33 @@ int main(int argc, char** argv) {
 
   unique_bs_rng rng = model.make_rng(seed);
 
+  auto init_positions = [&]() {
+    if (!init_file.empty()) {
+      // plain text: one unconstrained coordinate per line
+      std::ifstream in(init_file);
+      if (!in) {
+        throw std::invalid_argument("cannot open --init-file: " + init_file);
+      }
+      std::vector<double> vals;
+      double v;
+      while (in >> v) {
+        vals.push_back(v);
+      }
+      if (vals.size() != model.unconstrained_dimensions()) {
+        throw std::invalid_argument(
+            "--init-file dimension mismatch: file has " +
+            std::to_string(vals.size()) + ", model has " +
+            std::to_string(model.unconstrained_dimensions()));
+      }
+      return Eigen::VectorXd(Eigen::VectorXd::Map(vals.data(), vals.size()));
+    }
+    return model.initialize(nullptr, rng, init);
+  }();
+
   auto init_cfg =
       walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
           .step_sizes(step_size_init)
-          .positions(model.initialize(nullptr, rng, init));
+          .positions(init_positions);
 
   auto res = [&]() {
     using walnutpie::detail::Adam;

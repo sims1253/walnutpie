@@ -86,6 +86,36 @@ class MassEstimator {
                                           static_cast<double>(iteration));
     draw_var_estimator_.discount_observe(discount_factor, theta);
     score_var_estimator_.discount_observe(discount_factor, grad);
+    if (warmup_cfg_.metric_stall_reset() > 0) {
+      // Stall detector on the raw draws (metric-independent): if the chain
+      // has barely moved over the last `stall_window` observations, the mass
+      // estimate is being fed by a pinned chain and cannot recover (tiny
+      // metric -> tiny moves -> tiny Var_draw -> tinier metric). Break the
+      // loop by resetting both accumulators to their seeds.
+      if (stall_reference_.size() == 0) {
+        stall_reference_ = theta;
+        stall_countdown_ = warmup_cfg_.metric_stall_window();
+      } else if (--stall_countdown_ == 0) {
+        const double movement =
+            (theta - stall_reference_).cwiseAbs().maxCoeff();
+        if (movement < warmup_cfg_.metric_stall_reset()) {
+          reset_to_seeds();
+        }
+        stall_reference_ = theta;
+        stall_countdown_ = warmup_cfg_.metric_stall_window();
+      }
+    }
+  }
+
+  /**
+   * @brief Reset both moment accumulators to their initialization seeds.
+   */
+  void reset_to_seeds() {
+    Eigen::VectorXd zero = Eigen::VectorXd::Zero(init_draw_var_.size());
+    score_var_estimator_ = OnlineMoments(
+        warmup_cfg_.mass_init_count(), zero, init_score_var_);
+    draw_var_estimator_ = OnlineMoments(
+        warmup_cfg_.mass_init_count(), zero, init_draw_var_);
   }
 
   /**
@@ -143,7 +173,26 @@ class MassEstimator {
       score_var = score_var.cwiseMax(Eigen::VectorXd::Constant(
           score_var.size(), floor_v));
     }
-    return (draw_var.array() / score_var.array()).sqrt().matrix();
+    // Combine the two reciprocal-scale estimates: estimate A = Var_draw
+    // (posterior scale seen by the chain), estimate B = 1 / Var_score
+    // (Fisher-information scale from gradients). The classical geometric
+    // mean (power p -> 0) makes a collapsed A drag the metric to zero even
+    // when B is healthy; a higher-power mean lets the healthy estimate
+    // rescue the collapsed one (p = 1 arithmetic, p -> infinity max).
+    const double pcomb = warmup_cfg_.mass_combine_power();
+    Eigen::VectorXd est_a = draw_var;
+    Eigen::VectorXd est_b = score_var.array().inverse().matrix();
+    if (pcomb <= 0.0) {
+      return (est_a.array() * est_b.array()).sqrt().matrix();  // geometric
+    }
+    if (pcomb >= 64.0) {  // effectively max
+      return est_a.cwiseMax(est_b);
+    }
+    Eigen::VectorXd mp = ((est_a.array().pow(pcomb) +
+                           est_b.array().pow(pcomb)) * 0.5)
+                              .pow(1.0 / pcomb)
+                              .matrix();
+    return mp;
   }
 
  private:
@@ -159,6 +208,12 @@ class MassEstimator {
   /** Initial variance seeds (regularization/blend targets). */
   Eigen::VectorXd init_score_var_;
   Eigen::VectorXd init_draw_var_;
+
+  /** Last reference position for the stall detector. */
+  Eigen::VectorXd stall_reference_;
+
+  /** Iterations until the next stall check. */
+  std::size_t stall_countdown_ = 0;
 };
 
 /**

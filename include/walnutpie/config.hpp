@@ -631,6 +631,14 @@ class WarmupConfig {
 
   bool metric_drift_guard() const { return metric_drift_guard_; }
 
+  double mass_combine_power() const { return mass_combine_power_; }
+
+  double metric_collapse_reset() const { return metric_collapse_reset_; }
+
+  double metric_stall_reset() const { return metric_stall_reset_; }
+
+  std::size_t metric_stall_window() const { return metric_stall_window_; }
+
   /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
@@ -673,6 +681,10 @@ class WarmupConfig {
   double mass_shrink_kappa_ = 0.0;
   double mass_var_floor_ = 0.0;
   bool metric_drift_guard_ = false;
+  double mass_combine_power_ = 0.0;
+  double metric_collapse_reset_ = 0.0;
+  double metric_stall_reset_ = 0.0;
+  std::size_t metric_stall_window_ = 100;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
 };
@@ -877,6 +889,35 @@ class WarmupConfigBuilder {
       throw std::invalid_argument("mass_shrink_kappa must be >= 0 (0 = off)");
     }
     cfg_.mass_shrink_kappa_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_stall_reset(double v,
+                                          std::size_t window = 100) {
+    if (v < 0) {
+      throw std::invalid_argument(
+          "metric_stall_reset must be >= 0 (0 = off; e.g. 1e-3)");
+    }
+    cfg_.metric_stall_reset_ = v;
+    cfg_.metric_stall_window_ = window;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_collapse_reset(double v) {
+    if (v < 0 || v >= 1) {
+      throw std::invalid_argument(
+          "metric_collapse_reset must be in [0, 1) (0 = off; e.g. 0.01)");
+    }
+    cfg_.metric_collapse_reset_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& mass_combine_power(double v) {
+    if (v < 0 || v > 1e3) {
+      throw std::invalid_argument(
+          "mass_combine_power must be in [0, 1000] (0 = geometric mean)");
+    }
+    cfg_.mass_combine_power_ = v;
     return *this;
   }
 
