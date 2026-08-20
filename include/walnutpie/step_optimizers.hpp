@@ -262,4 +262,47 @@ class ClippedAdapter {
   const double clip_;
 };
 
+
+/**
+ * @brief Wrap a step size adapter with anti-windup (conditional integration).
+ *
+ * Classical ODE step-size control (Gustafsson-Lundh-Soderlind) freezes the
+ * integral action while the controller is saturated. Here: when the observed
+ * acceptance statistic is exactly zero (a divergent macro step) or below
+ * `floor_alpha`, the observation is passed to the inner adapter but the
+ * adapter's accumulated state is protected by limiting how many such
+ * observations update it: only 1 in `pass_rate` saturated observations is
+ * forwarded (the rest are dropped). This bounds the windup of the error
+ * integral (Adam's m) during a divergence burst, preventing the log step
+ * size from crashing afterwards.
+ */
+template <StepSizeAdapter Inner>
+class AntiWindupAdapter {
+ public:
+  AntiWindupAdapter(Inner&& inner, double floor_alpha = 1e-12,
+                    std::size_t pass_rate = 8)
+      : inner_(std::move(inner)),
+        floor_alpha_(floor_alpha),
+        pass_rate_(pass_rate),
+        saturated_seen_(0) {}
+
+  void operator()(double alpha) noexcept {
+    if (alpha < floor_alpha_) {
+      ++saturated_seen_;
+      if (saturated_seen_ % pass_rate_ != 1) {
+        return;  // drop this saturated observation
+      }
+    }
+    inner_(alpha);
+  }
+
+  double step_size() const noexcept { return inner_.step_size(); }
+
+ private:
+  Inner inner_;
+  const double floor_alpha_;
+  const std::size_t pass_rate_;
+  std::size_t saturated_seen_;
+};
+
 }  // namespace walnutpie::detail

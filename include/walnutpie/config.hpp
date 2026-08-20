@@ -639,6 +639,18 @@ class WarmupConfig {
 
   std::size_t metric_stall_window() const { return metric_stall_window_; }
 
+  std::size_t anti_windup_pass_rate() const { return anti_windup_pass_rate_; }
+
+  std::size_t drift_iters() const { return drift_iters_; }
+
+  std::size_t metric_window() const { return metric_window_; }
+
+  double max_error_start() const { return max_error_start_; }
+
+  std::size_t max_error_schedule_iters() const {
+    return max_error_schedule_iters_;
+  }
+
   /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
@@ -685,6 +697,11 @@ class WarmupConfig {
   double metric_collapse_reset_ = 0.0;
   double metric_stall_reset_ = 0.0;
   std::size_t metric_stall_window_ = 100;
+  std::size_t anti_windup_pass_rate_ = 0;
+  std::size_t drift_iters_ = 0;
+  std::size_t metric_window_ = 0;
+  double max_error_start_ = 0.0;
+  std::size_t max_error_schedule_iters_ = 0;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
 };
@@ -889,6 +906,30 @@ class WarmupConfigBuilder {
       throw std::invalid_argument("mass_shrink_kappa must be >= 0 (0 = off)");
     }
     cfg_.mass_shrink_kappa_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_window(std::size_t v) {
+    cfg_.metric_window_ = v;  // 0 = off (exponential discounting only)
+    return *this;
+  }
+
+  WarmupConfigBuilder& drift_iters(std::size_t v) {
+    cfg_.drift_iters_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& max_error_schedule(double start, std::size_t iters) {
+    if (start < 0) {
+      throw std::invalid_argument("max_error_schedule start must be >= 0");
+    }
+    cfg_.max_error_start_ = start;
+    cfg_.max_error_schedule_iters_ = iters;
+    return *this;
+  }
+
+  WarmupConfigBuilder& anti_windup_pass_rate(std::size_t v) {
+    cfg_.anti_windup_pass_rate_ = v;  // 0 = off
     return *this;
   }
 

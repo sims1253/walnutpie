@@ -242,6 +242,11 @@ int main(int argc, char** argv) {
   double mass_combine_power = 0.0;
   double metric_collapse_reset = 0.0;
   double metric_stall_reset = 0.0;
+  std::size_t anti_windup = 0;
+  std::size_t drift_iters = 0;
+  std::size_t metric_window = 0;
+  double max_error_start = 0.0;
+  std::size_t max_error_schedule_iters = 0;
   double da_gamma = default_warmup.da_gamma();
   double da_t0 = default_warmup.da_t0();
   double da_kappa = default_warmup.da_kappa();
@@ -373,6 +378,34 @@ int main(int argc, char** argv) {
                    "(e.g. 100; 0 = off)")
         ->default_val(mass_init_clamp);
 
+    app.add_option("--metric-window", metric_window,
+                   "Memoryless metric windows: reset the draw/score moment "
+                   "accumulators every N warmup iterations (0 = off; "
+                   "Fisher-HMC 'chopping', arXiv:2603.18845)")
+        ->default_val(metric_window);
+
+    app.add_option("--drift-iters", drift_iters,
+                   "Drift-phase warmup: for the first N iterations, suspend "
+                   "the Hamiltonian-error cap and the mass estimation "
+                   "(identity metric) while the chain moves toward the "
+                   "typical set (0 = off)")
+        ->default_val(drift_iters);
+
+    app.add_option("--max-error-start", max_error_start,
+                   "Max-error schedule start: begin at this cap and decay to "
+                   "--max-error over --max-error-iters (0 = off; e.g. 100)")
+        ->default_val(max_error_start);
+
+    app.add_option("--max-error-iters", max_error_schedule_iters,
+                   "Iterations for the max-error schedule decay (0 = off)")
+        ->default_val(max_error_schedule_iters);
+
+    app.add_option("--anti-windup", anti_windup,
+                   "During acceptance-statistic saturation (alpha ~ 0), pass "
+                   "only 1 in N observations to the step optimizer (0 = off; "
+                   "e.g. 8)")
+        ->default_val(anti_windup);
+
     app.add_option("--metric-stall-reset", metric_stall_reset,
                    "Reset mass estimators to seeds when max coordinate "
                    "movement over 100 warmup iterations is below this "
@@ -470,6 +503,10 @@ int main(int argc, char** argv) {
           .mass_combine_power(mass_combine_power)
           .metric_collapse_reset(metric_collapse_reset)
           .metric_stall_reset(metric_stall_reset)
+          .anti_windup_pass_rate(anti_windup)
+          .drift_iters(drift_iters)
+          .max_error_schedule(max_error_start, max_error_schedule_iters)
+          .metric_window(metric_window)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
@@ -521,6 +558,13 @@ int main(int argc, char** argv) {
     auto run_base = [&](auto opt_tag) -> StanHandler {
       using Opt = typename decltype(opt_tag)::type;
       auto extra = std::make_pair(mass_init_clamp, step_init_heuristic);
+      if (anti_windup > 0) {
+        using AW = walnutpie::detail::ClippedAdapter<
+            walnutpie::detail::AntiWindupAdapter<Opt>>;
+        return run_walnuts<AW>(model, seed, init_cfg, num_warmup, num_draws,
+                               save_warmup, warmup_cfg, sample_cfg,
+                               mass_init_clamp, step_init_heuristic);
+      }
       if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,

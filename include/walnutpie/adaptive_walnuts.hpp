@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <cstddef>
 #include <functional>
 #include <random>
@@ -353,6 +354,16 @@ struct StepAdapterFactory<BatchedAdapter<Inner>> {
 };
 
 template <StepSizeAdapter Inner>
+struct StepAdapterFactory<AntiWindupAdapter<Inner>> {
+  static AntiWindupAdapter<Inner> make(const InitChainConfig& init_cfg,
+                                       const WarmupConfig& warmup_cfg) {
+    return AntiWindupAdapter<Inner>(
+        StepAdapterFactory<Inner>::make(init_cfg, warmup_cfg),
+        1e-12, warmup_cfg.anti_windup_pass_rate());
+  }
+};
+
+template <StepSizeAdapter Inner>
 struct StepAdapterFactory<ClippedAdapter<Inner>> {
   static ClippedAdapter<Inner> make(const InitChainConfig& init_cfg,
                                     const WarmupConfig& warmup_cfg) {
@@ -438,20 +449,83 @@ class AdaptiveWalnuts {
    * warmup, call `sampler()` to return a sampler that fixes the
    * tuning parameters and provides a proper Markov chain.
    */
+  /**
+   * @brief Effective Hamiltonian-error cap for the current iteration.
+   *
+   * With a max-error schedule configured, interpolates geometrically (in log
+   * space) from `max_error_start` down to the configured cap over the first
+   * `max_error_schedule_iters` iterations; afterwards returns the configured
+   * cap. Option (c) for robustness to distant initializations: the loose
+   * early cap lets trajectories through while the chain drifts toward the
+   * typical set, then tightens to the intended error control.
+   */
+  double effective_max_error() const {
+    const double base = sampling_cfg_.get().max_hamiltonian_error();
+    const double start = warmup_cfg_.get().max_error_start();
+    const std::size_t iters = warmup_cfg_.get().max_error_schedule_iters();
+    if (!(start > base) || iters == 0 || iteration_ >= iters) {
+      return base;
+    }
+    const double frac =
+        static_cast<double>(iteration_) / static_cast<double>(iters);
+    return std::exp(std::log(start) +
+                    frac * (std::log(base) - std::log(start)));
+  }
+
   void operator()() {
-    Eigen::VectorXd inv_mass = mass_estimator_.inv_mass_estimate();
+    const bool drifting = iteration_ < warmup_cfg_.get().drift_iters();
+    Eigen::VectorXd inv_mass =
+        drifting ? Eigen::VectorXd::Ones(theta_.size())
+                 : mass_estimator_.inv_mass_estimate();
     Eigen::VectorXd chol_mass = inv_mass.array().inverse().sqrt().matrix();
     Eigen::VectorXd grad_select;
     double logp_select;
     std::size_t depth;
-    theta_ =
-        transition_w(rand_, logp_grad_, inv_mass, chol_mass, opt_.step_size(),
-                     sampling_cfg_.get().max_trajectory_doublings(),
-                     sampling_cfg_.get().max_step_halvings(),
-                     min_micro_estimator_.min_micro_steps(),
-                     sampling_cfg_.get().max_hamiltonian_error(),
-                     std::move(theta_), depth, grad_select, logp_select, opt_);
-    mass_estimator_.observe(theta_, grad_select, iteration_);
+    // During the drift phase the error cap is suspended entirely (option (b)):
+    // a distant initialization cannot satisfy any tight cap, and rejecting
+    // every macro step pins the chain at its starting point.
+    const double max_err =
+        drifting ? std::numeric_limits<double>::infinity()
+                 : effective_max_error();
+    // During drift the acceptance statistics are meaningless (huge energy
+    // errors by construction), so the step adapter is not updated either:
+    // WALNUTS' within-orbit dyadic step adaptation already selects viable
+    // micro steps, and feeding the adapter saturated alphas drives the macro
+    // step toward zero and freezes the chain when the drift phase ends.
+    detail::NoOpStepSizeAdapter drift_noop;
+    if (drifting) {
+      theta_ = transition_w(rand_, logp_grad_, inv_mass, chol_mass,
+                            opt_.step_size(),
+                            sampling_cfg_.get().max_trajectory_doublings(),
+                            sampling_cfg_.get().max_step_halvings(),
+                            min_micro_estimator_.min_micro_steps(), max_err,
+                            std::move(theta_), depth, grad_select,
+                            logp_select, drift_noop);
+    } else {
+      theta_ = transition_w(rand_, logp_grad_, inv_mass, chol_mass,
+                            opt_.step_size(),
+                            sampling_cfg_.get().max_trajectory_doublings(),
+                            sampling_cfg_.get().max_step_halvings(),
+                            min_micro_estimator_.min_micro_steps(), max_err,
+                            std::move(theta_), depth, grad_select,
+                            logp_select, opt_);
+    }
+    if (!drifting) {
+      // Suspend metric estimation during drift: the draws observed while the
+      // chain is pinned/throttled poison the variance estimates (the
+      // self-locking failure mode documented in the init-robustness notes).
+      mass_estimator_.observe(theta_, grad_select, iteration_);
+      // Memoryless windows ("chopping", Fisher-HMC discipline,
+      // arXiv:2603.18845): at each window boundary, discard the accumulated
+      // history entirely rather than exponentially discounting it forward.
+      // Stale early draws are noise, not signal; the metric is rebuilt from
+      // post-drift samples only.
+      const std::size_t window = warmup_cfg_.get().metric_window();
+      if (window > 0 && iteration_ > 0 && (iteration_ + 1) % window == 0 &&
+          iteration_ + 1 < warmup_cfg_.get().max_iter()) {
+        mass_estimator_.reset_to_seeds();
+      }
+    }
     min_micro_estimator_.observe(1 << depth);
     handler_.get().on_warmup(theta_, logp_select, step_size(), inv_mass);
     ++iteration_;
