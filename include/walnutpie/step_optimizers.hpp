@@ -20,8 +20,10 @@ namespace walnutpie::detail {
 class DualAveraging {
  public:
   DualAveraging(double step_size_init, double accept_rate_target,
-                double gamma, double t0, double kappa)
-      : mu_(std::log(10.0 * step_size_init)),
+                double gamma, double t0, double kappa,
+                bool use_average = false)
+      : use_average_(use_average),
+        mu_(std::log(10.0 * step_size_init)),
         x_(0.0),
         x_bar_(0.0),
         h_bar_(0.0),
@@ -40,11 +42,14 @@ class DualAveraging {
     x_bar_ = w * x_ + (1.0 - w) * x_bar_;
   }
 
-  double step_size() const noexcept { return std::exp(x_); }
+  double step_size() const noexcept {
+    return std::exp(use_average_ ? x_bar_ : x_);
+  }
 
   double step_size_bar() const noexcept { return std::exp(x_bar_); }
 
  private:
+  bool use_average_;
   double mu_;
   double x_;
   double x_bar_;
@@ -227,6 +232,34 @@ class BatchedAdapter {
   const std::size_t stride_;
   std::size_t count_;
   double alpha_sum_;
+};
+
+
+/**
+ * @brief Wrap a step size adapter, clipping the acceptance-statistic
+ * gradient signal.
+ *
+ * A single near-zero acceptance statistic produces a large gradient
+ * (target - alpha up to the target itself) that can crash the log step
+ * size; clipping the observed statistic to [1 - c, 1] bounds that impulse.
+ * (Equivalent to clipping the gradient to [-c, c].)
+ */
+template <StepSizeAdapter Inner>
+class ClippedAdapter {
+ public:
+  ClippedAdapter(Inner&& inner, double clip)
+      : inner_(std::move(inner)), clip_(clip) {}
+
+  void operator()(double alpha) noexcept {
+    const double floored = std::max(alpha, 1.0 - clip_);
+    inner_(floored);
+  }
+
+  double step_size() const noexcept { return inner_.step_size(); }
+
+ private:
+  Inner inner_;
+  const double clip_;
 };
 
 }  // namespace walnutpie::detail

@@ -199,7 +199,8 @@ struct StepAdapterFactory<DualAveraging> {
     return DualAveraging(init_cfg.step_size(),
                          warmup_cfg.step_accept_rate_target(),
                          warmup_cfg.da_gamma(), warmup_cfg.da_t0(),
-                         warmup_cfg.da_kappa());
+                         warmup_cfg.da_kappa(),
+                         warmup_cfg.da_freeze_average());
   }
 };
 
@@ -237,6 +238,26 @@ struct StepAdapterFactory<BatchedAdapter<Inner>> {
     return BatchedAdapter<Inner>(
         StepAdapterFactory<Inner>::make(init_cfg, warmup_cfg),
         warmup_cfg.step_opt_batch_stride());
+  }
+};
+
+template <StepSizeAdapter Inner>
+struct StepAdapterFactory<ClippedAdapter<Inner>> {
+  static ClippedAdapter<Inner> make(const InitChainConfig& init_cfg,
+                                    const WarmupConfig& warmup_cfg) {
+    return ClippedAdapter<Inner>(
+        StepAdapterFactory<Inner>::make(init_cfg, warmup_cfg),
+        warmup_cfg.step_grad_clip());
+  }
+};
+
+template <StepSizeAdapter Inner>
+struct StepAdapterFactory<ClippedAdapter<BatchedAdapter<Inner>>> {
+  static ClippedAdapter<BatchedAdapter<Inner>> make(
+      const InitChainConfig& init_cfg, const WarmupConfig& warmup_cfg) {
+    return ClippedAdapter<BatchedAdapter<Inner>>(
+        StepAdapterFactory<BatchedAdapter<Inner>>::make(init_cfg, warmup_cfg),
+        warmup_cfg.step_grad_clip());
   }
 };
 

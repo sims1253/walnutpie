@@ -614,6 +614,10 @@ class WarmupConfig {
 
   std::size_t step_opt_batch_stride() const { return step_opt_batch_stride_; }
 
+  double step_grad_clip() const { return step_grad_clip_; }
+
+  bool da_freeze_average() const { return da_freeze_average_; }
+
   /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
@@ -651,6 +655,8 @@ class WarmupConfig {
   double da_kappa_ = 0.75;
   std::size_t slow_ema_warmup_ = 100;
   std::size_t step_opt_batch_stride_ = 1;
+  double step_grad_clip_ = 0.0;
+  bool da_freeze_average_ = false;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
 };
@@ -839,6 +845,19 @@ class WarmupConfigBuilder {
 
   WarmupConfigBuilder& slow_ema_warmup(std::size_t v) {
     cfg_.slow_ema_warmup_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& step_grad_clip(double v) {
+    if (v < 0) {
+      throw std::invalid_argument("step_grad_clip must be >= 0 (0 = off)");
+    }
+    cfg_.step_grad_clip_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& da_freeze_average(bool v) {
+    cfg_.da_freeze_average_ = v;
     return *this;
   }
 
