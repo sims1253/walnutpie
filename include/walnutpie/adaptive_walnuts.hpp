@@ -88,10 +88,32 @@ class MassEstimator {
    * @return The inverse mass matrix estimate.
    */
   Eigen::VectorXd inv_mass_estimate() const {
-    return (draw_var_estimator_.variance().array() /
-            score_var_estimator_.variance().array())
-        .sqrt()
-        .matrix();
+    Eigen::VectorXd draw_var = draw_var_estimator_.variance();
+    Eigen::VectorXd score_var = score_var_estimator_.variance();
+    const double kappa = warmup_cfg_.mass_shrink_kappa();
+    if (kappa > 0) {
+      // Regularized (shrinkage) estimates in the style of Stan's
+      // var_adaptation: var <- (n/(n+kappa)) var + (kappa/(n+kappa)) var_init,
+      // using the discounted weight as effective sample size.
+      const double n_draw = draw_var_estimator_.weight();
+      const double n_score = score_var_estimator_.weight();
+      const double w_draw = n_draw / (n_draw + kappa);
+      const double w_score = n_score / (n_score + kappa);
+      draw_var = (w_draw * draw_var.array() +
+                  (1 - w_draw) * draw_var_estimator_.initial_variance().array())
+                     .matrix();
+      score_var = (w_score * score_var.array() +
+                   (1 - w_score) * score_var_estimator_.initial_variance().array())
+                      .matrix();
+    }
+    const double floor_v = warmup_cfg_.mass_var_floor();
+    if (floor_v > 0) {
+      draw_var = draw_var.cwiseMax(Eigen::VectorXd::Constant(
+          draw_var.size(), floor_v));
+      score_var = score_var.cwiseMax(Eigen::VectorXd::Constant(
+          score_var.size(), floor_v));
+    }
+    return (draw_var.array() / score_var.array()).sqrt().matrix();
   }
 
  private:
