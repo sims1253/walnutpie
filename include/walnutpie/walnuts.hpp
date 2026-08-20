@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <iostream>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -334,6 +335,15 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
     logp_next = logp_pos_next + logp_momentum(rho_next, inv_mass);
     if (num_steps == min_micro_steps) {
       double min_accept = std::exp(-std::fabs(logp - logp_next));
+      if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_ALPHA")) {
+        static std::size_t alpha_n = 0;
+        ++alpha_n;
+        if (alpha_n <= static_cast<std::size_t>(atoi(dbg))) {
+          std::cout << "[alpha " << alpha_n << "] " << min_accept
+                    << " dlogp=" << (logp - logp_next)
+                    << " macro_step=" << std::fabs(step) << std::endl;
+        }
+      }
       adapt_handler(min_accept);
     }
     if (std::fabs(logp - logp_next) <= max_error) {
@@ -533,6 +543,11 @@ inline Eigen::VectorXd transition_w(
   double logp_joint = logp_pos + logp_momentum(rho, inv_mass);
   auto span_accum = SpanW::from_initial_point(
       std::move(theta), std::move(rho), std::move(grad), logp_pos, logp_joint);
+  if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_SPAN")) {
+    std::cout << "[tw enter] theta0=" << span_accum.theta_select_[0]
+              << " step=" << step << " max_depth=" << max_depth
+              << " invm0=" << inv_mass[0] << std::endl;
+  }
   for (depth = 1; depth <= max_depth; ++depth) {
     // helper to turn runtime direction into compile-time template enum
     auto expand_in_direction = [&](auto direction) -> bool {
@@ -540,6 +555,17 @@ inline Eigen::VectorXd transition_w(
       auto maybe_next_span = build_span<D>(
           rand, logp_grad, inv_mass, step, depth - 1, max_step_halvings,
           min_micro_steps, max_error, span_accum, step_size_adapter);
+      if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_SPAN")) {
+        static std::size_t span_calls = 0;
+        ++span_calls;
+        if (span_calls % atoi(dbg) == 0) {
+          std::cout << "[span call " << span_calls << "] depth=" << depth
+                    << " valid=" << maybe_next_span.has_value()
+                    << " theta0=" << span_accum.theta_select_[0]
+                    << " step=" << step
+                    << " invm0=" << inv_mass[0] << std::endl;
+        }
+      }
       if (!maybe_next_span) {
         return true;
       }

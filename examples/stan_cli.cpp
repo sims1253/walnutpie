@@ -1,5 +1,6 @@
 #include <walnutpie.hpp>
 #include <walnutpie/load_stan.hpp>
+#include <walnutpie/warmup_heuristics.hpp>
 
 #include <CLI/CLI.hpp>
 #include <Eigen/Dense>
@@ -79,6 +80,18 @@ class StanHandler {
 
   void on_warmup(const Eigen::VectorXd& position, double lp, double step_size,
                  const Eigen::VectorXd& diag_inv_mass) {
+    static std::size_t it = 0;
+    if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_WARMUP")) {
+      if (it % std::max(1, atoi(dbg)) == 0) {
+        std::cout << "[warmup it " << it << "] lp=" << lp
+                  << " step=" << step_size
+                  << " invm[0]=" << (diag_inv_mass.size() ? diag_inv_mass[0] : -1)
+                  << " pos[0]=" << (position.size() ? position[0] : 0)
+                  << " pos[last]=" << (position.size() ? position[position.size()-1] : 0)
+                  << std::endl;
+      }
+    }
+    ++it;
     if (!save_warmup_) {
       return;
     }
@@ -118,7 +131,9 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                         walnutpie::InitConfigBuilder& init_builder,
                         std::size_t num_warmup, std::size_t num_draws,
                         bool save_warmup, walnutpie::WarmupConfig& warmup_cfg,
-                        walnutpie::SamplingConfig& sample_cfg) {
+                        walnutpie::SamplingConfig& sample_cfg,
+                        double mass_init_clamp = 0.0,
+                        bool step_init_heuristic = false) {
   using Clock = std::chrono::high_resolution_clock;
   auto elapsed_seconds = [](auto t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
@@ -148,9 +163,17 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
     ++logp_count;
   };
 
-  auto init_cfg =
-      init_builder.masses(logp, warmup_cfg.mass_additive_smoothing()).build();
+  auto init_cfg = init_builder.masses(logp, warmup_cfg.mass_additive_smoothing(),
+                                    false, mass_init_clamp)
+                      .build();
   auto inits = init_cfg.init_chain_config(0);
+  if (step_init_heuristic) {
+    const auto inv_mass = inits.mass().array().inverse().matrix().eval();
+    double eps = walnutpie::detail::find_reasonable_step(
+        logp, inits.position(), inv_mass, inits.step_size());
+    inits = walnutpie::InitChainConfig(eps, inits.position(), inits.mass());
+    std::cout << "Heuristic initial step size: " << eps << std::endl;
+  }
 
   std::mt19937_64 rng{seed};
   walnutpie::AdaptiveWalnuts<decltype(logp), decltype(rng), StanHandler, Opt>
@@ -211,6 +234,8 @@ int main(int argc, char** argv) {
   bool da_freeze_average = false;
   double mass_shrink_kappa = 0.0;
   double mass_var_floor = 0.0;
+  double mass_init_clamp = 0.0;
+  bool step_init_heuristic = false;
   double da_gamma = default_warmup.da_gamma();
   double da_t0 = default_warmup.da_t0();
   double da_kappa = default_warmup.da_kappa();
@@ -331,6 +356,15 @@ int main(int argc, char** argv) {
                    "n/(n+kappa) (Stan uses 5; 0 = off)")
         ->default_val(mass_shrink_kappa);
 
+    app.add_option("--mass-init-clamp", mass_init_clamp,
+                   "Clamp gradient-seeded initial masses to [1/clamp, clamp] "
+                   "(e.g. 100; 0 = off)")
+        ->default_val(mass_init_clamp);
+
+    app.add_flag("--step-init-heuristic", step_init_heuristic,
+                 "Find initial step size with a Stan-style doubling/halving "
+                 "probe instead of a fixed value");
+
     app.add_option("--mass-var-floor", mass_var_floor,
                    "Elementwise floor for draw/score variances (e.g. 1e-3; "
                    "0 = off)")
@@ -425,21 +459,23 @@ int main(int argc, char** argv) {
     // dispatch: base optimizer, optional batching, optional clipping
     auto run_base = [&](auto opt_tag) -> StanHandler {
       using Opt = typename decltype(opt_tag)::type;
+      auto extra = std::make_pair(mass_init_clamp, step_init_heuristic);
       if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg);
+            warmup_cfg, sample_cfg, extra.first, extra.second);
       } else if (step_opt_batch_stride > 1) {
         return run_walnuts<BatchedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg);
+            warmup_cfg, sample_cfg, extra.first, extra.second);
       } else if (step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg);
+            warmup_cfg, sample_cfg, extra.first, extra.second);
       }
       return run_walnuts<Opt>(model, seed, init_cfg, num_warmup, num_draws,
-                              save_warmup, warmup_cfg, sample_cfg);
+                              save_warmup, warmup_cfg, sample_cfg, extra.first,
+                              extra.second);
     };
     if (step_optimizer == "adam") {
       return run_base(std::type_identity<Adam>{});

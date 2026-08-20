@@ -359,7 +359,8 @@ class InitConfigBuilder {
    */
   template <LogpGrad F>
   InitConfigBuilder& masses(const F& logp_grad, double mass_smoothing,
-                            bool average_masses = false) {
+                            bool average_masses = false,
+                            double clamp = 0.0) {
     detail::validate_probability(mass_smoothing, "mass_smoothing");
     Eigen::VectorXd grad;
     masses_.resize(num_chains_);
@@ -367,6 +368,12 @@ class InitConfigBuilder {
       double lp_to_discard;
       logp_grad(positions_[c], lp_to_discard, grad);
       masses_[c] = (1 - mass_smoothing) * grad.array().abs() + mass_smoothing;
+      if (clamp > 0) {
+        // Guard against far-from-typical-set initializations where the
+        // gradient magnitude (and hence the seeded mass) is enormous; a
+        // degenerate seed throttles all early movement (inv_mass ~ 1/|grad|).
+        masses_[c] = masses_[c].cwiseMin(clamp).cwiseMax(1.0 / clamp);
+      }
     }
     if (average_masses) {
       Eigen::Index D = masses_[0].size();
