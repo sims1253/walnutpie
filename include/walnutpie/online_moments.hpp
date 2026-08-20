@@ -152,7 +152,9 @@ class OnlineMoments {
                 const Eigen::VectorXd& init_variance)
       : weight_(init_weight),
         mean_(init_mean),
-        sum_sq_dev_(init_weight * init_variance) {
+        sum_sq_dev_(init_weight * init_variance),
+        init_weight_(init_weight),
+        sum_sq_dev_init_(init_weight * init_variance) {
     detail::validate_positive(init_weight, "init_weight");
     detail::validate_same_size(init_mean, init_variance, "init_mean",
                                "init_variance");
@@ -229,6 +231,23 @@ class OnlineMoments {
     return sum_sq_dev_ / weight_;
   }
 
+  /**
+   * @brief Return the total (discounted) weight of observations,
+   * an effective sample size for the moment estimates.
+   */
+  double weight() const noexcept { return weight_; }
+
+  /**
+   * @brief Return the initial variance used at construction (the
+   * shrinkage target for regularized estimates).
+   */
+  Eigen::VectorXd initial_variance() const {
+    if (init_weight_ > 0) {
+      return sum_sq_dev_init_ / init_weight_;
+    }
+    return Eigen::VectorXd::Ones(mean_.size());
+  }
+
  private:
   /** The discount factor applied to the weights of previous observations.
    *
@@ -244,6 +263,12 @@ class OnlineMoments {
 
   /** The sum of weighted squared deviations from the mean. */
   Eigen::VectorXd sum_sq_dev_;
+
+  /** The initial weight (for the regularized shrinkage target). */
+  double init_weight_;
+
+  /** The initial sum of squared deviations (shrinkage target). */
+  Eigen::VectorXd sum_sq_dev_init_;
 };
 
 }  // namespace walnutpie::detail

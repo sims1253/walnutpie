@@ -618,6 +618,10 @@ class WarmupConfig {
 
   bool da_freeze_average() const { return da_freeze_average_; }
 
+  double mass_shrink_kappa() const { return mass_shrink_kappa_; }
+
+  double mass_var_floor() const { return mass_var_floor_; }
+
   /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
@@ -657,6 +661,8 @@ class WarmupConfig {
   std::size_t step_opt_batch_stride_ = 1;
   double step_grad_clip_ = 0.0;
   bool da_freeze_average_ = false;
+  double mass_shrink_kappa_ = 0.0;
+  double mass_var_floor_ = 0.0;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
 };
@@ -853,6 +859,22 @@ class WarmupConfigBuilder {
       throw std::invalid_argument("step_grad_clip must be >= 0 (0 = off)");
     }
     cfg_.step_grad_clip_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& mass_shrink_kappa(double v) {
+    if (v < 0) {
+      throw std::invalid_argument("mass_shrink_kappa must be >= 0 (0 = off)");
+    }
+    cfg_.mass_shrink_kappa_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& mass_var_floor(double v) {
+    if (v < 0) {
+      throw std::invalid_argument("mass_var_floor must be >= 0 (0 = off)");
+    }
+    cfg_.mass_var_floor_ = v;
     return *this;
   }
 

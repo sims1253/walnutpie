@@ -209,6 +209,8 @@ int main(int argc, char** argv) {
   std::size_t step_opt_batch_stride = 1;
   double step_grad_clip = 0.0;
   bool da_freeze_average = false;
+  double mass_shrink_kappa = 0.0;
+  double mass_var_floor = 0.0;
   double da_gamma = default_warmup.da_gamma();
   double da_t0 = default_warmup.da_t0();
   double da_kappa = default_warmup.da_kappa();
@@ -324,6 +326,16 @@ int main(int argc, char** argv) {
     app.add_flag("--da-freeze-average", da_freeze_average,
                  "Dual averaging: use Polyak-Ruppert averaged log step size");
 
+    app.add_option("--mass-shrink-kappa", mass_shrink_kappa,
+                   "Shrink mass-matrix variance toward init with weight "
+                   "n/(n+kappa) (Stan uses 5; 0 = off)")
+        ->default_val(mass_shrink_kappa);
+
+    app.add_option("--mass-var-floor", mass_var_floor,
+                   "Elementwise floor for draw/score variances (e.g. 1e-3; "
+                   "0 = off)")
+        ->default_val(mass_var_floor);
+
     app.add_option("--step-learning-rate", step_learning_rate,
                    "Learning rates for step adaptation")
         ->default_val(step_learning_rate)
@@ -384,6 +396,8 @@ int main(int argc, char** argv) {
           .step_opt_batch_stride(step_opt_batch_stride)
           .step_grad_clip(step_grad_clip)
           .da_freeze_average(da_freeze_average)
+          .mass_shrink_kappa(mass_shrink_kappa)
+          .mass_var_floor(mass_var_floor)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
