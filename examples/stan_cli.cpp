@@ -207,6 +207,8 @@ int main(int argc, char** argv) {
 
   std::string step_optimizer = "adam";
   std::size_t step_opt_batch_stride = 1;
+  double step_grad_clip = 0.0;
+  bool da_freeze_average = false;
   double da_gamma = default_warmup.da_gamma();
   double da_t0 = default_warmup.da_t0();
   double da_kappa = default_warmup.da_kappa();
@@ -314,6 +316,14 @@ int main(int argc, char** argv) {
                    "Dual averaging averaging exponent kappa")
         ->default_val(da_kappa);
 
+    app.add_option("--step-grad-clip", step_grad_clip,
+                   "Clip acceptance-statistic gradient impulse (e.g. 0.3; 0 "
+                   "= off)")
+        ->default_val(step_grad_clip);
+
+    app.add_flag("--da-freeze-average", da_freeze_average,
+                 "Dual averaging: use Polyak-Ruppert averaged log step size");
+
     app.add_option("--step-learning-rate", step_learning_rate,
                    "Learning rates for step adaptation")
         ->default_val(step_learning_rate)
@@ -372,6 +382,8 @@ int main(int argc, char** argv) {
           .da_t0(da_t0)
           .da_kappa(da_kappa)
           .step_opt_batch_stride(step_opt_batch_stride)
+          .step_grad_clip(step_grad_clip)
+          .da_freeze_average(da_freeze_average)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
@@ -394,41 +406,35 @@ int main(int argc, char** argv) {
     using walnutpie::detail::AdaBelief;
     using walnutpie::detail::AdEMAMix;
     using walnutpie::detail::BatchedAdapter;
+    using walnutpie::detail::ClippedAdapter;
     using walnutpie::detail::DualAveraging;
-    if (step_opt_batch_stride > 1) {
-      if (step_optimizer == "adam") {
-        return run_walnuts<BatchedAdapter<Adam>>(
+    // dispatch: base optimizer, optional batching, optional clipping
+    auto run_base = [&](auto opt_tag) -> StanHandler {
+      using Opt = typename decltype(opt_tag)::type;
+      if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
+        return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
             warmup_cfg, sample_cfg);
-      } else if (step_optimizer == "da") {
-        return run_walnuts<BatchedAdapter<DualAveraging>>(
+      } else if (step_opt_batch_stride > 1) {
+        return run_walnuts<BatchedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
             warmup_cfg, sample_cfg);
-      } else if (step_optimizer == "dem") {
-        return run_walnuts<BatchedAdapter<AdEMAMix>>(
-            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg);
-      } else {
-        return run_walnuts<BatchedAdapter<AdaBelief>>(
+      } else if (step_grad_clip > 0.0) {
+        return run_walnuts<ClippedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
             warmup_cfg, sample_cfg);
       }
-    }
+      return run_walnuts<Opt>(model, seed, init_cfg, num_warmup, num_draws,
+                              save_warmup, warmup_cfg, sample_cfg);
+    };
     if (step_optimizer == "adam") {
-      return run_walnuts<Adam>(model, seed, init_cfg, num_warmup, num_draws,
-                               save_warmup, warmup_cfg, sample_cfg);
+      return run_base(std::type_identity<Adam>{});
     } else if (step_optimizer == "da") {
-      return run_walnuts<DualAveraging>(model, seed, init_cfg, num_warmup,
-                                        num_draws, save_warmup, warmup_cfg,
-                                        sample_cfg);
+      return run_base(std::type_identity<DualAveraging>{});
     } else if (step_optimizer == "dem") {
-      return run_walnuts<AdEMAMix>(model, seed, init_cfg, num_warmup,
-                                   num_draws, save_warmup, warmup_cfg,
-                                   sample_cfg);
+      return run_base(std::type_identity<AdEMAMix>{});
     } else {
-      return run_walnuts<AdaBelief>(model, seed, init_cfg, num_warmup,
-                                    num_draws, save_warmup, warmup_cfg,
-                                    sample_cfg);
+      return run_base(std::type_identity<AdaBelief>{});
     }
   }();
 
