@@ -53,7 +53,9 @@ class MassEstimator {
    * size.
    */
   MassEstimator(const WarmupConfig& warmup_cfg, const InitChainConfig& init_cfg)
-      : warmup_cfg_(warmup_cfg) {
+      : warmup_cfg_(warmup_cfg),
+        init_score_var_(init_cfg.mass()),
+        init_draw_var_(init_cfg.mass().array().inverse().matrix()) {
     Eigen::VectorXd zero = Eigen::VectorXd::Zero(init_cfg.position().size());
     score_var_estimator_ =
         OnlineMoments(warmup_cfg.mass_init_count(), zero, init_cfg.mass());
@@ -61,6 +63,12 @@ class MassEstimator {
         OnlineMoments(warmup_cfg.mass_init_count(), zero,
                       init_cfg.mass().array().inverse().matrix());
   }
+
+  /**
+   * @brief Return the effective sample size of the draw moment estimates
+   * (Kish weight of the discounted Welford accumulator).
+   */
+  double draw_n_eff() const { return draw_var_estimator_.weight(); }
 
   /**
    * @brief Update the estimate for the specified iteration with the
@@ -87,9 +95,31 @@ class MassEstimator {
    *
    * @return The inverse mass matrix estimate.
    */
+  /**
+   * @brief Aggregate two variance vectors in log space (geometric mean).
+   *
+   * The arithmetic average of two variances is dominated by the larger one;
+   * the log-space average preserves relative scale information when the two
+   * estimates disagree by orders of magnitude, as happens during the early
+   * drift from a distant initialization.
+   */
+  static Eigen::VectorXd logspace_average(const Eigen::VectorXd& a,
+                                          const Eigen::VectorXd& b) {
+    return ((a.array().log() + b.array().log()) * 0.5).exp().matrix();
+  }
+
   Eigen::VectorXd inv_mass_estimate() const {
     Eigen::VectorXd draw_var = draw_var_estimator_.variance();
     Eigen::VectorXd score_var = score_var_estimator_.variance();
+    if (warmup_cfg_.metric_drift_guard()) {
+      // During the initial drift from a distant point, the two moment
+      // estimators can disagree by orders of magnitude (score variance on
+      // plateau gradients vs draw variance of a pinned chain). An arithmetic
+      // combination then produces an unusable metric either way; aggregate in
+      // log space so relative scale information survives on both sides.
+      draw_var = logspace_average(draw_var, init_draw_var_);
+      score_var = logspace_average(score_var, init_score_var_);
+    }
     const double kappa = warmup_cfg_.mass_shrink_kappa();
     if (kappa > 0) {
       // Regularized (shrinkage) estimates in the style of Stan's
@@ -125,6 +155,10 @@ class MassEstimator {
 
   /** The online inverse variance estimator for scores. */
   OnlineMoments score_var_estimator_;
+
+  /** Initial variance seeds (regularization/blend targets). */
+  Eigen::VectorXd init_score_var_;
+  Eigen::VectorXd init_draw_var_;
 };
 
 /**

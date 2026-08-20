@@ -629,6 +629,8 @@ class WarmupConfig {
 
   double mass_var_floor() const { return mass_var_floor_; }
 
+  bool metric_drift_guard() const { return metric_drift_guard_; }
+
   /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
@@ -670,6 +672,7 @@ class WarmupConfig {
   bool da_freeze_average_ = false;
   double mass_shrink_kappa_ = 0.0;
   double mass_var_floor_ = 0.0;
+  bool metric_drift_guard_ = false;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
 };
@@ -874,6 +877,11 @@ class WarmupConfigBuilder {
       throw std::invalid_argument("mass_shrink_kappa must be >= 0 (0 = off)");
     }
     cfg_.mass_shrink_kappa_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_drift_guard(bool v) {
+    cfg_.metric_drift_guard_ = v;
     return *this;
   }
 

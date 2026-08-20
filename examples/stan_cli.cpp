@@ -236,6 +236,7 @@ int main(int argc, char** argv) {
   double mass_var_floor = 0.0;
   double mass_init_clamp = 0.0;
   bool step_init_heuristic = false;
+  bool metric_drift_guard = false;
   double da_gamma = default_warmup.da_gamma();
   double da_t0 = default_warmup.da_t0();
   double da_kappa = default_warmup.da_kappa();
@@ -361,6 +362,10 @@ int main(int argc, char** argv) {
                    "(e.g. 100; 0 = off)")
         ->default_val(mass_init_clamp);
 
+    app.add_flag("--metric-drift-guard", metric_drift_guard,
+                 "Aggregate draw/score variances with their seeds in log "
+                 "space (guards metric during early drift)");
+
     app.add_flag("--step-init-heuristic", step_init_heuristic,
                  "Find initial step size with a Stan-style doubling/halving "
                  "probe instead of a fixed value");
@@ -432,6 +437,7 @@ int main(int argc, char** argv) {
           .da_freeze_average(da_freeze_average)
           .mass_shrink_kappa(mass_shrink_kappa)
           .mass_var_floor(mass_var_floor)
+          .metric_drift_guard(metric_drift_guard)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
