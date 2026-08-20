@@ -245,6 +245,7 @@ int main(int argc, char** argv) {
   std::size_t anti_windup = 0;
   std::size_t drift_iters = 0;
   std::size_t metric_window = 0;
+  std::size_t metric_rank = 0;
   double max_error_start = 0.0;
   std::size_t max_error_schedule_iters = 0;
   double da_gamma = default_warmup.da_gamma();
@@ -378,6 +379,11 @@ int main(int argc, char** argv) {
                    "(e.g. 100; 0 = off)")
         ->default_val(mass_init_clamp);
 
+    app.add_option("--metric-rank", metric_rank,
+                   "Low-rank correction rank folded into the diagonal "
+                   "metric (requires --metric-window; 0 = off; e.g. 5-20)")
+        ->default_val(metric_rank);
+
     app.add_option("--metric-window", metric_window,
                    "Memoryless metric windows: reset the draw/score moment "
                    "accumulators every N warmup iterations (0 = off; "
@@ -507,6 +513,7 @@ int main(int argc, char** argv) {
           .drift_iters(drift_iters)
           .max_error_schedule(max_error_start, max_error_schedule_iters)
           .metric_window(metric_window)
+          .metric_rank(metric_rank)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =

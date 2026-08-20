@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <vector>
 #include <cstddef>
 #include <functional>
 #include <random>
@@ -15,6 +16,7 @@
 #include "walnutpie/concepts.hpp"
 #include "walnutpie/config.hpp"
 #include "walnutpie/online_moments.hpp"
+#include "walnutpie/low_rank_metric.hpp"
 #include "walnutpie/util.hpp"
 #include "walnutpie/walnuts.hpp"
 
@@ -87,6 +89,17 @@ class MassEstimator {
                                           static_cast<double>(iteration));
     draw_var_estimator_.discount_observe(discount_factor, theta);
     score_var_estimator_.discount_observe(discount_factor, grad);
+    if (warmup_cfg_.metric_rank() > 0) {
+      const std::size_t window = warmup_cfg_.metric_window();
+      if (window > 0) {
+        window_draws_.push_back(theta);
+        window_scores_.push_back(grad);
+        if (window_draws_.size() > window) {
+          window_draws_.erase(window_draws_.begin());
+          window_scores_.erase(window_scores_.begin());
+        }
+      }
+    }
     if (warmup_cfg_.metric_stall_reset() > 0) {
       // Stall detector on the raw draws (metric-independent): if the chain
       // has barely moved over the last `stall_window` observations, the mass
@@ -137,6 +150,57 @@ class MassEstimator {
   static Eigen::VectorXd logspace_average(const Eigen::VectorXd& a,
                                           const Eigen::VectorXd& b) {
     return ((a.array().log() + b.array().log()) * 0.5).exp().matrix();
+  }
+
+  /**
+   * @brief Rank-corrected diagonal estimate: folds the low-rank correction
+   * sqrt(D) U C U^T sqrt(D) into its per-coordinate marginal
+   *   d_eff_i = d_i + sqrt(d_i) * (U diag(c) U^T)_ii * sqrt(d_i)
+   * keeping the diagonal interface of transition_w while carrying the
+   * dominant directions of the draw-score cross structure (full rank part
+   * reserved for a dedicated transition variant; see low_rank_metric.hpp).
+   */
+  Eigen::VectorXd rank_folded_estimate() const {
+    Eigen::VectorXd diag = inv_mass_estimate();
+    if (warmup_cfg_.metric_rank() == 0 ||
+        draw_var_estimator_.weight() <
+            2.0 * warmup_cfg_.mass_init_count()) {
+      return diag;
+    }
+    LowRankMetricEstimator lr(draw_var_estimator_.mean().size(),
+                              warmup_cfg_.metric_rank(),
+                              warmup_cfg_.metric_window());
+    // replay is unavailable in the streaming estimator; instead the rank
+    // factors are refreshed by the explicit low_rank_update() below.
+    if (U_.cols() == 0) {
+      return diag;
+    }
+    Eigen::VectorXd sq = diag.cwiseSqrt();
+    // marginal: sqrtD (U C U^T) sqrtD -> row-wise weighted sum
+    Eigen::VectorXd marg =
+        (U_.array().square().matrix() * c_).cwiseProduct(sq.cwiseProduct(sq));
+    return diag + marg;
+  }
+
+  /**
+   * @brief Refresh the low-rank factors from the accumulated window.
+   *
+   * Called at window boundaries (chopping); stores U, c for the folded
+   * diagonal estimate. Draws/scores come from the streaming accumulators'
+   * raw window, retained for exactly this purpose.
+   */
+  void low_rank_update() {
+    if (warmup_cfg_.metric_rank() == 0 || window_draws_.size() < 4) {
+      return;
+    }
+    const std::size_t dim = window_draws_[0].size();
+    LowRankMetricEstimator lr(dim, warmup_cfg_.metric_rank(),
+                              warmup_cfg_.metric_window());
+    for (std::size_t k = 0; k < window_draws_.size(); ++k) {
+      lr.observe(window_draws_[k], window_scores_[k]);
+    }
+    Eigen::VectorXd diag = inv_mass_estimate();
+    lr.low_rank_factors(U_, c_, diag);
   }
 
   Eigen::VectorXd inv_mass_estimate() const {
@@ -212,6 +276,14 @@ class MassEstimator {
 
   /** Last reference position for the stall detector. */
   Eigen::VectorXd stall_reference_;
+
+  /** Low-rank factors of the metric (empty when metric_rank == 0). */
+  Eigen::MatrixXd U_;
+  Eigen::VectorXd c_;
+
+  /** Rolling raw window of draws/scores for low-rank refresh. */
+  std::vector<Eigen::VectorXd> window_draws_;
+  std::vector<Eigen::VectorXd> window_scores_;
 
   /** Iterations until the next stall check. */
   std::size_t stall_countdown_ = 0;
@@ -474,9 +546,16 @@ class AdaptiveWalnuts {
 
   void operator()() {
     const bool drifting = iteration_ < warmup_cfg_.get().drift_iters();
+    const std::size_t window = warmup_cfg_.get().metric_window();
+    if (window > 0 && !drifting && iteration_ > 0 &&
+        (iteration_ + 1) % window == 0) {
+      mass_estimator_.low_rank_update();
+    }
     Eigen::VectorXd inv_mass =
         drifting ? Eigen::VectorXd::Ones(theta_.size())
-                 : mass_estimator_.inv_mass_estimate();
+                 : (warmup_cfg_.get().metric_rank() > 0
+                        ? mass_estimator_.rank_folded_estimate()
+                        : mass_estimator_.inv_mass_estimate());
     Eigen::VectorXd chol_mass = inv_mass.array().inverse().sqrt().matrix();
     Eigen::VectorXd grad_select;
     double logp_select;
