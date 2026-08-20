@@ -113,6 +113,7 @@ class StanHandler {
   Eigen::Index n_ = 0;
 };
 
+template <typename Opt>
 StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                         walnutpie::InitConfigBuilder& init_builder,
                         std::size_t num_warmup, std::size_t num_draws,
@@ -152,8 +153,9 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   auto inits = init_cfg.init_chain_config(0);
 
   std::mt19937_64 rng{seed};
-  walnutpie::AdaptiveWalnuts walnuts(rng, storage, logp, inits, warmup_cfg,
-                                     sample_cfg);
+  walnutpie::AdaptiveWalnuts<decltype(logp), decltype(rng), StanHandler, Opt>
+      walnuts(
+      rng, storage, logp, inits, warmup_cfg, sample_cfg);
   for (std::size_t w = 0; w < num_warmup; ++w) {
     walnuts();
   }
@@ -202,6 +204,12 @@ int main(int argc, char** argv) {
 
   walnutpie::SamplingConfig default_sampling =
       walnutpie::SamplingConfigBuilder().build();
+
+  std::string step_optimizer = "adam";
+  std::size_t step_opt_batch_stride = 1;
+  double da_gamma = default_warmup.da_gamma();
+  double da_t0 = default_warmup.da_t0();
+  double da_kappa = default_warmup.da_kappa();
 
   std::size_t max_trajectory_doublings =
       default_sampling.max_trajectory_doublings();
@@ -282,8 +290,29 @@ int main(int argc, char** argv) {
 
     app.add_option("--step-accept-rate-target", step_accept_rate_target,
                    "Target acceptance rate for the step size adaptation")
-        ->default_val(step_accept_rate_target)
-        ->check(CLI::Range((std::numeric_limits<double>::min)(), 1.0));
+        ->default_val(step_accept_rate_target);
+
+    app.add_option("--step-optimizer", step_optimizer,
+                   "Step size adaptation optimizer: adam | da (dual averaging) "
+                   "| dem (AdEMAMix) | belief (AdaBelief)")
+        ->default_val(step_optimizer)
+        ->check(CLI::IsMember({"adam", "da", "dem", "belief"}));
+
+    app.add_option("--step-opt-batch-stride", step_opt_batch_stride,
+                   "Update the step optimizer once per N acceptance "
+                   "observations, using their mean")
+        ->default_val(step_opt_batch_stride)
+        ->check(CLI::PositiveNumber);
+
+    app.add_option("--da-gamma", da_gamma, "Dual averaging shrinkage gamma")
+        ->default_val(da_gamma);
+
+    app.add_option("--da-t0", da_t0, "Dual averaging iteration offset t0")
+        ->default_val(da_t0);
+
+    app.add_option("--da-kappa", da_kappa,
+                   "Dual averaging averaging exponent kappa")
+        ->default_val(da_kappa);
 
     app.add_option("--step-learning-rate", step_learning_rate,
                    "Learning rates for step adaptation")
@@ -339,6 +368,10 @@ int main(int argc, char** argv) {
           .step_sq_gradient_decay(step_sq_gradient_decay)
           .step_stabilization(step_stabilization)
           .step_learn_rate_decay(step_learn_rate_decay)
+          .da_gamma(da_gamma)
+          .da_t0(da_t0)
+          .da_kappa(da_kappa)
+          .step_opt_batch_stride(step_opt_batch_stride)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
@@ -356,8 +389,48 @@ int main(int argc, char** argv) {
           .step_sizes(step_size_init)
           .positions(model.initialize(nullptr, rng, init));
 
-  auto res = run_walnuts(model, seed, init_cfg, num_warmup, num_draws,
-                         save_warmup, warmup_cfg, sample_cfg);
+  auto res = [&]() {
+    using walnutpie::detail::Adam;
+    using walnutpie::detail::AdaBelief;
+    using walnutpie::detail::AdEMAMix;
+    using walnutpie::detail::BatchedAdapter;
+    using walnutpie::detail::DualAveraging;
+    if (step_opt_batch_stride > 1) {
+      if (step_optimizer == "adam") {
+        return run_walnuts<BatchedAdapter<Adam>>(
+            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+            warmup_cfg, sample_cfg);
+      } else if (step_optimizer == "da") {
+        return run_walnuts<BatchedAdapter<DualAveraging>>(
+            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+            warmup_cfg, sample_cfg);
+      } else if (step_optimizer == "dem") {
+        return run_walnuts<BatchedAdapter<AdEMAMix>>(
+            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+            warmup_cfg, sample_cfg);
+      } else {
+        return run_walnuts<BatchedAdapter<AdaBelief>>(
+            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+            warmup_cfg, sample_cfg);
+      }
+    }
+    if (step_optimizer == "adam") {
+      return run_walnuts<Adam>(model, seed, init_cfg, num_warmup, num_draws,
+                               save_warmup, warmup_cfg, sample_cfg);
+    } else if (step_optimizer == "da") {
+      return run_walnuts<DualAveraging>(model, seed, init_cfg, num_warmup,
+                                        num_draws, save_warmup, warmup_cfg,
+                                        sample_cfg);
+    } else if (step_optimizer == "dem") {
+      return run_walnuts<AdEMAMix>(model, seed, init_cfg, num_warmup,
+                                   num_draws, save_warmup, warmup_cfg,
+                                   sample_cfg);
+    } else {
+      return run_walnuts<AdaBelief>(model, seed, init_cfg, num_warmup,
+                                    num_draws, save_warmup, warmup_cfg,
+                                    sample_cfg);
+    }
+  }();
 
   res.summarize();
   res.write_csv(output_file);
