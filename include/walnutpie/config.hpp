@@ -639,6 +639,8 @@ class WarmupConfig {
 
   std::size_t metric_stall_window() const { return metric_stall_window_; }
 
+  double mass_init_clamp() const { return mass_init_clamp_; }
+
   std::size_t anti_windup_pass_rate() const { return anti_windup_pass_rate_; }
 
   std::size_t drift_iters() const { return drift_iters_; }
@@ -703,6 +705,7 @@ class WarmupConfig {
   double metric_collapse_reset_ = 0.0;
   double metric_stall_reset_ = 0.0;
   std::size_t metric_stall_window_ = 100;
+  double mass_init_clamp_ = 0.0;
   std::size_t anti_windup_pass_rate_ = 0;
   std::size_t drift_iters_ = 0;
   std::size_t metric_window_ = 0;
@@ -958,6 +961,14 @@ class WarmupConfigBuilder {
 
   WarmupConfigBuilder& anti_windup_pass_rate(std::size_t v) {
     cfg_.anti_windup_pass_rate_ = v;  // 0 = off
+    return *this;
+  }
+
+  WarmupConfigBuilder& mass_init_clamp(double v) {
+    if (v < 0) {
+      throw std::invalid_argument("mass_init_clamp must be >= 0");
+    }
+    cfg_.mass_init_clamp_ = v;
     return *this;
   }
 

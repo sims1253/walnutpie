@@ -522,6 +522,7 @@ int main(int argc, char** argv) {
           .da_freeze_average(da_freeze_average)
           .mass_shrink_kappa(mass_shrink_kappa)
           .mass_var_floor(mass_var_floor)
+          .mass_init_clamp(mass_init_clamp)
           .metric_drift_guard(metric_drift_guard)
           .mass_combine_power(mass_combine_power)
           .metric_collapse_reset(metric_collapse_reset)

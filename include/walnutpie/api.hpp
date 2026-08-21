@@ -128,11 +128,16 @@ inline void walnuts_with_reinit(
       const auto& pool = reinit_positions[(m + reinits) % reinit_positions.size()];
       new_positions[m] = pool[(m + reinits) % pool.size()];
     }
+    // Reinit rounds inherit the warmup config including any init-robustness
+    // settings (mass clamp, step-size heuristic): a fresh distant draw needs
+    // the same safeguards as the initial round, or the restarted warmup
+    // collapses the step size before the policy can help again.
     InitConfigBuilder builder{
         M, cfg.init().init_chain_config(0).position().size()};
     builder.step_sizes(cfg.init().init_chain_config(0).step_size());
     builder.positions(new_positions);
-    builder.masses(log_p_grad, cfg.warmup().mass_additive_smoothing());
+    builder.masses(log_p_grad, cfg.warmup().mass_additive_smoothing(),
+                   false, cfg.warmup().mass_init_clamp());
     cfg = WalnutsConfig(builder.build(), cfg.warmup(), cfg.sampling());
   }
 
