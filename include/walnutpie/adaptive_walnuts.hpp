@@ -517,6 +517,22 @@ struct StepAdapterFactory<ClippedAdapter<BatchedAdapter<Inner>>> {
 namespace walnutpie {
 
 /**
+ * @brief Construct the step adapter requested by the warmup configuration.
+ *
+ * Library users cannot template-dispatch as the CLI does, so configuration
+ * carries the selection: anti-windup wrapping (pass_rate > 0) is applied
+ * around the requested base adapter type. Default: the base adapter itself.
+ */
+template <detail::StepSizeAdapter Opt>
+Opt make_configured_adapter(const InitChainConfig& init_cfg,
+                            const WarmupConfig& warmup_cfg) {
+  // The factory for AntiWindupAdapter reads the configured pass rate
+  // (0 = pass-through), so library users select anti-windup purely through
+  // WarmupConfig — no template dispatch needed, matching the CLI behavior.
+  return detail::StepAdapterFactory<Opt>::make(init_cfg, warmup_cfg);
+}
+
+/**
  * @brief The adaptive Walnuts sampler.
  *
  * The adaptive Walnuts sampler is configured in the constructor, then
@@ -529,7 +545,7 @@ namespace walnutpie {
  * @tparam Handler Type of adaptation and sampling event handler.
  */
 template <LogpGrad F, std::uniform_random_bit_generator RNG, ChainHandler H,
-          detail::StepSizeAdapter Opt = detail::Adam>
+          detail::StepSizeAdapter Opt = detail::AntiWindupAdapter<detail::Adam>>
 class AdaptiveWalnuts {
  public:
   /**
@@ -563,8 +579,7 @@ class AdaptiveWalnuts {
         logp_grad_(logp_grad, handler),
         theta_(init_chain_cfg.position()),
         iteration_(0),
-        opt_(detail::StepAdapterFactory<Opt>::make(init_chain_cfg,
-                              warmup_cfg)),
+        opt_(make_configured_adapter<Opt>(init_chain_cfg, warmup_cfg)),
         mass_estimator_(warmup_cfg, init_chain_cfg),
         min_micro_estimator_(warmup_cfg.max_macro_steps_target(),
                              sampling_cfg.min_micro_steps()) {}

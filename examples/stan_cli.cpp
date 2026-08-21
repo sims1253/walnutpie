@@ -585,13 +585,6 @@ int main(int argc, char** argv) {
     auto run_base = [&](auto opt_tag) -> StanHandler {
       using Opt = typename decltype(opt_tag)::type;
       auto extra = std::make_pair(mass_init_clamp, step_init_heuristic);
-      if (anti_windup > 0) {
-        using AW = walnutpie::detail::ClippedAdapter<
-            walnutpie::detail::AntiWindupAdapter<Opt>>;
-        return run_walnuts<AW>(model, seed, init_cfg, num_warmup, num_draws,
-                               save_warmup, warmup_cfg, sample_cfg,
-                               mass_init_clamp, step_init_heuristic);
-      }
       if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,

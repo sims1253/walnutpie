@@ -287,7 +287,7 @@ class AntiWindupAdapter {
         saturated_seen_(0) {}
 
   void operator()(double alpha) noexcept {
-    if (alpha < floor_alpha_) {
+    if (pass_rate_ > 0 && alpha < floor_alpha_) {
       ++saturated_seen_;
       if (saturated_seen_ % pass_rate_ != 1) {
         return;  // drop this saturated observation
