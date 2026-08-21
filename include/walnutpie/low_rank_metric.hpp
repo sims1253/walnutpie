@@ -30,10 +30,10 @@ namespace walnutpie::detail {
 class LowRankMetricEstimator {
  public:
   LowRankMetricEstimator(std::size_t dim, std::size_t rank,
-                         std::size_t window,
+                         std::size_t window, std::size_t basis = 0,
                          double var_floor = 1e-8)
       : dim_(dim), rank_(std::min(rank, dim)), window_(window),
-        var_floor_(var_floor) {
+        var_floor_(var_floor), basis_(basis) {
     draws_.reserve(window_);
     scores_.reserve(window_);
   }
@@ -98,19 +98,109 @@ class LowRankMetricEstimator {
     Eigen::MatrixXd Ss = diag.asDiagonal() * S;
     Eigen::MatrixXd stacked(dim_, 2 * K);
     stacked << Ys, Ss;
-    // Thin SVD; take top-r right? left singular vectors (dim x r).
-    Eigen::JacobiSVD<Eigen::MatrixXd> svd(
-        stacked, Eigen::ComputeThinU | Eigen::ComputeThinV);
-    std::size_t r = std::min(rank_, static_cast<std::size_t>(svd.rank()));
-    U = svd.matrixU().leftCols(r);
-    // The singular-value excess above the isotropic baseline (sqrt(2K))
-    // gives the correction magnitude per direction.
-    Eigen::VectorXd sv = svd.singularValues().head(r);
+    if (basis_ == 0) {
+      // Windowed thin SVD (default; Algorithm 1).
+      Eigen::JacobiSVD<Eigen::MatrixXd> svd(
+          stacked, Eigen::ComputeThinU | Eigen::ComputeThinV);
+      std::size_t r = std::min(rank_, static_cast<std::size_t>(svd.rank()));
+      U = svd.matrixU().leftCols(r);
+      Eigen::VectorXd sv = svd.singularValues().head(r);
+      const double baseline = std::sqrt(2.0 * static_cast<double>(K));
+      c = (sv.array() - baseline).cwiseMax(0.0);
+      const double denom = baseline + c.sum();
+      c = c / std::max(denom, 1e-12);
+      prev_U_ = U;
+      return;
+    }
+    if (basis_ == 1) {
+      // Streaming orthogonal (power) iteration on C = stacked stacked^T via
+      // matrix-free products, warm-started from the previous window's basis.
+      std::size_t r = std::min(rank_, dim_);
+      Eigen::MatrixXd V;
+      if (prev_U_.cols() == r && prev_U_.rows() == dim_) {
+        V = prev_U_;
+      } else {
+        V = Eigen::MatrixXd::Zero(dim_, r);
+        // deterministic start: standardized stacked columns' top-leverage
+        Eigen::VectorXd cn = stacked.colwise().norm();
+        for (std::size_t j = 0; j < r; ++j) {
+          std::ptrdiff_t best;
+          cn.maxCoeff(&best);
+          cn(best) = -1.0;
+          V.col(j) = stacked.col(best);  // D-dim column as start direction
+        }
+      }
+      const int iters = 4;  // per window; persistence does the streaming
+      for (int it = 0; it < iters; ++it) {
+        Eigen::MatrixXd W = stacked * (stacked.transpose() * V);  // C V
+        Eigen::HouseholderQR<Eigen::MatrixXd> qr(W);
+        V = qr.householderQ() * Eigen::MatrixXd::Identity(
+                                    W.rows(), std::min(W.cols(), W.rows()));
+      }
+      // Weights: Rayleigh-style excess of the directional variance.
+      Eigen::VectorXd ray(V.cols());
+      for (Eigen::Index j = 0; j < V.cols(); ++j) {
+        Eigen::VectorXd Cv = stacked * (stacked.transpose() * V.col(j));
+        ray(j) = std::sqrt(std::max(0.0, V.col(j).dot(Cv)));
+      }
+      const double baseline = std::sqrt(2.0 * static_cast<double>(K));
+      U = V;
+      c = (ray.array() - baseline).cwiseMax(0.0);
+      const double denom = baseline + c.sum();
+      c = c / std::max(denom, 1e-12);
+      prev_U_ = U;
+      return;
+    }
+    // basis_ 2/3: Muon-style Newton-Schulz column orthogonalization of the
+    // stacked matrix (and MuonEq-style row equilibration first for 3).
+    Eigen::MatrixXd M = stacked;
+    Eigen::VectorXd row_scale = Eigen::VectorXd::Ones(dim_);
+    if (basis_ == 3) {
+      row_scale = M.cwiseAbs2().rowwise().mean().cwiseSqrt().cwiseMax(1e-12);
+      M = row_scale.cwiseInverse().asDiagonal() * M;
+    }
+    // Column norms of the (equilibrated) matrix are the leverage scores
+    // used for rank selection.
+    Eigen::VectorXd cn = M.colwise().norm();
+    std::size_t r = std::min(rank_, static_cast<std::size_t>(M.cols()));
+    // Newton-Schulz quintic iteration on the small Gram side:
+    // X <- X (aI + bA + cA^2), A = X^T X (2K x 2K), coefficients per
+    // modded-nanogpt Muon (Jordan); converges to column-orthonormal.
+    M /= std::max(M.norm(), 1e-12);
+    const double a = 3.4445, b = -4.7750, cc = 2.0315;
+    for (int it = 0; it < 5; ++it) {
+      Eigen::MatrixXd A = M.transpose() * M;
+      M *= (a * Eigen::MatrixXd::Identity(A.rows(), A.cols()) + b * A +
+            cc * A * A);
+      M /= std::max(M.norm(), 1e-12);
+    }
+    // Select r columns by pre-orthogonalization leverage; the NS iterate's
+    // columns are near-equal norm, so selection uses the original scores.
+    Eigen::VectorXi sel(r);
+    Eigen::VectorXd cn_work = cn;
+    for (std::size_t j = 0; j < r; ++j) {
+      std::ptrdiff_t best;
+      cn_work.maxCoeff(&best);
+      cn_work(best) = -1.0;
+      sel(j) = static_cast<int>(best);
+    }
+    Eigen::MatrixXd Usel(M.rows(), sel.size());
+    for (Eigen::Index j = 0; j < sel.size(); ++j) {
+      Usel.col(j) = M.col(sel(j));
+    }
+    Eigen::HouseholderQR<Eigen::MatrixXd> qr(Usel);
+    U = qr.householderQ() * Eigen::MatrixXd::Identity(
+                                Usel.rows(), std::min(Usel.cols(), Usel.rows()));
+    // Weights from the selected leverage scores, damped like the SVD path.
+    Eigen::VectorXd lev(r);
+    for (std::size_t j = 0; j < r; ++j) {
+      lev(j) = cn(sel(j));
+    }
     const double baseline = std::sqrt(2.0 * static_cast<double>(K));
-    c = (sv.array() - baseline).cwiseMax(0.0);
-    // Normalize correction to a modest relative magnitude (damping).
+    c = (lev.array() - baseline).cwiseMax(0.0);
     const double denom = baseline + c.sum();
     c = c / std::max(denom, 1e-12);
+    prev_U_ = U;
   }
 
  private:
@@ -128,6 +218,13 @@ class LowRankMetricEstimator {
   std::vector<Eigen::VectorXd> draws_;
   std::vector<Eigen::VectorXd> scores_;
   std::size_t n_obs_ = 0;
+  std::size_t basis_ = 0;
+
+  /**
+   * @brief Persistent basis for the streaming (power) mode; carries the
+   * previous window's basis forward so refresh cadence is measurable.
+   */
+  mutable Eigen::MatrixXd prev_U_{Eigen::MatrixXd::Zero(0, 0)};
 };
 
 }  // namespace walnutpie::detail

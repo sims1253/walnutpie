@@ -641,6 +641,19 @@ class WarmupConfig {
 
   double mass_init_clamp() const { return mass_init_clamp_; }
 
+  /**
+   * @brief Basis-extraction rule for the low-rank metric factors.
+   *
+   * 0 = windowed thin SVD of the standardized stacked draw/score matrix
+   *     (default; Algorithm 1 of the low-rank Fisher metric).
+   * 1 = streaming orthogonal (power) iteration with a persistent basis.
+   * 2 = Muon-style Newton-Schulz polar orthogonalization of the stacked
+   *     matrix (column-selection by pre-orthonormalization leverage).
+   * 3 = as 2 but with row RMS equilibration before orthogonalization
+   *     (MuonEq-style), the diagonal-adjacent ablation.
+   */
+  std::size_t metric_basis() const { return metric_basis_; }
+
   std::size_t anti_windup_pass_rate() const { return anti_windup_pass_rate_; }
 
   std::size_t drift_iters() const { return drift_iters_; }
@@ -706,6 +719,7 @@ class WarmupConfig {
   double metric_stall_reset_ = 0.0;
   std::size_t metric_stall_window_ = 100;
   double mass_init_clamp_ = 0.0;
+  std::size_t metric_basis_ = 0;  // 0=svd 1=power 2=muon 3=muoneq
   std::size_t anti_windup_pass_rate_ = 0;
   std::size_t drift_iters_ = 0;
   std::size_t metric_window_ = 0;
@@ -961,6 +975,14 @@ class WarmupConfigBuilder {
 
   WarmupConfigBuilder& anti_windup_pass_rate(std::size_t v) {
     cfg_.anti_windup_pass_rate_ = v;  // 0 = off
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_basis(std::size_t v) {
+    if (v > 3) {
+      throw std::invalid_argument("metric_basis must be 0..3");
+    }
+    cfg_.metric_basis_ = v;
     return *this;
   }
 

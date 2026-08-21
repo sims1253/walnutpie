@@ -252,7 +252,8 @@ class MassEstimator {
     }
     const std::size_t dim = window_draws_[0].size();
     LowRankMetricEstimator lr(dim, warmup_cfg_.metric_rank(),
-                              warmup_cfg_.metric_window());
+                              warmup_cfg_.metric_window(),
+                              warmup_cfg_.metric_basis());
     for (std::size_t k = 0; k < window_draws_.size(); ++k) {
       lr.observe(window_draws_[k], window_scores_[k]);
     }
