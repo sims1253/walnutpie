@@ -169,6 +169,15 @@ struct AdaptResult {
    * mode-aware re-initialization policies in embedding code.
    */
   double log_mass_dispersion = 0.0;
+
+  /**
+   * @brief Per-chain log-mass diagonals at the end of adaptation.
+   *
+   * Size M; lets embedding code attribute the cross-chain dispersion to
+   * individual chains (the outlier chains in a scale-locked run) instead of
+   * only observing the aggregate.
+   */
+  std::vector<Eigen::VectorXd> chain_log_mass{};
 };
 
 /**
@@ -248,8 +257,13 @@ inline AdaptResult controller_loop(
           }
           disp_sum += v / static_cast<double>(M - 1);
         }
+        std::vector<Eigen::VectorXd> chain_lm;
+        chain_lm.reserve(M);
+        for (std::size_t m2 = 0; m2 < M; ++m2) {
+          chain_lm.push_back(latest[m2].log_mass);
+        }
         return {geom_mean_mass, std::exp(mean_log_step),
-                disp_sum / static_cast<double>(D)};
+                disp_sum / static_cast<double>(D), std::move(chain_lm)};
       }
     }
 

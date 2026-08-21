@@ -120,13 +120,96 @@ inline void walnuts_with_reinit(
         reinits >= max_reinits || reinit_positions.size() == 0) {
       break;
     }
-    // Chains locked into different scales: re-draw initializations from the
-    // pool (per-chain, cycling with the reinit round) and re-run warmup.
+    // Chains locked into different scales. Targeted policy (W-15):
+    //  - attribute the dispersion to outlier chains (per-chain mean abs
+    //    deviation from the cross-chain mean log-mass; outlier if more than
+    //    2x the median deviation and at least 0.25 nats);
+    //  - outlier chains are re-drawn from the pool (best log-density draws,
+    //    distinct per chain) and seeded with the CONSENSUS mass/step so they
+    //    re-enter the same scale the healthy chains agreed on;
+    //  - healthy chains keep their end-of-warmup position, mass and macro
+    //    time, so the second warmup only refines them.
+    // If the attribution is ambiguous (no clear outliers, e.g. a 2v2 split),
+    // fall back to the blanket policy: re-draw every chain.
     ++reinits;
-    std::vector<Eigen::VectorXd> new_positions(M);
+    std::vector<double> dev(M, 0.0);
     for (std::size_t m = 0; m < M; ++m) {
-      const auto& pool = reinit_positions[(m + reinits) % reinit_positions.size()];
-      new_positions[m] = pool[(m + reinits) % pool.size()];
+      dev[m] = (ar.chain_log_mass[m].array() -
+                ar.chain_log_mass[m].array().mean())
+                   .abs()
+                   .mean();
+    }
+    // median of dev
+    std::vector<double> dev_sorted = dev;
+    std::sort(dev_sorted.begin(), dev_sorted.end());
+    double dev_med =
+        dev_sorted[M % 2 == 1 ? M / 2 : M / 2 - 1 + (M > 1 ? 1 : 0)];
+    std::vector<bool> outlier(M, false);
+    std::size_t n_out = 0;
+    for (std::size_t m = 0; m < M; ++m) {
+      outlier[m] = dev[m] > 2.0 * dev_med && dev[m] > 0.25;
+      if (outlier[m]) ++n_out;
+    }
+    const bool targeted = n_out > 0 && n_out < M;
+
+    std::vector<Eigen::VectorXd> new_positions(M);
+    std::vector<Eigen::VectorXd> new_masses(M);
+    std::vector<double> new_steps(M);
+    for (std::size_t m = 0; m < M; ++m) {
+      if (targeted && !outlier[m]) {
+        new_positions[m] = samplers[m].position();
+        // builder convention: masses(v) seeds mass (inv_mass = 1/v), so the
+        // sampler's inverse mass must be inverted back before re-seeding.
+        new_masses[m] = samplers[m].inv_mass().cwiseInverse();
+        new_steps[m] = samplers[m].macro_time();
+      } else {
+        new_positions[m] = cfg.init().init_chain_config(m).position();
+        new_masses[m] = ar.mass_bar;
+        new_steps[m] = ar.step_bar;
+      }
+    }
+    {  // both paths: outliers (or all chains, blanket) draw from the pool
+      // Score pool draws by log-density at the position; keep finite ones,
+      // best first, and assign distinct draws to the re-drawn chains.
+      struct ScoredDraw {
+        double logp;
+        std::size_t pool_idx;
+        std::size_t draw_idx;
+      };
+      std::vector<ScoredDraw> scored;
+      for (std::size_t p = 0; p < reinit_positions.size(); ++p) {
+        for (std::size_t k = 0; k < reinit_positions[p].size(); ++k) {
+          double lp = 0.0;
+          Eigen::VectorXd g(
+              reinit_positions[p][k].size());
+          bool ok = true;
+          try {
+            log_p_grad(reinit_positions[p][k], lp, g);
+          } catch (...) {
+            ok = false;
+          }
+          if (ok && std::isfinite(lp)) {
+            scored.push_back({lp, p, k});
+          }
+        }
+      }
+      std::sort(scored.begin(), scored.end(),
+                [](const ScoredDraw& a, const ScoredDraw& b) {
+                  return a.logp > b.logp;
+                });
+      std::size_t take = 0;
+      for (std::size_t m = 0; m < M; ++m) {
+        if (targeted && !outlier[m]) continue;
+        if (take < scored.size()) {
+          new_positions[m] =
+              reinit_positions[scored[take].pool_idx][scored[take].draw_idx];
+          ++take;
+        } else {
+          const auto& pool =
+              reinit_positions[(m + reinits) % reinit_positions.size()];
+          new_positions[m] = pool[(m + reinits) % pool.size()];
+        }
+      }
     }
     // Reinit rounds inherit the warmup config including any init-robustness
     // settings (mass clamp, step-size heuristic): a fresh distant draw needs
@@ -134,10 +217,9 @@ inline void walnuts_with_reinit(
     // collapses the step size before the policy can help again.
     InitConfigBuilder builder{
         M, cfg.init().init_chain_config(0).position().size()};
-    builder.step_sizes(cfg.init().init_chain_config(0).step_size());
+    builder.step_sizes(new_steps);
     builder.positions(new_positions);
-    builder.masses(log_p_grad, cfg.warmup().mass_additive_smoothing(),
-                   false, cfg.warmup().mass_init_clamp());
+    builder.masses(new_masses);
     cfg = WalnutsConfig(builder.build(), cfg.warmup(), cfg.sampling());
   }
 

@@ -342,7 +342,8 @@ int main(int argc, char** argv) {
 
     app.add_option("--step-accept-rate-target", step_accept_rate_target,
                    "Target acceptance rate for the step size adaptation")
-        ->default_val(step_accept_rate_target);
+        ->default_val(step_accept_rate_target)
+        ->check(CLI::Range((std::numeric_limits<double>::min)(), 1.0));
 
     app.add_option("--step-optimizer", step_optimizer,
                    "Step size adaptation optimizer: adam | da (dual averaging) "
@@ -576,6 +577,7 @@ int main(int argc, char** argv) {
 
   auto res = [&]() {
     using walnutpie::detail::Adam;
+    using walnutpie::detail::AntiWindupAdapter;
     using walnutpie::detail::AdaBelief;
     using walnutpie::detail::AdEMAMix;
     using walnutpie::detail::BatchedAdapter;
@@ -585,6 +587,28 @@ int main(int argc, char** argv) {
     auto run_base = [&](auto opt_tag) -> StanHandler {
       using Opt = typename decltype(opt_tag)::type;
       auto extra = std::make_pair(mass_init_clamp, step_init_heuristic);
+      // --anti-windup selects the AntiWindupAdapter wrapper around whatever
+      // optimizer/composition the other flags chose; the wrapper's pass rate
+      // comes from warmup_cfg (StepAdapterFactory<AntiWindupAdapter<Inner>>).
+      if (anti_windup > 0) {
+        if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
+          return run_walnuts<
+              AntiWindupAdapter<ClippedAdapter<BatchedAdapter<Opt>>>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, sample_cfg, extra.first, extra.second);
+        } else if (step_opt_batch_stride > 1) {
+          return run_walnuts<AntiWindupAdapter<BatchedAdapter<Opt>>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, sample_cfg, extra.first, extra.second);
+        } else if (step_grad_clip > 0.0) {
+          return run_walnuts<AntiWindupAdapter<ClippedAdapter<Opt>>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, sample_cfg, extra.first, extra.second);
+        }
+        return run_walnuts<AntiWindupAdapter<Opt>>(
+            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+            warmup_cfg, sample_cfg, extra.first, extra.second);
+      }
       if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,

@@ -777,7 +777,7 @@ inline Eigen::VectorXd transition_w_lr(
       if (!maybe_next_span) {
         return true;
       }
-      bool combined_uturn = uturn<D>(span_accum, *maybe_next_span, lrm.D);
+      bool combined_uturn = uturn_lr<D>(span_accum, *maybe_next_span, lrm);
       span_accum = combine<Update::Metropolis, D>(rand, std::move(span_accum),
                                                   std::move(*maybe_next_span));
       return combined_uturn;
@@ -960,6 +960,16 @@ class WalnutsSampler {
    * @return The maximum error allowed among Hamiltonians.
    */
   double max_error() const noexcept { return max_error_; }
+
+  /**
+   * @brief Current position of this chain (end of warmup / last draw).
+   */
+  const Eigen::VectorXd& position() const noexcept { return theta_; }
+
+  /**
+   * @brief Current inverse mass diagonal of this chain.
+   */
+  const Eigen::VectorXd& inv_mass() const noexcept { return inv_mass_; }
 
   /**
    * @brief Return the number of dimensions.

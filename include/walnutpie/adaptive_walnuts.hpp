@@ -747,6 +747,20 @@ class AdaptiveWalnuts {
    * @return The diagonal of the inverse mass matrix.
    */
   Eigen::VectorXd inv_mass() const {
+    // The frozen sampler must carry the SAME metric the last warmup
+    // transitions used. In fold mode (metric_rank > 0, rank active per the
+    // auto-screen) warmup integrates with rank_folded_estimate(); freezing
+    // with the unfolded estimate silently changes the Hamiltonian at the
+    // warmup/sampling boundary (step size was tuned for the folded metric).
+    const bool auto_screen = warmup_cfg_.get().metric_auto() > 0;
+    const bool rank_active =
+        warmup_cfg_.get().metric_rank() > 0 &&
+        (!auto_screen ||
+         mass_estimator_.window_cross_ratio() <=
+             warmup_cfg_.get().metric_auto());
+    if (rank_active) {
+      return mass_estimator_.rank_folded_estimate();
+    }
     return mass_estimator_.inv_mass_estimate();
   }
 
