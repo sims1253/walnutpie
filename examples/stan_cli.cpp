@@ -249,6 +249,7 @@ int main(int argc, char** argv) {
   std::size_t drift_iters = 0;
   std::size_t metric_window = 0;
   std::size_t metric_rank = 0;
+  bool metric_full = false;
   double max_error_start = 0.0;
   std::size_t max_error_schedule_iters = 0;
   double da_gamma = default_warmup.da_gamma();
@@ -381,6 +382,11 @@ int main(int argc, char** argv) {
                    "Clamp gradient-seeded initial masses to [1/clamp, clamp] "
                    "(e.g. 100; 0 = off)")
         ->default_val(mass_init_clamp);
+
+    app.add_flag("--metric-full", metric_full,
+                 "Use the exact low-rank mass operator in the hot loop "
+                 "(requires --metric-rank; otherwise the rank correction is "
+                 "folded into the diagonal)");
 
     app.add_option("--metric-rank", metric_rank,
                    "Low-rank correction rank folded into the diagonal "
@@ -517,6 +523,7 @@ int main(int argc, char** argv) {
           .max_error_schedule(max_error_start, max_error_schedule_iters)
           .metric_window(metric_window)
           .metric_rank(metric_rank)
+          .metric_full(metric_full)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =

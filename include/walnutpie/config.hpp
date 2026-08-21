@@ -647,6 +647,8 @@ class WarmupConfig {
 
   std::size_t metric_rank() const { return metric_rank_; }
 
+  bool metric_full() const { return metric_full_; }
+
   double max_error_start() const { return max_error_start_; }
 
   std::size_t max_error_schedule_iters() const {
@@ -703,6 +705,7 @@ class WarmupConfig {
   std::size_t drift_iters_ = 0;
   std::size_t metric_window_ = 0;
   std::size_t metric_rank_ = 0;
+  bool metric_full_ = false;
   double max_error_start_ = 0.0;
   std::size_t max_error_schedule_iters_ = 0;
   std::size_t publish_stride_ = 5;
@@ -909,6 +912,11 @@ class WarmupConfigBuilder {
       throw std::invalid_argument("mass_shrink_kappa must be >= 0 (0 = off)");
     }
     cfg_.mass_shrink_kappa_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_full(bool v) {
+    cfg_.metric_full_ = v;
     return *this;
   }
 

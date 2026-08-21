@@ -17,6 +17,7 @@
 #include "walnutpie/concepts.hpp"
 #include "walnutpie/util.hpp"
 #include "walnutpie/validate.hpp"
+#include "walnutpie/low_rank_mass.hpp"
 
 namespace walnutpie::detail {
 
@@ -595,6 +596,203 @@ inline Eigen::VectorXd transition_w(
  * it has no body, it will be inlined away at optimization level `-O2` or
  * above.
  */
+
+// ===================== low-rank metric variants =====================
+// Mirrors of macro_step / build_leaf / build_span / transition_w with the
+// diagonal inverse mass replaced by the exact LowRankMass operator
+// (include/walnutpie/low_rank_mass.hpp). Kept separate from the originals
+// so the diagonal hot loop is untouched; both paths share all tree logic.
+
+template <LogpGrad F>
+static bool within_tolerance_lr(const F& logp_grad,
+                                const detail::LowRankMass& lrm, double step,
+                                std::size_t num_steps, double max_error,
+                                double logp_next, Eigen::VectorXd& theta_next,
+                                Eigen::VectorXd& rho_next,
+                                Eigen::VectorXd& grad_next) {
+  double half_step = 0.5 * step;
+  double logp = logp_next;
+  for (std::size_t n = 0; n < num_steps; ++n) {
+    rho_next += half_step * grad_next;
+    theta_next += step * lrm.apply_inv(rho_next);
+    logp_grad(theta_next, logp_next, grad_next);
+    rho_next += half_step * grad_next;
+  }
+  logp_next += lrm.logp_momentum(rho_next);
+  return std::abs(logp_next - logp) <= max_error;
+}
+
+template <LogpGrad F>
+static bool reversible_lr(const F& logp_grad, const detail::LowRankMass& lrm,
+                          double step, std::size_t num_steps,
+                          std::size_t min_micro_steps, double max_error,
+                          double logp_next, const Eigen::VectorXd& theta,
+                          const Eigen::VectorXd& rho,
+                          const Eigen::VectorXd& grad) {
+  if (num_steps == 1) {
+    return true;
+  }
+  Eigen::VectorXd theta_next(theta.size());
+  Eigen::VectorXd rho_next(theta.size());
+  Eigen::VectorXd grad_next(theta.size());
+  while (num_steps >= 2 * min_micro_steps) {
+    theta_next = theta;
+    rho_next = -rho;
+    grad_next = grad;
+    num_steps /= 2;
+    step *= 2;
+    if (within_tolerance_lr(logp_grad, lrm, step, num_steps, max_error,
+                            logp_next, theta_next, rho_next, grad_next)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+template <Direction D>
+static bool uturn_lr(const SpanW& span1, const SpanW& span2,
+                     const detail::LowRankMass& lrm) {
+  auto [span_bk, span_fw] = order_forward_backward<D>(span1, span2);
+  auto scaled_diff = lrm.apply_inv(span_fw.theta_fw_ - span_bk.theta_bk_);
+  return span_fw.rho_fw_.dot(scaled_diff) < 0 ||
+         span_bk.rho_bk_.dot(scaled_diff) < 0;
+}
+
+template <Direction D, LogpGrad F, StepSizeAdapter A>
+static bool macro_step_lr(const F& logp_grad, const detail::LowRankMass& lrm,
+                          double step, std::size_t max_step_halvings,
+                          std::size_t min_micro_steps, double max_error,
+                          const SpanW& span, Eigen::VectorXd& theta_next,
+                          Eigen::VectorXd& rho_next, Eigen::VectorXd& grad_next,
+                          double& logp_pos_next, double& logp_next,
+                          A& adapt_handler) {
+  constexpr bool is_forward = (D == Direction::Forward);
+  const Eigen::VectorXd& theta = is_forward ? span.theta_fw_ : span.theta_bk_;
+  const Eigen::VectorXd& rho = is_forward ? span.rho_fw_ : span.rho_bk_;
+  const Eigen::VectorXd& grad =
+      is_forward ? span.grad_theta_fw_ : span.grad_theta_bk_;
+  double logp = is_forward ? span.logp_fw_ : span.logp_bk_;
+  step = is_forward ? step : -step;
+  for (std::size_t num_steps = min_micro_steps, halvings = 0;
+       halvings < max_step_halvings; ++halvings, num_steps *= 2, step *= 0.5) {
+    theta_next = theta;
+    rho_next = rho;
+    grad_next = grad;
+    double half_step = 0.5 * step;
+    for (std::size_t n = 0; n < num_steps; ++n) {
+      rho_next += half_step * grad_next;
+      theta_next += step * lrm.apply_inv(rho_next);
+      logp_grad(theta_next, logp_pos_next, grad_next);
+      rho_next += half_step * grad_next;
+    }
+    logp_next = logp_pos_next + lrm.logp_momentum(rho_next);
+    if (num_steps == min_micro_steps) {
+      double min_accept = std::exp(-std::fabs(logp - logp_next));
+      adapt_handler(min_accept);
+    }
+    if (std::fabs(logp - logp_next) <= max_error) {
+      return reversible_lr(logp_grad, lrm, step, num_steps, min_micro_steps,
+                           max_error, logp_next, theta_next, rho_next,
+                           grad_next);
+    }
+  }
+  return false;
+}
+
+template <Direction D, LogpGrad F, StepSizeAdapter A>
+static std::optional<SpanW> build_leaf_lr(const F& logp_grad, const SpanW& span,
+                                          const detail::LowRankMass& lrm,
+                                          double step, std::size_t max_step_halvings,
+                                          std::size_t min_micro_steps,
+                                          double max_error, A& adapt_handler) {
+  Eigen::VectorXd theta_next;
+  Eigen::VectorXd rho_next;
+  Eigen::VectorXd grad_theta_next;
+  double logp_pos_next = -std::numeric_limits<double>::infinity();
+  double logp_next = -std::numeric_limits<double>::infinity();
+  if (!macro_step_lr<D>(logp_grad, lrm, step, max_step_halvings,
+                        min_micro_steps, max_error, span, theta_next, rho_next,
+                        grad_theta_next, logp_pos_next, logp_next,
+                        adapt_handler)) {
+    return std::nullopt;
+  }
+  return SpanW::from_initial_point(std::move(theta_next), std::move(rho_next),
+                                   std::move(grad_theta_next), logp_pos_next,
+                                   logp_next);
+}
+
+template <Direction D, LogpGrad F, std::uniform_random_bit_generator RNG,
+          StepSizeAdapter A>
+static std::optional<SpanW> build_span_lr(
+    Random<RNG>& rng, const F& logp_grad, const detail::LowRankMass& lrm,
+    double step, std::size_t depth, std::size_t max_step_halvings,
+    std::size_t min_micro_steps, double max_error, const SpanW& last_span,
+    A& adapt_handler) {
+  if (depth == 0) {
+    return build_leaf_lr<D>(logp_grad, last_span, lrm, step, max_step_halvings,
+                            min_micro_steps, max_error, adapt_handler);
+  }
+  auto maybe_subspan1 = build_span_lr<D>(rng, logp_grad, lrm, step, depth - 1,
+                                         max_step_halvings, min_micro_steps,
+                                         max_error, last_span, adapt_handler);
+  if (!maybe_subspan1) {
+    return std::nullopt;
+  }
+  auto maybe_subspan2 = build_span_lr<D>(
+      rng, logp_grad, lrm, step, depth - 1, max_step_halvings, min_micro_steps,
+      max_error, *maybe_subspan1, adapt_handler);
+  if (!maybe_subspan2) {
+    return std::nullopt;
+  }
+  if (uturn_lr<D>(*maybe_subspan1, *maybe_subspan2, lrm)) {
+    return std::nullopt;
+  }
+  return std::make_optional(combine<Update::Barker, D>(
+      rng, std::move(*maybe_subspan1), std::move(*maybe_subspan2)));
+}
+
+template <LogpGrad F, std::uniform_random_bit_generator RNG, StepSizeAdapter A>
+inline Eigen::VectorXd transition_w_lr(
+    detail::Random<RNG>& rand, const F& logp_grad, const detail::LowRankMass& lrm, double step,
+    std::size_t max_depth, std::size_t max_step_halvings,
+    std::size_t min_micro_steps, double max_error, Eigen::VectorXd&& theta,
+    std::size_t& depth, Eigen::VectorXd& theta_grad, double& logp_pos_select,
+    A& step_size_adapter) {
+  // Momentum refresh via the exact low-rank Cholesky identity, using the
+  // shared normal stream (z) for reproducibility with the diagonal path.
+  Eigen::VectorXd z = rand.standard_normal(lrm.D.size()).matrix();
+  Eigen::VectorXd rho = lrm.sample_momentum_from(z);
+  Eigen::VectorXd grad(theta.size());
+  double logp_pos;
+  logp_grad(theta, logp_pos, grad);
+  double logp_joint = logp_pos + lrm.logp_momentum(rho);
+  auto span_accum = SpanW::from_initial_point(
+      std::move(theta), std::move(rho), std::move(grad), logp_pos, logp_joint);
+  for (depth = 1; depth <= max_depth; ++depth) {
+    auto expand_lr = [&](auto direction) -> bool {
+      constexpr Direction D = direction;
+      auto maybe_next_span = build_span_lr<D>(
+          rand, logp_grad, lrm, step, depth - 1, max_step_halvings,
+          min_micro_steps, max_error, span_accum, step_size_adapter);
+      if (!maybe_next_span) {
+        return true;
+      }
+      bool combined_uturn = uturn<D>(span_accum, *maybe_next_span, lrm.D);
+      span_accum = combine<Update::Metropolis, D>(rand, std::move(span_accum),
+                                                  std::move(*maybe_next_span));
+      return combined_uturn;
+    };
+    bool go_forward = rand.uniform_binary();
+    bool made_uturn = go_forward ? expand_lr(Forward_t{}) : expand_lr(Backward_t{});
+    if (made_uturn) {
+      break;
+    }
+  }
+  theta_grad = span_accum.grad_select_;
+  logp_pos_select = span_accum.logp_pos_select_;
+  return std::move(span_accum.theta_select_);
+}
+
 class NoOpStepSizeAdapter {
  public:
   /**
@@ -709,12 +907,31 @@ class WalnutsSampler {
     std::size_t depth;
     Eigen::VectorXd grad_next;
     double logp_pos;
-    theta_ = transition_w(rand_, logp_grad_, inv_mass_, cholesky_mass_,
-                          macro_time_, max_nuts_depth_, max_step_halvings_,
-                          min_micro_steps_, max_error_, std::move(theta_),
-                          depth, grad_next, logp_pos, no_op_step_size_adapter_);
+    if (lrm_.U.cols() > 0) {
+      lrm_.D = inv_mass_;  // keep diagonal in sync (lr factors fixed post-warmup)
+      theta_ = detail::transition_w_lr(
+          rand_, logp_grad_.logp_grad_, lrm_, macro_time_, max_nuts_depth_,
+          max_step_halvings_, min_micro_steps_, max_error_,
+          std::move(theta_), depth, grad_next, logp_pos,
+          no_op_step_size_adapter_);
+    } else {
+      theta_ = transition_w(rand_, logp_grad_, inv_mass_, cholesky_mass_,
+                            macro_time_, max_nuts_depth_, max_step_halvings_,
+                            min_micro_steps_, max_error_, std::move(theta_),
+                            depth, grad_next, logp_pos,
+                            no_op_step_size_adapter_);
+    }
     sample_handler_.get().on_sample(theta_, logp_pos);
     return logp_pos;
+  }
+
+  /**
+   * @brief Set the low-rank factors of the mass operator (post-construction).
+   */
+  void set_low_rank(const Eigen::MatrixXd& U, const Eigen::VectorXd& c) {
+    lrm_.D = inv_mass_;
+    lrm_.U = U;
+    lrm_.c = c;
   }
 
   /**
@@ -789,6 +1006,9 @@ class WalnutsSampler {
 
   /** A handler for adaptation which does nothing. */
   const detail::NoOpStepSizeAdapter no_op_step_size_adapter_;
+
+  /** Optional low-rank mass operator (empty U => pure diagonal). */
+  detail::LowRankMass lrm_{};
 };
 
 }  // namespace walnutpie

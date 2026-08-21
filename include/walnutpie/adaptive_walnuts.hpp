@@ -160,6 +160,9 @@ class MassEstimator {
    * dominant directions of the draw-score cross structure (full rank part
    * reserved for a dedicated transition variant; see low_rank_metric.hpp).
    */
+  const Eigen::MatrixXd& rank_U() const { return U_; }
+  const Eigen::VectorXd& rank_c() const { return c_; }
+
   Eigen::VectorXd rank_folded_estimate() const {
     Eigen::VectorXd diag = inv_mass_estimate();
     if (warmup_cfg_.metric_rank() == 0 ||
@@ -551,12 +554,38 @@ class AdaptiveWalnuts {
         (iteration_ + 1) % window == 0) {
       mass_estimator_.low_rank_update();
     }
+    const bool full_rank_mode =
+        warmup_cfg_.get().metric_rank() > 0 && warmup_cfg_.get().metric_full();
     Eigen::VectorXd inv_mass =
         drifting ? Eigen::VectorXd::Ones(theta_.size())
                  : (warmup_cfg_.get().metric_rank() > 0
                         ? mass_estimator_.rank_folded_estimate()
                         : mass_estimator_.inv_mass_estimate());
     Eigen::VectorXd chol_mass = inv_mass.array().inverse().sqrt().matrix();
+    if (full_rank_mode) {
+      detail::LowRankMass lrm;
+      lrm.D = mass_estimator_.inv_mass_estimate();
+      lrm.U = mass_estimator_.rank_U();
+      lrm.c = mass_estimator_.rank_c();
+      Eigen::VectorXd grad_select;
+      double logp_select;
+      std::size_t depth;
+      theta_ = detail::transition_w_lr(
+          rand_, logp_grad_.logp_grad_, lrm, opt_.step_size(),
+          sampling_cfg_.get().max_trajectory_doublings(),
+          sampling_cfg_.get().max_step_halvings(),
+          min_micro_estimator_.min_micro_steps(),
+          drifting ? std::numeric_limits<double>::infinity()
+                   : effective_max_error(),
+          std::move(theta_), depth, grad_select, logp_select, opt_);
+      if (!drifting) {
+        mass_estimator_.observe(theta_, grad_select, iteration_);
+      }
+      min_micro_estimator_.observe(1 << depth);
+      handler_.get().on_warmup(theta_, logp_select, step_size(), lrm.D);
+      ++iteration_;
+      return;
+    }
     Eigen::VectorXd grad_select;
     double logp_select;
     std::size_t depth;
@@ -622,12 +651,20 @@ class AdaptiveWalnuts {
    */
   WalnutsSampler<F, RNG, H> sampler() {
     handler_.get().on_warmup_complete(step_size(), inv_mass());
-    return WalnutsSampler<F, RNG, H>(
+    WalnutsSampler<F, RNG, H> out(
         rand_.rng(), handler_, logp_grad_.logp_grad_, theta_, inv_mass(),
         step_size(), sampling_cfg_.get().max_trajectory_doublings(),
         sampling_cfg_.get().max_step_halvings(),
         min_micro_estimator_.min_micro_steps(),
         sampling_cfg_.get().max_hamiltonian_error());
+    if (warmup_cfg_.get().metric_rank() > 0 &&
+        warmup_cfg_.get().metric_full()) {
+      // Preserve the low-rank factors the warmup adapted with: freezing to
+      // the diagonal alone would sample under a different metric than the
+      // one step size and micro-step tuning were calibrated for.
+      out.set_low_rank(mass_estimator_.rank_U(), mass_estimator_.rank_c());
+    }
+    return out;
   }
 
   /**
