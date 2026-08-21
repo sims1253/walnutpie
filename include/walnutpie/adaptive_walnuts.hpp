@@ -192,6 +192,60 @@ class MassEstimator {
    * diagonal estimate. Draws/scores come from the streaming accumulators'
    * raw window, retained for exactly this purpose.
    */
+  static Eigen::VectorXd row_sample_variance_pub(const Eigen::MatrixXd& M) {
+    Eigen::VectorXd mu = M.rowwise().mean();
+    Eigen::MatrixXd centered = M.colwise() - mu;
+    return centered.cwiseProduct(centered).rowwise().sum() /
+           std::max(1.0, static_cast<double>(M.cols() - 1));
+  }
+
+  /**
+   * @brief Cross-structure strength of the current window: the second-to-first
+   * singular value ratio of the standardized stacked [draws | scores] matrix.
+   *
+   * ~0: geometry is (conditionally) diagonal, rank corrections are noise.
+   * O(1): strong off-diagonal structure, rank corrections carry signal.
+   */
+  double window_cross_ratio() const {
+    // Concentration of the singular-value EXCESS above the isotropic baseline
+    // (sqrt(2K)) in the top-r directions. Empirically inverted as a screening
+    // signal: spread spectra (low fraction, e.g. < 0.1) mark genuinely
+    // cross-correlated geometry where rank corrections help; concentrated
+    // spectra (fraction -> 1) mark funnel/spike geometry where rank
+    // corrections destabilize (eight_schools_centered, blr).
+    if (window_draws_.size() < 4) return 1.0;
+    const std::size_t dim = window_draws_[0].size();
+    const std::size_t K = window_draws_.size();
+    const std::size_t r = std::min<std::size_t>(
+        5, std::min(dim, static_cast<std::size_t>(K / 4)));
+    if (r == 0) return 1.0;
+    Eigen::MatrixXd Y(dim, K), S(dim, K);
+    for (std::size_t k = 0; k < K; ++k) {
+      Y.col(k) = window_draws_[k];
+      S.col(k) = window_scores_[k];
+    }
+    Eigen::VectorXd vy = row_sample_variance_pub(Y);
+    Eigen::VectorXd vs = row_sample_variance_pub(S);
+    Eigen::MatrixXd Ys = vy.cwiseSqrt().cwiseInverse().asDiagonal() * Y;
+    Eigen::MatrixXd Ss = vs.cwiseSqrt().cwiseInverse().asDiagonal() * S;
+    Eigen::MatrixXd st(dim, 2 * K);
+    st << Ys, Ss;
+    Eigen::JacobiSVD<Eigen::MatrixXd> svd(st, Eigen::ComputeThinU);
+    const auto& sv = svd.singularValues();
+    if (sv.size() < 2) return 1.0;
+    const double baseline = std::sqrt(2.0 * static_cast<double>(K));
+    double excess_total = 0.0;
+    for (int i = 0; i < sv.size(); ++i) {
+      excess_total += std::max(0.0, sv[i] - baseline);
+    }
+    if (excess_total <= 1e-12) return 1.0;
+    double excess_top = 0.0;
+    for (std::size_t i = 0; i < r && i < static_cast<std::size_t>(sv.size()); ++i) {
+      excess_top += std::max(0.0, sv[i] - baseline);
+    }
+    return excess_top / excess_total;
+  }
+
   void low_rank_update() {
     if (warmup_cfg_.metric_rank() == 0 || window_draws_.size() < 4) {
       return;
@@ -556,9 +610,14 @@ class AdaptiveWalnuts {
     }
     const bool full_rank_mode =
         warmup_cfg_.get().metric_rank() > 0 && warmup_cfg_.get().metric_full();
+    const bool auto_screen = warmup_cfg_.get().metric_auto() > 0;
+    const bool rank_active =
+        warmup_cfg_.get().metric_rank() > 0 &&
+        (!auto_screen ||
+         mass_estimator_.window_cross_ratio() <= warmup_cfg_.get().metric_auto());
     Eigen::VectorXd inv_mass =
         drifting ? Eigen::VectorXd::Ones(theta_.size())
-                 : (warmup_cfg_.get().metric_rank() > 0
+                 : (rank_active
                         ? mass_estimator_.rank_folded_estimate()
                         : mass_estimator_.inv_mass_estimate());
     Eigen::VectorXd chol_mass = inv_mass.array().inverse().sqrt().matrix();

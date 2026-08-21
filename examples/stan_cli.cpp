@@ -250,6 +250,7 @@ int main(int argc, char** argv) {
   std::size_t metric_window = 0;
   std::size_t metric_rank = 0;
   bool metric_full = false;
+  double metric_auto = 0.0;
   double max_error_start = 0.0;
   std::size_t max_error_schedule_iters = 0;
   double da_gamma = default_warmup.da_gamma();
@@ -382,6 +383,13 @@ int main(int argc, char** argv) {
                    "Clamp gradient-seeded initial masses to [1/clamp, clamp] "
                    "(e.g. 100; 0 = off)")
         ->default_val(mass_init_clamp);
+
+    app.add_option("--metric-auto", metric_auto,
+                   "Auto-select the rank-corrected metric per window: apply "
+                   "when the singular-excess concentration in the top "
+                   "directions is at most this threshold (spread spectra = "
+                   "cross-correlated geometry; 0 = off; e.g. 0.5)")
+        ->default_val(metric_auto);
 
     app.add_flag("--metric-full", metric_full,
                  "Use the exact low-rank mass operator in the hot loop "
@@ -524,6 +532,7 @@ int main(int argc, char** argv) {
           .metric_window(metric_window)
           .metric_rank(metric_rank)
           .metric_full(metric_full)
+          .metric_auto(metric_auto)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
