@@ -287,4 +287,30 @@ inline void adapt(const InitConfig& init_cfg, const WarmupConfig& warmup_cfg,
       controller_loop(buffers, interrupt_callback, init_cfg, warmup_cfg);
 }
 
+/**
+ * @brief Adaptation returning the adaptation statistics.
+ *
+ * Identical to the void overload, but exposes the AdaptResult (including the
+ * cross-chain log-mass dispersion) for mode-aware reinitialization policies.
+ */
+template <AdaptiveSampler A, InterruptCallback IC>
+inline AdaptResult adapt_with_stats(const InitConfig& init_cfg,
+                                    const WarmupConfig& warmup_cfg,
+                                    std::vector<A>& adapters,
+                                    const IC& interrupt_callback) {
+  std::deque<SpscBuffer<AdaptSnapshot>> buffers =
+      construct_buffers(init_cfg.num_chains(), init_cfg.dims());
+
+  std::latch start_gate(static_cast<std::ptrdiff_t>(init_cfg.num_chains() + 1));
+  std::vector<std::jthread> threads;
+  threads.reserve(init_cfg.num_chains());
+  for (std::size_t m = 0; m < init_cfg.num_chains(); ++m) {
+    threads.emplace_back(
+        AdaptWorker<A>(warmup_cfg, adapters[m], buffers[m], start_gate));
+  }
+  start_gate.arrive_and_wait();
+
+  return controller_loop(buffers, interrupt_callback, init_cfg, warmup_cfg);
+}
+
 }  // namespace walnutpie::detail
