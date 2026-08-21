@@ -169,15 +169,16 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                                     false, mass_init_clamp)
                       .build();
   auto inits = init_cfg.init_chain_config(0);
+  std::mt19937_64 rng{seed};
   if (step_init_heuristic) {
     const auto inv_mass = inits.mass().array().inverse().matrix().eval();
+    walnutpie::detail::Random heur_rand(rng);
     double eps = walnutpie::detail::find_reasonable_step(
-        logp, inits.position(), inv_mass, inits.step_size());
+        heur_rand, logp, inits.position(), inv_mass, inits.step_size());
     inits = walnutpie::InitChainConfig(eps, inits.position(), inits.mass());
     std::cout << "Heuristic initial step size: " << eps << std::endl;
   }
 
-  std::mt19937_64 rng{seed};
   walnutpie::AdaptiveWalnuts<decltype(logp), decltype(rng), StanHandler, Opt>
       walnuts(
       rng, storage, logp, inits, warmup_cfg, sample_cfg);

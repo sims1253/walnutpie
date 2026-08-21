@@ -5,6 +5,8 @@
 
 #include "walnutpie/concepts.hpp"
 
+#include "walnutpie/util.hpp"
+
 namespace walnutpie::detail {
 
 /**
@@ -21,15 +23,19 @@ namespace walnutpie::detail {
  * @param eps Initial step size guess (positive).
  * @return The adapted step size.
  */
-template <LogpGrad F>
-double find_reasonable_step(const F& logp_grad, const Eigen::VectorXd& theta,
+template <LogpGrad F, std::uniform_random_bit_generator RNG>
+double find_reasonable_step(detail::Random<RNG>& rand, const F& logp_grad,
+                            const Eigen::VectorXd& theta,
                             const Eigen::VectorXd& inv_mass, double eps) {
   Eigen::VectorXd grad;
   double lp;
   logp_grad(theta, lp, grad);
-  // one leapfrog micro step
+  // one leapfrog micro step. rho comes from the CALLER'S seeded RNG:
+  // Eigen::VectorXd::Random() draws from std::rand(), which nothing ties to
+  // --seed, so the heuristic made fixed-seed runs irreproducible (found via
+  // bit-diffing paired runs; see PR #4 follow-up 14).
   auto accept_of = [&](double e) {
-    Eigen::VectorXd rho = Eigen::VectorXd::Random(theta.size());
+    Eigen::VectorXd rho = rand.standard_normal(theta.size()).matrix();
     Eigen::VectorXd p = rho.cwiseProduct(inv_mass.cwiseSqrt());  // ~N(0, M)
     double h0 = -lp + 0.5 * p.cwiseProduct(inv_mass).dot(p);
     Eigen::VectorXd p1 = p + 0.5 * e * grad;
