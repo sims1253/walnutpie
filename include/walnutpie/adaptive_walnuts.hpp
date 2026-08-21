@@ -578,6 +578,7 @@ class AdaptiveWalnuts {
         handler_(handler),
         logp_grad_(logp_grad, handler),
         theta_(init_chain_cfg.position()),
+        last_mass_(init_chain_cfg.mass()),
         iteration_(0),
         opt_(make_configured_adapter<Opt>(init_chain_cfg, warmup_cfg)),
         mass_estimator_(warmup_cfg, init_chain_cfg),
@@ -655,6 +656,13 @@ class AdaptiveWalnuts {
       if (!drifting) {
         mass_estimator_.observe(theta_, grad_select, iteration_);
       }
+      // Full-rank mode integrates with the low-rank OPERATOR whose diagonal
+      // is the UNFOLDED inv_mass_estimate() (see lrm.D above), not the folded
+      // inv_mass this iteration also computed. The frozen sampler rebuilds
+      // lrm.D from inv_mass(), so the memo must carry the unfolded diagonal
+      // (mass convention) or sampling silently runs a different operator than
+      // warmup tuned under — the third instance of the freeze-mismatch family.
+      last_mass_ = lrm.D.cwiseInverse();
       min_micro_estimator_.observe(1 << depth);
       handler_.get().on_warmup(theta_, logp_select, step_size(), lrm.D);
       ++iteration_;
@@ -708,6 +716,7 @@ class AdaptiveWalnuts {
         mass_estimator_.reset_to_seeds();
       }
     }
+    last_mass_ = inv_mass.cwiseInverse();
     min_micro_estimator_.observe(1 << depth);
     handler_.get().on_warmup(theta_, logp_select, step_size(), inv_mass);
     ++iteration_;
@@ -752,16 +761,11 @@ class AdaptiveWalnuts {
     // auto-screen) warmup integrates with rank_folded_estimate(); freezing
     // with the unfolded estimate silently changes the Hamiltonian at the
     // warmup/sampling boundary (step size was tuned for the folded metric).
-    const bool auto_screen = warmup_cfg_.get().metric_auto() > 0;
-    const bool rank_active =
-        warmup_cfg_.get().metric_rank() > 0 &&
-        (!auto_screen ||
-         mass_estimator_.window_cross_ratio() <=
-             warmup_cfg_.get().metric_auto());
-    if (rank_active) {
-      return mass_estimator_.rank_folded_estimate();
-    }
-    return mass_estimator_.inv_mass_estimate();
+    // The memo avoids a second staleness hazard: operator() recomputes the
+    // estimate AFTER the final observe(), so recomputing here reads an
+    // estimator one draw ahead of the last transition and can flip the
+    // auto-screen decision at the freeze boundary.
+    return last_mass_.cwiseInverse();
   }
 
   /**
@@ -832,6 +836,18 @@ class AdaptiveWalnuts {
 
   /** The current state. */
   Eigen::VectorXd theta_;
+
+  /**
+   * @brief Mass used by the most recent warmup transition (MASS convention,
+   * like InitChainConfig::mass(); inv_mass() inverts it).
+   *
+   * operator() recomputes the estimate AFTER observing (the estimator window
+   * advances one draw between the last transition and a sampler() call), so
+   * recomputing at freeze time can flip the auto-screen decision and freeze
+   * a different metric than the chain's final transitions used. Frozen
+   * samplers must carry the metric they were tuned with, hence the memo.
+   */
+  Eigen::VectorXd last_mass_;
 
   /** The current iteration. */
   std::size_t iteration_;
