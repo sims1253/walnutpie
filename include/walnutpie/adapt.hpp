@@ -158,6 +158,17 @@ struct AdaptResult {
    * The average step size.
    */
   double step_bar;
+
+  /**
+   * @brief Per-chain dispersion of log mass diagonals at the end of
+   * adaptation, a cheap cross-chain disagreement diagnostic.
+   *
+   * Values near 0 indicate the chains converged to the same scale estimate;
+   * large values indicate chains locked into different posterior scales (the
+   * multimodality/scale-lock signature). Intended as the trigger for
+   * mode-aware re-initialization policies in embedding code.
+   */
+  double log_mass_dispersion = 0.0;
 };
 
 /**
@@ -220,7 +231,25 @@ inline AdaptResult controller_loop(
                        max_rel_diff_step <= warmup_cfg.step_size_converge_tol();
       bool hit_max_iter = num_draws == max_draws;
       if (converged || hit_max_iter) {
-        return {geom_mean_mass, std::exp(mean_log_step)};
+        // Cross-chain scale disagreement: mean over coordinates of the
+        // variance across chains of log mass. Cheap O(M*D); recomputed here
+        // rather than accumulated to keep the loop branch simple.
+        double disp_sum = 0.0;
+        for (std::size_t d = 0; d < D; ++d) {
+          double m_log = 0.0;
+          for (std::size_t m2 = 0; m2 < M; ++m2) {
+            m_log += latest[m2].log_mass[d];
+          }
+          m_log /= static_cast<double>(M);
+          double v = 0.0;
+          for (std::size_t m2 = 0; m2 < M; ++m2) {
+            const double dev = latest[m2].log_mass[d] - m_log;
+            v += dev * dev;
+          }
+          disp_sum += v / static_cast<double>(M - 1);
+        }
+        return {geom_mean_mass, std::exp(mean_log_step),
+                disp_sum / static_cast<double>(D)};
       }
     }
 

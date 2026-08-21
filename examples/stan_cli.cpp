@@ -189,6 +189,9 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   // N post-warmup draws
   auto sampler = walnuts.sampler();  // freeze tuning
   std::cout << "Adaptation completed." << std::endl;
+  std::cout << "Note: multi-chain mode (walnutpie::adapt) reports a "
+               "log-mass cross-chain dispersion diagnostic for mode-aware "
+               "reinit policies; single-chain CLI does not." << std::endl;
   std::cout << "Macro time = " << sampler.macro_time() << std::endl;
   std::cout << "Mass matrix diagonal = ["
             << sampler.inverse_mass_matrix_diagonal() << "]" << std::endl;
