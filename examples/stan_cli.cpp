@@ -204,7 +204,7 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                              std::max(prev_mass.norm(), 1e-12);
           double step_diff = std::abs(step - prev_step) /
                              std::max(std::abs(prev_step), 1e-12);
-          if (mass_diff < early_exit_tol && step_diff < 0.3) {
+          if (mass_diff < early_exit_tol && step_diff < 0.1) {
             std::cout << "Early warmup exit at iteration " << (w + 1)
                       << " (mass_diff=" << mass_diff
                       << ", step_diff=" << step_diff << ")" << std::endl;
