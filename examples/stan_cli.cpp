@@ -135,7 +135,8 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                         bool save_warmup, walnutpie::WarmupConfig& warmup_cfg,
                         walnutpie::SamplingConfig& sample_cfg,
                         double mass_init_clamp = 0.0,
-                        bool step_init_heuristic = false) {
+                        bool step_init_heuristic = false,
+                        double early_exit_tol = 0.0) {
   using Clock = std::chrono::high_resolution_clock;
   auto elapsed_seconds = [](auto t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
@@ -182,8 +183,42 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   walnutpie::AdaptiveWalnuts<decltype(logp), decltype(rng), StanHandler, Opt>
       walnuts(
       rng, storage, logp, inits, warmup_cfg, sample_cfg);
-  for (std::size_t w = 0; w < num_warmup; ++w) {
-    walnuts();
+  // W-21: temporal-stabilization early exit (single-chain analogue of the
+  // multi-chain controller's convergence stop). Every 50 iterations — the
+  // metric-window length, so successive snapshots are INDEPENDENT window
+  // estimates — compare inv_mass() to the previous snapshot; exit when the
+  // l2 rel-diff of the mass and the rel-diff of the step size have both
+  // stabilized. Floors: 200 iters minimum (4 full metric windows).
+  if (early_exit_tol > 0.0) {
+    const std::size_t period = 50;
+    const std::size_t min_iters = 200;
+    Eigen::VectorXd prev_mass;
+    double prev_step = -1.0;
+    for (std::size_t w = 0; w < num_warmup; ++w) {
+      walnuts();
+      if ((w + 1) >= min_iters && (w + 1) % period == 0) {
+        Eigen::VectorXd mass = walnuts.inv_mass();
+        double step = walnuts.step_size();
+        if (prev_mass.size() == mass.size()) {
+          double mass_diff = (mass - prev_mass).norm() /
+                             std::max(prev_mass.norm(), 1e-12);
+          double step_diff = std::abs(step - prev_step) /
+                             std::max(std::abs(prev_step), 1e-12);
+          if (mass_diff < early_exit_tol && step_diff < 0.3) {
+            std::cout << "Early warmup exit at iteration " << (w + 1)
+                      << " (mass_diff=" << mass_diff
+                      << ", step_diff=" << step_diff << ")" << std::endl;
+            break;
+          }
+        }
+        prev_mass = mass;
+        prev_step = step;
+      }
+    }
+  } else {
+    for (std::size_t w = 0; w < num_warmup; ++w) {
+      walnuts();
+    }
   }
   end_timing();
 
@@ -251,6 +286,7 @@ int main(int argc, char** argv) {
   std::size_t metric_window = 0;
   std::size_t metric_rank = 0;
   std::size_t metric_basis = 0;
+  double early_exit_tol = 0.0;  // 0 = fixed warmup (default)
   bool metric_full = false;
   double metric_auto = 0.0;
   double max_error_start = 0.0;
@@ -410,6 +446,14 @@ int main(int argc, char** argv) {
                    "Newton-Schulz polar, 3=MuonEq-style equilibrated polar")
         ->default_val(metric_basis)
         ->check(CLI::Range(0, 3));
+
+    app.add_option("--early-exit-warmup", early_exit_tol,
+                   "Temporal stabilization early-exit for single-chain "
+                   "warmup: exit when successive 50-iter window mass "
+                   "estimates agree within this l2 rel-diff (and step "
+                   "within 0.3), after 200 iters; 0 = fixed warmup")
+        ->default_val(early_exit_tol)
+        ->check(CLI::NonNegativeNumber);
 
     app.add_option("--metric-window", metric_window,
                    "Memoryless metric windows: reset the draw/score moment "
@@ -605,36 +649,36 @@ int main(int argc, char** argv) {
           return run_walnuts<
               AntiWindupAdapter<ClippedAdapter<BatchedAdapter<Opt>>>>(
               model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second);
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
         } else if (step_opt_batch_stride > 1) {
           return run_walnuts<AntiWindupAdapter<BatchedAdapter<Opt>>>(
               model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second);
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
         } else if (step_grad_clip > 0.0) {
           return run_walnuts<AntiWindupAdapter<ClippedAdapter<Opt>>>(
               model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second);
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
         }
         return run_walnuts<AntiWindupAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
       }
       if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
       } else if (step_opt_batch_stride > 1) {
         return run_walnuts<BatchedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
       } else if (step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
       }
       return run_walnuts<Opt>(model, seed, init_cfg, num_warmup, num_draws,
                               save_warmup, warmup_cfg, sample_cfg, extra.first,
-                              extra.second);
+                              extra.second, early_exit_tol);
     };
     if (step_optimizer == "adam") {
       return run_base(std::type_identity<Adam>{});
