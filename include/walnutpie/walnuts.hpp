@@ -526,6 +526,11 @@ static std::optional<SpanW> build_span(Random<RNG>& rng, const F& logp_grad,
  * @param[out] theta_grad The gradient of the log density at the previous state.
  * @param[out] logp_pos_select The log density of the selected position.
  * @param[in,out] step_size_adapter The step-size adaptation handler.
+ * @param[in] grad_cached If non-empty and the same size as `theta`, the
+ * gradient of the log density at `theta` computed by the previous
+ * transition (endpoint reuse); the start-position re-evaluation is skipped.
+ * @param[in] logp_cached The log density at `theta` corresponding to
+ * `grad_cached` (only used when the cache is valid).
  * @return The next position in the Markov chain.
  */
 template <LogpGrad F, class Rand, StepSizeAdapter A>
@@ -535,12 +540,22 @@ inline Eigen::VectorXd transition_w(
     std::size_t max_step_halvings, std::size_t min_micro_steps,
     double max_error, Eigen::VectorXd&& theta, std::size_t& depth,
     Eigen::VectorXd& theta_grad, double& logp_pos_select,
-    A& step_size_adapter) {
+    A& step_size_adapter, const Eigen::VectorXd& grad_cached = Eigen::VectorXd(),
+    double logp_cached = -std::numeric_limits<double>::infinity()) {
   auto z = rand.standard_normal(chol_mass.size());
   Eigen::VectorXd rho = (chol_mass.array() * z.array()).matrix();
-  Eigen::VectorXd grad(theta.size());
+  Eigen::VectorXd grad;
   double logp_pos;
-  logp_grad(theta, logp_pos, grad);
+  if (grad_cached.size() == theta.size()) {
+    // W-23 endpoint-gradient threading: the previous transition ended at this
+    // exact position and already computed its (logp, grad); reusing the
+    // identical doubles changes no downstream arithmetic.
+    grad = grad_cached;
+    logp_pos = logp_cached;
+  } else {
+    grad.resize(theta.size());
+    logp_grad(theta, logp_pos, grad);
+  }
   double logp_joint = logp_pos + logp_momentum(rho, inv_mass);
   auto span_accum = SpanW::from_initial_point(
       std::move(theta), std::move(rho), std::move(grad), logp_pos, logp_joint);
@@ -757,14 +772,21 @@ inline Eigen::VectorXd transition_w_lr(
     std::size_t max_depth, std::size_t max_step_halvings,
     std::size_t min_micro_steps, double max_error, Eigen::VectorXd&& theta,
     std::size_t& depth, Eigen::VectorXd& theta_grad, double& logp_pos_select,
-    A& step_size_adapter) {
+    A& step_size_adapter, const Eigen::VectorXd& grad_cached = Eigen::VectorXd(),
+    double logp_cached = -std::numeric_limits<double>::infinity()) {
   // Momentum refresh via the exact low-rank Cholesky identity, using the
   // shared normal stream (z) for reproducibility with the diagonal path.
   Eigen::VectorXd z = rand.standard_normal(lrm.D.size()).matrix();
   Eigen::VectorXd rho = lrm.sample_momentum_from(z);
-  Eigen::VectorXd grad(theta.size());
+  Eigen::VectorXd grad;
   double logp_pos;
-  logp_grad(theta, logp_pos, grad);
+  if (grad_cached.size() == theta.size()) {
+    grad = grad_cached;
+    logp_pos = logp_cached;
+  } else {
+    grad.resize(theta.size());
+    logp_grad(theta, logp_pos, grad);
+  }
   double logp_joint = logp_pos + lrm.logp_momentum(rho);
   auto span_accum = SpanW::from_initial_point(
       std::move(theta), std::move(rho), std::move(grad), logp_pos, logp_joint);
@@ -913,16 +935,31 @@ class WalnutsSampler {
           rand_, logp_grad_.logp_grad_, lrm_, macro_time_, max_nuts_depth_,
           max_step_halvings_, min_micro_steps_, max_error_,
           std::move(theta_), depth, grad_next, logp_pos,
-          no_op_step_size_adapter_);
+          no_op_step_size_adapter_, cached_grad_, cached_logp_);
     } else {
       theta_ = transition_w(rand_, logp_grad_, inv_mass_, cholesky_mass_,
                             macro_time_, max_nuts_depth_, max_step_halvings_,
                             min_micro_steps_, max_error_, std::move(theta_),
                             depth, grad_next, logp_pos,
-                            no_op_step_size_adapter_);
+                            no_op_step_size_adapter_, cached_grad_,
+                            cached_logp_);
     }
+    // Cache the endpoint (grad, logp) so the next transition's start-position
+    // evaluation reuses them (W-23 endpoint-gradient threading).
+    cached_grad_ = std::move(grad_next);
+    cached_logp_ = logp_pos;
     sample_handler_.get().on_sample(theta_, logp_pos);
     return logp_pos;
+  }
+
+  /**
+   * @brief Seed the endpoint cache (e.g. from the final warmup transition at
+   * the freeze boundary) so the first sampling transition skips its
+   * start-position re-evaluation.
+   */
+  void seed_endpoint_cache(Eigen::VectorXd grad, double logp) {
+    cached_grad_ = std::move(grad);
+    cached_logp_ = logp;
   }
 
   /**
@@ -1019,6 +1056,12 @@ class WalnutsSampler {
 
   /** Optional low-rank mass operator (empty U => pure diagonal). */
   detail::LowRankMass lrm_{};
+
+  /** Cached endpoint gradient at `theta_` from the last transition (W-23). */
+  Eigen::VectorXd cached_grad_;
+
+  /** Cached endpoint log density at `theta_` from the last transition. */
+  double cached_logp_ = -std::numeric_limits<double>::infinity();
 };
 
 }  // namespace walnutpie

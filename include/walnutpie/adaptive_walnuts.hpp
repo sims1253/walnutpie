@@ -653,7 +653,12 @@ class AdaptiveWalnuts {
           min_micro_estimator_.min_micro_steps(),
           drifting ? std::numeric_limits<double>::infinity()
                    : effective_max_error(),
-          std::move(theta_), depth, grad_select, logp_select, opt_);
+          std::move(theta_), depth, grad_select, logp_select, opt_,
+          cached_grad_, cached_logp_);
+      // W-23: cache the endpoint (grad, logp) for the next transition's
+      // start-position reuse (duplicate eval elimination, see W-20).
+      cached_grad_ = grad_select;
+      cached_logp_ = logp_select;
       if (!drifting) {
         mass_estimator_.observe(theta_, grad_select, iteration_);
       }
@@ -691,7 +696,8 @@ class AdaptiveWalnuts {
                             sampling_cfg_.get().max_step_halvings(),
                             min_micro_estimator_.min_micro_steps(), max_err,
                             std::move(theta_), depth, grad_select,
-                            logp_select, drift_noop);
+                            logp_select, drift_noop, cached_grad_,
+                            cached_logp_);
     } else {
       theta_ = transition_w(rand_, logp_grad_, inv_mass, chol_mass,
                             opt_.step_size(),
@@ -699,8 +705,10 @@ class AdaptiveWalnuts {
                             sampling_cfg_.get().max_step_halvings(),
                             min_micro_estimator_.min_micro_steps(), max_err,
                             std::move(theta_), depth, grad_select,
-                            logp_select, opt_);
+                            logp_select, opt_, cached_grad_, cached_logp_);
     }
+    cached_grad_ = grad_select;
+    cached_logp_ = logp_select;
     if (!drifting) {
       // Suspend metric estimation during drift: the draws observed while the
       // chain is pinned/throttled poison the variance estimates (the
@@ -748,6 +756,10 @@ class AdaptiveWalnuts {
       // one step size and micro-step tuning were calibrated for.
       out.set_low_rank(mass_estimator_.rank_U(), mass_estimator_.rank_c());
     }
+    // W-23: seed the frozen sampler's endpoint cache with the final warmup
+    // transition's (grad, logp) at exactly this position, so the first
+    // sampling transition skips its start-position re-evaluation too.
+    out.seed_endpoint_cache(cached_grad_, cached_logp_);
     return out;
   }
 
@@ -837,6 +849,12 @@ class AdaptiveWalnuts {
 
   /** The current state. */
   Eigen::VectorXd theta_;
+
+  /** Cached endpoint gradient at `theta_` from the last transition (W-23). */
+  Eigen::VectorXd cached_grad_;
+
+  /** Cached endpoint log density at `theta_` from the last transition. */
+  double cached_logp_ = -std::numeric_limits<double>::infinity();
 
   /**
    * @brief Mass used by the most recent warmup transition (MASS convention,
