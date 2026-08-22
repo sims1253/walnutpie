@@ -359,7 +359,8 @@ class InitConfigBuilder {
    */
   template <LogpGrad F>
   InitConfigBuilder& masses(const F& logp_grad, double mass_smoothing,
-                            bool average_masses = false) {
+                            bool average_masses = false,
+                            double clamp = 0.0) {
     detail::validate_probability(mass_smoothing, "mass_smoothing");
     Eigen::VectorXd grad;
     masses_.resize(num_chains_);
@@ -367,6 +368,12 @@ class InitConfigBuilder {
       double lp_to_discard;
       logp_grad(positions_[c], lp_to_discard, grad);
       masses_[c] = (1 - mass_smoothing) * grad.array().abs() + mass_smoothing;
+      if (clamp > 0) {
+        // Guard against far-from-typical-set initializations where the
+        // gradient magnitude (and hence the seeded mass) is enormous; a
+        // degenerate seed throttles all early movement (inv_mass ~ 1/|grad|).
+        masses_[c] = masses_[c].cwiseMin(clamp).cwiseMax(1.0 / clamp);
+      }
     }
     if (average_masses) {
       Eigen::Index D = masses_[0].size();
@@ -622,6 +629,49 @@ class WarmupConfig {
 
   double mass_var_floor() const { return mass_var_floor_; }
 
+  bool metric_drift_guard() const { return metric_drift_guard_; }
+
+  double mass_combine_power() const { return mass_combine_power_; }
+
+  double metric_collapse_reset() const { return metric_collapse_reset_; }
+
+  double metric_stall_reset() const { return metric_stall_reset_; }
+
+  std::size_t metric_stall_window() const { return metric_stall_window_; }
+
+  double mass_init_clamp() const { return mass_init_clamp_; }
+
+  /**
+   * @brief Basis-extraction rule for the low-rank metric factors.
+   *
+   * 0 = windowed thin SVD of the standardized stacked draw/score matrix
+   *     (default; Algorithm 1 of the low-rank Fisher metric).
+   * 1 = streaming orthogonal (power) iteration with a persistent basis.
+   * 2 = Muon-style Newton-Schulz polar orthogonalization of the stacked
+   *     matrix (column-selection by pre-orthonormalization leverage).
+   * 3 = as 2 but with row RMS equilibration before orthogonalization
+   *     (MuonEq-style), the diagonal-adjacent ablation.
+   */
+  std::size_t metric_basis() const { return metric_basis_; }
+
+  std::size_t anti_windup_pass_rate() const { return anti_windup_pass_rate_; }
+
+  std::size_t drift_iters() const { return drift_iters_; }
+
+  std::size_t metric_window() const { return metric_window_; }
+
+  std::size_t metric_rank() const { return metric_rank_; }
+
+  bool metric_full() const { return metric_full_; }
+
+  double metric_auto() const { return metric_auto_; }
+
+  double max_error_start() const { return max_error_start_; }
+
+  std::size_t max_error_schedule_iters() const {
+    return max_error_schedule_iters_;
+  }
+
   /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
@@ -663,6 +713,21 @@ class WarmupConfig {
   bool da_freeze_average_ = false;
   double mass_shrink_kappa_ = 0.0;
   double mass_var_floor_ = 0.0;
+  bool metric_drift_guard_ = false;
+  double mass_combine_power_ = 0.0;
+  double metric_collapse_reset_ = 0.0;
+  double metric_stall_reset_ = 0.0;
+  std::size_t metric_stall_window_ = 100;
+  double mass_init_clamp_ = 0.0;
+  std::size_t metric_basis_ = 0;  // 0=svd 1=power 2=muon 3=muoneq
+  std::size_t anti_windup_pass_rate_ = 0;
+  std::size_t drift_iters_ = 0;
+  std::size_t metric_window_ = 0;
+  std::size_t metric_rank_ = 0;
+  bool metric_full_ = false;
+  double metric_auto_ = 0.0;
+  double max_error_start_ = 0.0;
+  std::size_t max_error_schedule_iters_ = 0;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
 };
@@ -867,6 +932,99 @@ class WarmupConfigBuilder {
       throw std::invalid_argument("mass_shrink_kappa must be >= 0 (0 = off)");
     }
     cfg_.mass_shrink_kappa_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_auto(double v) {
+    if (v < 0 || v > 1) {
+      throw std::invalid_argument(
+          "metric_auto threshold must be in [0, 1] (0 = off)");
+    }
+    cfg_.metric_auto_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_full(bool v) {
+    cfg_.metric_full_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_rank(std::size_t v) {
+    cfg_.metric_rank_ = v;  // 0 = off
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_window(std::size_t v) {
+    cfg_.metric_window_ = v;  // 0 = off (exponential discounting only)
+    return *this;
+  }
+
+  WarmupConfigBuilder& drift_iters(std::size_t v) {
+    cfg_.drift_iters_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& max_error_schedule(double start, std::size_t iters) {
+    if (start < 0) {
+      throw std::invalid_argument("max_error_schedule start must be >= 0");
+    }
+    cfg_.max_error_start_ = start;
+    cfg_.max_error_schedule_iters_ = iters;
+    return *this;
+  }
+
+  WarmupConfigBuilder& anti_windup_pass_rate(std::size_t v) {
+    cfg_.anti_windup_pass_rate_ = v;  // 0 = off
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_basis(std::size_t v) {
+    if (v > 3) {
+      throw std::invalid_argument("metric_basis must be 0..3");
+    }
+    cfg_.metric_basis_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& mass_init_clamp(double v) {
+    if (v < 0) {
+      throw std::invalid_argument("mass_init_clamp must be >= 0");
+    }
+    cfg_.mass_init_clamp_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_stall_reset(double v,
+                                          std::size_t window = 100) {
+    if (v < 0) {
+      throw std::invalid_argument(
+          "metric_stall_reset must be >= 0 (0 = off; e.g. 1e-3)");
+    }
+    cfg_.metric_stall_reset_ = v;
+    cfg_.metric_stall_window_ = window;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_collapse_reset(double v) {
+    if (v < 0 || v >= 1) {
+      throw std::invalid_argument(
+          "metric_collapse_reset must be in [0, 1) (0 = off; e.g. 0.01)");
+    }
+    cfg_.metric_collapse_reset_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& mass_combine_power(double v) {
+    if (v < 0 || v > 1e3) {
+      throw std::invalid_argument(
+          "mass_combine_power must be in [0, 1000] (0 = geometric mean)");
+    }
+    cfg_.mass_combine_power_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& metric_drift_guard(bool v) {
+    cfg_.metric_drift_guard_ = v;
     return *this;
   }
 

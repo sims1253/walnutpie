@@ -1,7 +1,10 @@
 #include <walnutpie.hpp>
 #include <walnutpie/load_stan.hpp>
+#include <walnutpie/warmup_heuristics.hpp>
 
 #include <CLI/CLI.hpp>
+#include <fstream>
+#include <vector>
 #include <Eigen/Dense>
 
 #include <chrono>
@@ -79,6 +82,18 @@ class StanHandler {
 
   void on_warmup(const Eigen::VectorXd& position, double lp, double step_size,
                  const Eigen::VectorXd& diag_inv_mass) {
+    static std::size_t it = 0;
+    if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_WARMUP")) {
+      if (it % std::max(1, atoi(dbg)) == 0) {
+        std::cout << "[warmup it " << it << "] lp=" << lp
+                  << " step=" << step_size
+                  << " invm[0]=" << (diag_inv_mass.size() ? diag_inv_mass[0] : -1)
+                  << " pos[0]=" << (position.size() ? position[0] : 0)
+                  << " pos[last]=" << (position.size() ? position[position.size()-1] : 0)
+                  << std::endl;
+      }
+    }
+    ++it;
     if (!save_warmup_) {
       return;
     }
@@ -118,7 +133,10 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                         walnutpie::InitConfigBuilder& init_builder,
                         std::size_t num_warmup, std::size_t num_draws,
                         bool save_warmup, walnutpie::WarmupConfig& warmup_cfg,
-                        walnutpie::SamplingConfig& sample_cfg) {
+                        walnutpie::SamplingConfig& sample_cfg,
+                        double mass_init_clamp = 0.0,
+                        bool step_init_heuristic = false,
+                        double early_exit_tol = 0.0) {
   using Clock = std::chrono::high_resolution_clock;
   auto elapsed_seconds = [](auto t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
@@ -148,22 +166,68 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
     ++logp_count;
   };
 
-  auto init_cfg =
-      init_builder.masses(logp, warmup_cfg.mass_additive_smoothing()).build();
+  auto init_cfg = init_builder.masses(logp, warmup_cfg.mass_additive_smoothing(),
+                                    false, mass_init_clamp)
+                      .build();
   auto inits = init_cfg.init_chain_config(0);
-
   std::mt19937_64 rng{seed};
+  if (step_init_heuristic) {
+    const auto inv_mass = inits.mass().array().inverse().matrix().eval();
+    walnutpie::detail::Random heur_rand(rng);
+    double eps = walnutpie::detail::find_reasonable_step(
+        heur_rand, logp, inits.position(), inv_mass, inits.step_size());
+    inits = walnutpie::InitChainConfig(eps, inits.position(), inits.mass());
+    std::cout << "Heuristic initial step size: " << eps << std::endl;
+  }
+
   walnutpie::AdaptiveWalnuts<decltype(logp), decltype(rng), StanHandler, Opt>
       walnuts(
       rng, storage, logp, inits, warmup_cfg, sample_cfg);
-  for (std::size_t w = 0; w < num_warmup; ++w) {
-    walnuts();
+  // W-21: temporal-stabilization early exit (single-chain analogue of the
+  // multi-chain controller's convergence stop). Every 50 iterations — the
+  // metric-window length, so successive snapshots are INDEPENDENT window
+  // estimates — compare inv_mass() to the previous snapshot; exit when the
+  // l2 rel-diff of the mass and the rel-diff of the step size have both
+  // stabilized. Floors: 200 iters minimum (4 full metric windows).
+  if (early_exit_tol > 0.0) {
+    const std::size_t period = 50;
+    const std::size_t min_iters = 200;
+    Eigen::VectorXd prev_mass;
+    double prev_step = -1.0;
+    for (std::size_t w = 0; w < num_warmup; ++w) {
+      walnuts();
+      if ((w + 1) >= min_iters && (w + 1) % period == 0) {
+        Eigen::VectorXd mass = walnuts.inv_mass();
+        double step = walnuts.step_size();
+        if (prev_mass.size() == mass.size()) {
+          double mass_diff = (mass - prev_mass).norm() /
+                             std::max(prev_mass.norm(), 1e-12);
+          double step_diff = std::abs(step - prev_step) /
+                             std::max(std::abs(prev_step), 1e-12);
+          if (mass_diff < early_exit_tol && step_diff < 0.1) {
+            std::cout << "Early warmup exit at iteration " << (w + 1)
+                      << " (mass_diff=" << mass_diff
+                      << ", step_diff=" << step_diff << ")" << std::endl;
+            break;
+          }
+        }
+        prev_mass = mass;
+        prev_step = step;
+      }
+    }
+  } else {
+    for (std::size_t w = 0; w < num_warmup; ++w) {
+      walnuts();
+    }
   }
   end_timing();
 
   // N post-warmup draws
   auto sampler = walnuts.sampler();  // freeze tuning
   std::cout << "Adaptation completed." << std::endl;
+  std::cout << "Note: multi-chain mode (walnutpie::adapt) reports a "
+               "log-mass cross-chain dispersion diagnostic for mode-aware "
+               "reinit policies; single-chain CLI does not." << std::endl;
   std::cout << "Macro time = " << sampler.macro_time() << std::endl;
   std::cout << "Mass matrix diagonal = ["
             << sampler.inverse_mass_matrix_diagonal() << "]" << std::endl;
@@ -211,6 +275,22 @@ int main(int argc, char** argv) {
   bool da_freeze_average = false;
   double mass_shrink_kappa = 0.0;
   double mass_var_floor = 0.0;
+  double mass_init_clamp = 0.0;
+  bool step_init_heuristic = false;
+  bool metric_drift_guard = false;
+  double mass_combine_power = 0.0;
+  double metric_collapse_reset = 0.0;
+  double metric_stall_reset = 0.0;
+  std::size_t anti_windup = 0;
+  std::size_t drift_iters = 0;
+  std::size_t metric_window = 0;
+  std::size_t metric_rank = 0;
+  std::size_t metric_basis = 0;
+  double early_exit_tol = 0.0;  // 0 = fixed warmup (default)
+  bool metric_full = false;
+  double metric_auto = 0.0;
+  double max_error_start = 0.0;
+  std::size_t max_error_schedule_iters = 0;
   double da_gamma = default_warmup.da_gamma();
   double da_t0 = default_warmup.da_t0();
   double da_kappa = default_warmup.da_kappa();
@@ -223,6 +303,7 @@ int main(int argc, char** argv) {
 
   double init = 2.0;
   double step_size_init = 1.0;
+  std::string init_file = "";
 
   std::string lib;
   std::string data;
@@ -267,6 +348,11 @@ int main(int argc, char** argv) {
         ->default_val(max_hamiltonian_error)
         ->check(CLI::PositiveNumber);
 
+    app.add_option("--init-file", init_file,
+                   "Text file with the unconstrained initial position, one "
+                   "coordinate per line (e.g. a Pathfinder draw)")
+        ->default_val(init_file);
+
     app.add_option("--init", init,
                    "Range [-init,init] for uniform parameter initial values")
         ->default_val(init)
@@ -294,7 +380,8 @@ int main(int argc, char** argv) {
 
     app.add_option("--step-accept-rate-target", step_accept_rate_target,
                    "Target acceptance rate for the step size adaptation")
-        ->default_val(step_accept_rate_target);
+        ->default_val(step_accept_rate_target)
+        ->check(CLI::Range((std::numeric_limits<double>::min)(), 1.0));
 
     app.add_option("--step-optimizer", step_optimizer,
                    "Step size adaptation optimizer: adam | da (dual averaging) "
@@ -330,6 +417,97 @@ int main(int argc, char** argv) {
                    "Shrink mass-matrix variance toward init with weight "
                    "n/(n+kappa) (Stan uses 5; 0 = off)")
         ->default_val(mass_shrink_kappa);
+
+    app.add_option("--mass-init-clamp", mass_init_clamp,
+                   "Clamp gradient-seeded initial masses to [1/clamp, clamp] "
+                   "(e.g. 100; 0 = off)")
+        ->default_val(mass_init_clamp);
+
+    app.add_option("--metric-auto", metric_auto,
+                   "Auto-select the rank-corrected metric per window: apply "
+                   "when the singular-excess concentration in the top "
+                   "directions is at most this threshold (spread spectra = "
+                   "cross-correlated geometry; 0 = off; e.g. 0.5)")
+        ->default_val(metric_auto);
+
+    app.add_flag("--metric-full", metric_full,
+                 "Use the exact low-rank mass operator in the hot loop "
+                 "(requires --metric-rank; otherwise the rank correction is "
+                 "folded into the diagonal)");
+
+    app.add_option("--metric-rank", metric_rank,
+                   "Low-rank correction rank folded into the diagonal metric; "
+                   "0 = off; e.g. 5-20")
+        ->default_val(metric_rank);
+
+    app.add_option("--metric-basis", metric_basis,
+                   "Basis rule for the low-rank metric: 0=windowed SVD "
+                   "(default), 1=streaming power iteration, 2=Muon-style "
+                   "Newton-Schulz polar, 3=MuonEq-style equilibrated polar")
+        ->default_val(metric_basis)
+        ->check(CLI::Range(0, 3));
+
+    app.add_option("--early-exit-warmup", early_exit_tol,
+                   "Temporal stabilization early-exit for single-chain "
+                   "warmup: exit when successive 50-iter window mass "
+                   "estimates agree within this l2 rel-diff (and step "
+                   "within 0.3), after 200 iters; 0 = fixed warmup")
+        ->default_val(early_exit_tol)
+        ->check(CLI::NonNegativeNumber);
+
+    app.add_option("--metric-window", metric_window,
+                   "Memoryless metric windows: reset the draw/score moment "
+                   "accumulators every N warmup iterations (0 = off; "
+                   "Fisher-HMC 'chopping', arXiv:2603.18845)")
+        ->default_val(metric_window);
+
+    app.add_option("--drift-iters", drift_iters,
+                   "Drift-phase warmup: for the first N iterations, suspend "
+                   "the Hamiltonian-error cap and the mass estimation "
+                   "(identity metric) while the chain moves toward the "
+                   "typical set (0 = off)")
+        ->default_val(drift_iters);
+
+    app.add_option("--max-error-start", max_error_start,
+                   "Max-error schedule start: begin at this cap and decay to "
+                   "--max-error over --max-error-iters (0 = off; e.g. 100)")
+        ->default_val(max_error_start);
+
+    app.add_option("--max-error-iters", max_error_schedule_iters,
+                   "Iterations for the max-error schedule decay (0 = off)")
+        ->default_val(max_error_schedule_iters);
+
+    app.add_option("--anti-windup", anti_windup,
+                   "During acceptance-statistic saturation (alpha ~ 0), pass "
+                   "only 1 in N observations to the step optimizer (0 = off; "
+                   "e.g. 8)")
+        ->default_val(anti_windup);
+
+    app.add_option("--metric-stall-reset", metric_stall_reset,
+                   "Reset mass estimators to seeds when max coordinate "
+                   "movement over 100 warmup iterations is below this "
+                   "(0 = off; e.g. 1e-3)")
+        ->default_val(metric_stall_reset);
+
+    app.add_option("--metric-collapse-reset", metric_collapse_reset,
+                   "Reset mass estimators to seeds when observed draw "
+                   "variance falls below this fraction of the metric-implied "
+                   "variance (0 = off; e.g. 0.01)")
+        ->default_val(metric_collapse_reset);
+
+    app.add_option("--mass-combine-power", mass_combine_power,
+                   "Power-mean order for combining Var_draw and 1/Var_score "
+                   "into the mass estimate (0 = geometric [default], 1 = "
+                   "arithmetic, >=64 = max; higher resists collapse)")
+        ->default_val(mass_combine_power);
+
+    app.add_flag("--metric-drift-guard", metric_drift_guard,
+                 "Aggregate draw/score variances with their seeds in log "
+                 "space (guards metric during early drift)");
+
+    app.add_flag("--step-init-heuristic", step_init_heuristic,
+                 "Find initial step size with a Stan-style doubling/halving "
+                 "probe instead of a fixed value");
 
     app.add_option("--mass-var-floor", mass_var_floor,
                    "Elementwise floor for draw/score variances (e.g. 1e-3; "
@@ -398,6 +576,19 @@ int main(int argc, char** argv) {
           .da_freeze_average(da_freeze_average)
           .mass_shrink_kappa(mass_shrink_kappa)
           .mass_var_floor(mass_var_floor)
+          .mass_init_clamp(mass_init_clamp)
+          .metric_drift_guard(metric_drift_guard)
+          .mass_combine_power(mass_combine_power)
+          .metric_collapse_reset(metric_collapse_reset)
+          .metric_stall_reset(metric_stall_reset)
+          .anti_windup_pass_rate(anti_windup)
+          .drift_iters(drift_iters)
+          .max_error_schedule(max_error_start, max_error_schedule_iters)
+          .metric_window(metric_window)
+          .metric_rank(metric_rank)
+          .metric_basis(metric_basis)
+          .metric_full(metric_full)
+          .metric_auto(metric_auto)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
@@ -410,13 +601,37 @@ int main(int argc, char** argv) {
 
   unique_bs_rng rng = model.make_rng(seed);
 
+  auto init_positions = [&]() {
+    if (!init_file.empty()) {
+      // plain text: one unconstrained coordinate per line
+      std::ifstream in(init_file);
+      if (!in) {
+        throw std::invalid_argument("cannot open --init-file: " + init_file);
+      }
+      std::vector<double> vals;
+      double v;
+      while (in >> v) {
+        vals.push_back(v);
+      }
+      if (vals.size() != model.unconstrained_dimensions()) {
+        throw std::invalid_argument(
+            "--init-file dimension mismatch: file has " +
+            std::to_string(vals.size()) + ", model has " +
+            std::to_string(model.unconstrained_dimensions()));
+      }
+      return Eigen::VectorXd(Eigen::VectorXd::Map(vals.data(), vals.size()));
+    }
+    return model.initialize(nullptr, rng, init);
+  }();
+
   auto init_cfg =
       walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
           .step_sizes(step_size_init)
-          .positions(model.initialize(nullptr, rng, init));
+          .positions(init_positions);
 
   auto res = [&]() {
     using walnutpie::detail::Adam;
+    using walnutpie::detail::AntiWindupAdapter;
     using walnutpie::detail::AdaBelief;
     using walnutpie::detail::AdEMAMix;
     using walnutpie::detail::BatchedAdapter;
@@ -425,21 +640,45 @@ int main(int argc, char** argv) {
     // dispatch: base optimizer, optional batching, optional clipping
     auto run_base = [&](auto opt_tag) -> StanHandler {
       using Opt = typename decltype(opt_tag)::type;
+      auto extra = std::make_pair(mass_init_clamp, step_init_heuristic);
+      // --anti-windup selects the AntiWindupAdapter wrapper around whatever
+      // optimizer/composition the other flags chose; the wrapper's pass rate
+      // comes from warmup_cfg (StepAdapterFactory<AntiWindupAdapter<Inner>>).
+      if (anti_windup > 0) {
+        if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
+          return run_walnuts<
+              AntiWindupAdapter<ClippedAdapter<BatchedAdapter<Opt>>>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+        } else if (step_opt_batch_stride > 1) {
+          return run_walnuts<AntiWindupAdapter<BatchedAdapter<Opt>>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+        } else if (step_grad_clip > 0.0) {
+          return run_walnuts<AntiWindupAdapter<ClippedAdapter<Opt>>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+        }
+        return run_walnuts<AntiWindupAdapter<Opt>>(
+            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+      }
       if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
       } else if (step_opt_batch_stride > 1) {
         return run_walnuts<BatchedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
       } else if (step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
       }
       return run_walnuts<Opt>(model, seed, init_cfg, num_warmup, num_draws,
-                              save_warmup, warmup_cfg, sample_cfg);
+                              save_warmup, warmup_cfg, sample_cfg, extra.first,
+                              extra.second, early_exit_tol);
     };
     if (step_optimizer == "adam") {
       return run_base(std::type_identity<Adam>{});
