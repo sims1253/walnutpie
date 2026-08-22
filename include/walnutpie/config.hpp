@@ -534,6 +534,29 @@ class WarmupConfig {
   std::size_t max_iter() const { return max_iter_; }
 
   /**
+   * @brief Return a copy of this configuration with a different iteration
+   * range (W-28 pilot-gate resume: resumed warmup phases run against a
+   * shorter per-phase budget while the total budget is enforced by the
+   * caller).
+   *
+   * @param[in] min_iter The new minimum warmup iterations.
+   * @param[in] max_iter The new maximum warmup iterations.
+   * @throw std::invalid_argument If `min_iter > max_iter`.
+   * @return The configuration copy with the new iteration range.
+   */
+  WarmupConfig with_min_max_iter(std::size_t min_iter,
+                                 std::size_t max_iter) const {
+    if (min_iter > max_iter) {
+      throw std::invalid_argument(
+          "min_iter cannot be greater than max_iter");
+    }
+    WarmupConfig out = *this;
+    out.min_iter_ = min_iter;
+    out.max_iter_ = max_iter;
+    return out;
+  }
+
+  /**
    * @brief Return the step-size convergence tolerance.
    *
    * @return The step-size convergence tolerance.

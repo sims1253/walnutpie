@@ -448,4 +448,71 @@ inline AdaptResult adapt_with_stats(const InitConfig& init_cfg,
   return controller_loop(buffers, interrupt_callback, init_cfg, warmup_cfg);
 }
 
+/**
+ * @brief Adaptation with a pilot sampling-burst gate on early exits (W-28).
+ *
+ * Runs the multi-chain controller in phases under a TOTAL warmup budget of
+ * `warmup_cfg.max_iter()` iterations. Whenever a phase stops warmup early
+ * (cross-chain convergence, subject to the temporal drift gate when
+ * enabled), the caller-supplied `pilot_gate` may inspect the would-be
+ * frozen samplers (e.g. by running a short pilot burst of draws per chain)
+ * and VETO the early exit. On a veto, adaptation RESUMES from the preserved
+ * adapter state (nothing is discarded) with the remaining budget as the
+ * next phase's max_iter; a resumed phase re-arms the controller's temporal
+ * gate state from scratch, so the next candidate requires the gate
+ * conditions to hold again over fresh windows. If the budget is exhausted
+ * after a veto, warmup has effectively run to completion and the result is
+ * reported with `early_exit == false`.
+ *
+ * `pilot_gate` is invoked as `bool pilot_gate(std::vector<A>& adapters,
+ * std::size_t candidate_iter)` where `candidate_iter` is the cumulative
+ * warmup iteration count of the candidate exit; it returns true to approve
+ * the early exit, false to veto and resume. It is only called between
+ * phases (no warmup threads are running), so it may freely read the
+ * adapters and run sampler() on them.
+ *
+ * @tparam Adapter The type of adaptive sampler.
+ * @tparam IC The type of the interrupt callback.
+ * @tparam PilotGate The type of the pilot gate callable.
+ * @param[in] init_cfg The initial configuration (chain count/dimensionality).
+ * @param[in] warmup_cfg The warmup configuration; its max_iter is the TOTAL
+ * budget across all phases.
+ * @param[inout] adapters The adaptive samplers for each chain.
+ * @param[in] interrupt_callback The interrupt callback for stopping.
+ * @param[in] pilot_gate The veto callable described above.
+ */
+template <AdaptiveSampler A, InterruptCallback IC, typename PilotGate>
+inline AdaptResult adapt_with_pilot(const InitConfig& init_cfg,
+                                    const WarmupConfig& warmup_cfg,
+                                    std::vector<A>& adapters,
+                                    const IC& interrupt_callback,
+                                    PilotGate& pilot_gate) {
+  const std::size_t total = warmup_cfg.max_iter();
+  std::size_t done = 0;
+  WarmupConfig phase_cfg = warmup_cfg;
+  while (true) {
+    AdaptResult r =
+        adapt_with_stats(init_cfg, phase_cfg, adapters, interrupt_callback);
+    done += std::min(r.exit_iter, phase_cfg.max_iter());
+    if (!r.early_exit || done >= total) {
+      // Ran to the phase (or total) budget: no pilot check applies.
+      r.exit_iter = done;
+      r.early_exit = false;
+      return r;
+    }
+    if (pilot_gate(adapters, done)) {
+      r.exit_iter = done;
+      return r;  // approved early exit
+    }
+    // Vetoed: resume warmup with the remaining budget. Clamp the phase
+    // min_iter to the remaining budget so a short final phase still runs
+    // (with min == max the controller can only stop at the budget, i.e. it
+    // completes warmup; the temporal gate re-arms only after
+    // temporal_min_iter more iterations).
+    const std::size_t remaining = total - done;
+    phase_cfg = warmup_cfg.with_min_max_iter(
+        std::min(warmup_cfg.min_iter(), remaining), remaining);
+  }
+}
+
 }  // namespace walnutpie::detail

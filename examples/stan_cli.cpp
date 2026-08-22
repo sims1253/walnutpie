@@ -258,6 +258,113 @@ struct NullInterrupt {
   void throw_if_interrupted() const {}
 };
 
+// W-28: recording-only handler for pilot-burst draws. Pilot draws are
+// diagnostics only — they never reach the output draws (the real handlers
+// are untouched, so their GQ rng streams stay bit-identical to a no-pilot
+// run at the same exit point).
+struct PilotSampleHandler {
+  std::vector<double> lp;
+  void on_sample(const Eigen::VectorXd& /*position*/, double logp) {
+    lp.push_back(logp);
+  }
+  void on_logp_exception(const Eigen::VectorXd& position,
+                         const std::exception& exn) const noexcept {
+    std::cout << "Pilot logp failed with exception " << exn.what() << " at "
+              << position.transpose() << "\n";
+  }
+};
+
+// W-28 pre-registered gate statistics on the per-chain pilot lp draws:
+// 1) per-chain lag-1 autocorrelation with the biased (ML) autocovariance
+//    estimator: mean = (1/P) sum lp; c0 = (1/P) sum (lp-mean)^2;
+//    c1 = (1/P) sum_{n=0..P-2} (lp_n-mean)(lp_{n+1}-mean); rho1 = c1/c0
+//    (c0 <= 0 -> rho1 := 1, i.e. a frozen chain fails).
+// 2) split-half cross-chain R-hat proxy (NOT rank-normalized; 50 draws is
+//    too few): each chain's P draws split into first/last P/2 -> J = 2M
+//    half-chains of n_h = P/2; W = mean half-chain sample variance (ddof=1);
+//    B = n_h/(J-1) * sum (mean_j - grand)^2;
+//    var_plus = (n_h-1)/n_h * W + B/n_h; Rhat = sqrt(var_plus/W)
+//    (W <= 0 -> Rhat := +inf, fail).
+struct PilotStats {
+  double rho1_max;
+  double rhat_lp;
+  bool pass;
+};
+
+static PilotStats pilot_gate_stats(
+    const std::vector<std::vector<double>>& chain_lps, double rho1_tol,
+    double rhat_tol) {
+  double rho1_max = -std::numeric_limits<double>::infinity();
+  for (const auto& lp : chain_lps) {
+    const std::size_t p = lp.size();
+    if (p < 2) {
+      rho1_max = std::numeric_limits<double>::infinity();
+      continue;
+    }
+    double mean = 0.0;
+    for (double x : lp) {
+      mean += x;
+    }
+    mean /= static_cast<double>(p);
+    double c0 = 0.0;
+    double c1 = 0.0;
+    for (std::size_t n = 0; n < p; ++n) {
+      c0 += (lp[n] - mean) * (lp[n] - mean);
+      if (n + 1 < p) {
+        c1 += (lp[n] - mean) * (lp[n + 1] - mean);
+      }
+    }
+    c0 /= static_cast<double>(p);
+    c1 /= static_cast<double>(p);
+    const double rho1 = c0 > 0.0 ? c1 / c0 : 1.0;
+    rho1_max = std::max(rho1_max, rho1);
+  }
+  // Split-half R-hat over J half-chains of length n_h.
+  const std::size_t n_h = chain_lps[0].size() / 2;
+  double w_sum = 0.0;
+  double mean_sum = 0.0;
+  std::size_t j = 0;
+  for (const auto& lp : chain_lps) {
+    for (std::size_t half = 0; half < 2; ++half) {
+      double m = 0.0;
+      for (std::size_t n = 0; n < n_h; ++n) {
+        m += lp[half * n_h + n];
+      }
+      m /= static_cast<double>(n_h);
+      double s2 = 0.0;
+      for (std::size_t n = 0; n < n_h; ++n) {
+        s2 += (lp[half * n_h + n] - m) * (lp[half * n_h + n] - m);
+      }
+      s2 /= static_cast<double>(n_h - 1);
+      w_sum += s2;
+      mean_sum += m;
+      ++j;
+    }
+  }
+  const double w = w_sum / static_cast<double>(j);
+  const double grand = mean_sum / static_cast<double>(j);
+  double b_sum = 0.0;
+  for (const auto& lp : chain_lps) {
+    for (std::size_t half = 0; half < 2; ++half) {
+      double m = 0.0;
+      for (std::size_t n = 0; n < n_h; ++n) {
+        m += lp[half * n_h + n];
+      }
+      m /= static_cast<double>(n_h);
+      b_sum += (m - grand) * (m - grand);
+    }
+  }
+  const double b =
+      static_cast<double>(n_h) / static_cast<double>(j - 1) * b_sum;
+  const double var_plus =
+      static_cast<double>(n_h - 1) / static_cast<double>(n_h) * w +
+      b / static_cast<double>(n_h);
+  const double rhat =
+      w > 0.0 ? std::sqrt(var_plus / w)
+              : std::numeric_limits<double>::infinity();
+  return {rho1_max, rhat, rho1_max <= rho1_tol && rhat < rhat_tol};
+}
+
 struct ChainTiming {
   double logp_time = 0.0;
   std::size_t logp_count = 0;
@@ -281,7 +388,8 @@ void run_walnuts_multi(
     bool save_warmup, const walnutpie::WarmupConfig& warmup_cfg,
     const walnutpie::SamplingConfig& sample_cfg, double init_radius,
     double step_size_init, const std::string& init_pattern,
-    const std::string& out_pattern) {
+    const std::string& out_pattern, std::size_t pilot_burst,
+    double pilot_rho1_max, double pilot_rhat_max) {
   using Clock = std::chrono::high_resolution_clock;
   using LogpT = decltype(make_timed_logp(std::declval<DynamicStanModel&>(),
                                          std::declval<ChainTiming&>()));
@@ -384,8 +492,61 @@ void run_walnuts_multi(
   }
 
   NullInterrupt interrupt;
-  walnutpie::detail::AdaptResult ar = walnutpie::detail::adapt_with_stats(
-      init_cfg, warmup_cfg, adapters, interrupt);
+  // W-28 pilot-burst gate: at each candidate early exit, run pilot_burst
+  // draws per chain on the would-be-frozen sampler (separate RNG streams,
+  // recording-only handlers — saved draws and the chains' sampling RNG
+  // streams are untouched) and approve the exit only when the pilot's lp
+  // mixing statistics pass. A veto resumes warmup from the preserved
+  // adapter state (adapt_with_pilot).
+  std::size_t pilot_checks = 0;
+  auto pilot_gate_fn = [&](std::vector<Adapter>& adapters,
+                           std::size_t cand_iter) -> bool {
+    std::vector<std::vector<double>> pilot_lps(chains);
+    {
+      std::vector<std::jthread> ts;
+      ts.reserve(chains);
+      for (std::size_t c = 0; c < chains; ++c) {
+        ts.emplace_back([&, c]() {
+          walnutpie::detail::interactive_qos();
+          // Read-only snapshot of the frozen tuning + position (sampler()
+          // does not mutate the adapter or advance any rng). The pilot runs
+          // on its own rng stream: 7919*(c+1) offsets cannot collide with
+          // the warmup streams (seed + c, c < chains << 7919). Diagonal
+          // metric only (the CLI study path; --metric-rank --metric-full is
+          // not piloted).
+          auto src = adapters[c].sampler();
+          RNG prng(seed + 7919u * static_cast<unsigned int>(c + 1));
+          PilotSampleHandler ph;
+          walnutpie::WalnutsSampler<LogpT, RNG, PilotSampleHandler> pilot(
+              prng, ph, logps[c], src.position(), src.inv_mass(),
+              src.macro_time(), sample_cfg.max_trajectory_doublings(),
+              sample_cfg.max_step_halvings(),
+              adapters[c].min_micro_steps(), src.max_error());
+          for (std::size_t n = 0; n < pilot_burst; ++n) {
+            pilot();
+          }
+          pilot_lps[c] = std::move(ph.lp);
+        });
+      }
+    }
+    ++pilot_checks;
+    const PilotStats st =
+        pilot_gate_stats(pilot_lps, pilot_rho1_max, pilot_rhat_max);
+    std::cout << "pilot check " << pilot_checks << " at iter " << cand_iter
+              << ": rho1_max=" << st.rho1_max << " rhat_lp=" << st.rhat_lp
+              << " -> " << (st.pass ? "approve" : "resume") << std::endl;
+    return st.pass;
+  };
+  walnutpie::detail::AdaptResult ar =
+      pilot_burst > 0
+          ? walnutpie::detail::adapt_with_pilot(init_cfg, warmup_cfg,
+                                                adapters, interrupt,
+                                                pilot_gate_fn)
+          : walnutpie::detail::adapt_with_stats(init_cfg, warmup_cfg,
+                                                adapters, interrupt);
+  if (pilot_burst > 0) {
+    std::cout << "pilot checks total=" << pilot_checks << std::endl;
+  }
   double warm_wall = elapsed(global_start);
   std::cout << "controller exit_iter=" << ar.exit_iter
             << " early_exit=" << (ar.early_exit ? 1 : 0)
@@ -479,6 +640,9 @@ int main(int argc, char** argv) {
   double temporal_step_tol = 0.0;  // 0 = temporal gate off (multi-chain)
   std::size_t temporal_window = 50;
   std::size_t temporal_min_iter = 200;
+  std::size_t pilot_burst = 0;  // W-28: 0 = pilot gate off (multi-chain)
+  double pilot_rho1_max = 0.5;
+  double pilot_rhat_max = 1.1;
   bool metric_full = false;
   double metric_auto = 0.0;
   double max_error_start = 0.0;
@@ -673,6 +837,27 @@ int main(int argc, char** argv) {
                    "may trigger early exit")
         ->default_val(temporal_min_iter);
 
+    app.add_option("--pilot-burst", pilot_burst,
+                   "W-28 pilot sampling-burst gate (multi-chain only): at "
+                   "each candidate early exit, draw N pilot draws per chain "
+                   "on the would-be-frozen sampler (separate rng streams, "
+                   "discarded) and approve the exit only if the pilot's lp "
+                   "lag-1 autocorrelation and split-half R-hat pass "
+                   "--pilot-rho1-max / --pilot-rhat-max; otherwise warmup "
+                   "resumes (0 = off; N must be even, e.g. 50)")
+        ->default_val(pilot_burst)
+        ->check(CLI::NonNegativeNumber);
+
+    app.add_option("--pilot-rho1-max", pilot_rho1_max,
+                   "Pilot gate: max per-chain lag-1 autocorrelation of lp "
+                   "to approve an early exit")
+        ->default_val(pilot_rho1_max);
+
+    app.add_option("--pilot-rhat-max", pilot_rhat_max,
+                   "Pilot gate: split-half cross-chain R-hat of lp below "
+                   "this to approve an early exit")
+        ->default_val(pilot_rhat_max);
+
     app.add_option("--metric-window", metric_window,
                    "Memoryless metric windows: reset the draw/score moment "
                    "accumulators every N warmup iterations (0 = off; "
@@ -828,12 +1013,21 @@ int main(int argc, char** argv) {
 
   unique_bs_rng rng = model.make_rng(seed);
 
+  if (pilot_burst > 0 && chains <= 1) {
+    throw std::invalid_argument("--pilot-burst requires --chains > 1");
+  }
+
   if (chains > 1) {
     // W-25 multi-chain path: library controller, per-chain models.
     if (early_exit_tol > 0.0 || step_init_heuristic || mass_init_clamp > 0.0) {
       throw std::invalid_argument(
           "--early-exit-warmup, --step-init-heuristic and --mass-init-clamp "
           "are single-chain-only flags");
+    }
+    if (pilot_burst > 0 && (pilot_burst < 2 || pilot_burst % 2 != 0)) {
+      throw std::invalid_argument(
+          "--pilot-burst must be 0 (off) or an even number >= 2 (the gate "
+          "splits each chain's pilot draws in half for the R-hat proxy)");
     }
     if (!init_file.empty() && init_file.find("{c}") == std::string::npos) {
       throw std::invalid_argument(
@@ -849,7 +1043,8 @@ int main(int argc, char** argv) {
       run_walnuts_multi<Opt>(
           lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
           num_draws, save_warmup, warmup_cfg, sample_cfg, init,
-          step_size_init, init_file, output_file);
+          step_size_init, init_file, output_file, pilot_burst,
+          pilot_rho1_max, pilot_rhat_max);
     };
     if (step_optimizer == "adam") {
       run_multi(std::type_identity<walnutpie::detail::Adam>{});
