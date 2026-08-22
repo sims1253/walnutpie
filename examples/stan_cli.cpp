@@ -389,7 +389,7 @@ void run_walnuts_multi(
     const walnutpie::SamplingConfig& sample_cfg, double init_radius,
     double step_size_init, const std::string& init_pattern,
     const std::string& out_pattern, std::size_t pilot_burst,
-    double pilot_rho1_max, double pilot_rhat_max) {
+    double pilot_rho1_max, double pilot_rhat_max, bool serial_exec) {
   using Clock = std::chrono::high_resolution_clock;
   using LogpT = decltype(make_timed_logp(std::declval<DynamicStanModel&>(),
                                          std::declval<ChainTiming&>()));
@@ -492,6 +492,11 @@ void run_walnuts_multi(
   }
 
   NullInterrupt interrupt;
+  const walnutpie::detail::ChainExec exec =
+      serial_exec ? walnutpie::detail::ChainExec::Serial
+                  : walnutpie::detail::ChainExec::Threads;
+  std::cout << "chain exec: " << (serial_exec ? "serial" : "threads")
+            << std::endl;
   // W-28 pilot-burst gate: at each candidate early exit, run pilot_burst
   // draws per chain on the would-be-frozen sampler (separate RNG streams,
   // recording-only handlers — saved draws and the chains' sampling RNG
@@ -502,31 +507,36 @@ void run_walnuts_multi(
   auto pilot_gate_fn = [&](std::vector<Adapter>& adapters,
                            std::size_t cand_iter) -> bool {
     std::vector<std::vector<double>> pilot_lps(chains);
-    {
+    auto run_pilot_chain = [&](std::size_t c) {
+      walnutpie::detail::interactive_qos();
+      // Read-only snapshot of the frozen tuning + position (sampler()
+      // does not mutate the adapter or advance any rng). The pilot runs
+      // on its own rng stream: 7919*(c+1) offsets cannot collide with
+      // the warmup streams (seed + c, c < chains << 7919). Diagonal
+      // metric only (the CLI study path; --metric-rank --metric-full is
+      // not piloted).
+      auto src = adapters[c].sampler();
+      RNG prng(seed + 7919u * static_cast<unsigned int>(c + 1));
+      PilotSampleHandler ph;
+      walnutpie::WalnutsSampler<LogpT, RNG, PilotSampleHandler> pilot(
+          prng, ph, logps[c], src.position(), src.inv_mass(),
+          src.macro_time(), sample_cfg.max_trajectory_doublings(),
+          sample_cfg.max_step_halvings(), adapters[c].min_micro_steps(),
+          src.max_error());
+      for (std::size_t n = 0; n < pilot_burst; ++n) {
+        pilot();
+      }
+      pilot_lps[c] = std::move(ph.lp);
+    };
+    if (serial_exec) {
+      for (std::size_t c = 0; c < chains; ++c) {
+        run_pilot_chain(c);
+      }
+    } else {
       std::vector<std::jthread> ts;
       ts.reserve(chains);
       for (std::size_t c = 0; c < chains; ++c) {
-        ts.emplace_back([&, c]() {
-          walnutpie::detail::interactive_qos();
-          // Read-only snapshot of the frozen tuning + position (sampler()
-          // does not mutate the adapter or advance any rng). The pilot runs
-          // on its own rng stream: 7919*(c+1) offsets cannot collide with
-          // the warmup streams (seed + c, c < chains << 7919). Diagonal
-          // metric only (the CLI study path; --metric-rank --metric-full is
-          // not piloted).
-          auto src = adapters[c].sampler();
-          RNG prng(seed + 7919u * static_cast<unsigned int>(c + 1));
-          PilotSampleHandler ph;
-          walnutpie::WalnutsSampler<LogpT, RNG, PilotSampleHandler> pilot(
-              prng, ph, logps[c], src.position(), src.inv_mass(),
-              src.macro_time(), sample_cfg.max_trajectory_doublings(),
-              sample_cfg.max_step_halvings(),
-              adapters[c].min_micro_steps(), src.max_error());
-          for (std::size_t n = 0; n < pilot_burst; ++n) {
-            pilot();
-          }
-          pilot_lps[c] = std::move(ph.lp);
-        });
+        ts.emplace_back([&, c]() { run_pilot_chain(c); });
       }
     }
     ++pilot_checks;
@@ -541,9 +551,9 @@ void run_walnuts_multi(
       pilot_burst > 0
           ? walnutpie::detail::adapt_with_pilot(init_cfg, warmup_cfg,
                                                 adapters, interrupt,
-                                                pilot_gate_fn)
+                                                pilot_gate_fn, exec)
           : walnutpie::detail::adapt_with_stats(init_cfg, warmup_cfg,
-                                                adapters, interrupt);
+                                                adapters, interrupt, exec);
   if (pilot_burst > 0) {
     std::cout << "pilot checks total=" << pilot_checks << std::endl;
   }
@@ -565,7 +575,15 @@ void run_walnuts_multi(
     t = ChainTiming{};
   }
   global_start = Clock::now();
-  {
+  if (serial_exec) {
+    // W-30 serial topology: chains run one at a time on the calling
+    // thread (identical draws to the threaded sampling below).
+    for (std::size_t c = 0; c < chains; ++c) {
+      for (std::size_t n = 0; n < num_draws; ++n) {
+        samplers[c]();
+      }
+    }
+  } else {
     std::vector<std::jthread> ts;
     ts.reserve(chains);
     for (std::size_t c = 0; c < chains; ++c) {
@@ -637,6 +655,8 @@ int main(int argc, char** argv) {
   double early_exit_tol = 0.0;  // 0 = fixed warmup (default)
   std::size_t chains = 1;  // 1 = legacy single-chain loop; >1 = library
                            // multi-chain controller (adapt_with_stats)
+  std::string chain_exec = "threads";  // W-30: multi-chain topology
+  bool fixed_warmup = false;  // W-30: pin controller min_iter to budget
   double temporal_step_tol = 0.0;  // 0 = temporal gate off (multi-chain)
   std::size_t temporal_window = 50;
   std::size_t temporal_min_iter = 200;
@@ -818,6 +838,22 @@ int main(int argc, char** argv) {
         ->default_val(chains)
         ->check(CLI::PositiveNumber);
 
+    app.add_option("--chain-exec", chain_exec,
+                   "Multi-chain execution topology (W-30): threads = one "
+                   "worker thread per chain with the event-driven "
+                   "controller; serial = all chains round-robin on the "
+                   "calling thread (deterministic observation points, "
+                   "identical per-chain draws)")
+        ->default_val(chain_exec)
+        ->check(CLI::IsMember({"threads", "serial"}));
+
+    app.add_flag(
+        "--fixed-warmup", fixed_warmup,
+        "Multi-chain: pin the controller's minimum warmup to the full "
+        "--warmup budget, so the cross-chain criteria can only stop at the "
+        "budget (deterministic warmup length; default early-exit behavior "
+        "unchanged)");
+
     app.add_option("--temporal-step-tol", temporal_step_tol,
                    "Multi-chain controller temporal step-drift gate: require "
                    "every chain's step size to drift less than this relative "
@@ -994,8 +1030,11 @@ int main(int argc, char** argv) {
           .metric_auto(metric_auto);
   if (chains > 1) {
     // Multi-chain: the controller bounds warmup (min 50, max num_warmup).
-    warmup_builder.min_max_iter(std::min<std::size_t>(50, num_warmup),
-                                num_warmup);
+    // --fixed-warmup pins min to the budget so the cross-chain criteria
+    // can only stop at max_iter (deterministic length for the W-30 gates).
+    warmup_builder.min_max_iter(
+        fixed_warmup ? num_warmup : std::min<std::size_t>(50, num_warmup),
+        num_warmup);
   }
   walnutpie::WarmupConfig warmup_cfg =
       warmup_builder.temporal_step_drift_tol(temporal_step_tol)
@@ -1015,6 +1054,11 @@ int main(int argc, char** argv) {
 
   if (pilot_burst > 0 && chains <= 1) {
     throw std::invalid_argument("--pilot-burst requires --chains > 1");
+  }
+  if (chains <= 1 && (fixed_warmup || chain_exec != "threads")) {
+    // Fail loudly rather than silently no-op (the CLI dispatch lesson).
+    throw std::invalid_argument(
+        "--chain-exec and --fixed-warmup require --chains > 1");
   }
 
   if (chains > 1) {
@@ -1044,7 +1088,7 @@ int main(int argc, char** argv) {
           lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
           num_draws, save_warmup, warmup_cfg, sample_cfg, init,
           step_size_init, init_file, output_file, pilot_burst,
-          pilot_rho1_max, pilot_rhat_max);
+          pilot_rho1_max, pilot_rhat_max, chain_exec == "serial");
     };
     if (step_optimizer == "adam") {
       run_multi(std::type_identity<walnutpie::detail::Adam>{});
