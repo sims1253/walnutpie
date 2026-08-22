@@ -3,7 +3,10 @@
 #include <walnutpie/warmup_heuristics.hpp>
 
 #include <CLI/CLI.hpp>
+#include <algorithm>
 #include <fstream>
+#include <memory>
+#include <utility>
 #include <vector>
 #include <Eigen/Dense>
 
@@ -82,10 +85,9 @@ class StanHandler {
 
   void on_warmup(const Eigen::VectorXd& position, double lp, double step_size,
                  const Eigen::VectorXd& diag_inv_mass) {
-    static std::size_t it = 0;
     if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_WARMUP")) {
-      if (it % std::max(1, atoi(dbg)) == 0) {
-        std::cout << "[warmup it " << it << "] lp=" << lp
+      if (warmup_dbg_it_ % std::max(1, atoi(dbg)) == 0) {
+        std::cout << "[warmup it " << warmup_dbg_it_ << "] lp=" << lp
                   << " step=" << step_size
                   << " invm[0]=" << (diag_inv_mass.size() ? diag_inv_mass[0] : -1)
                   << " pos[0]=" << (position.size() ? position[0] : 0)
@@ -93,7 +95,7 @@ class StanHandler {
                   << std::endl;
       }
     }
-    ++it;
+    ++warmup_dbg_it_;
     if (!save_warmup_) {
       return;
     }
@@ -126,6 +128,7 @@ class StanHandler {
   Eigen::MatrixXd draws_;
   bool save_warmup_;
   Eigen::Index n_ = 0;
+  std::size_t warmup_dbg_it_ = 0;
 };
 
 template <typename Opt>
@@ -243,6 +246,190 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   return storage;
 }
 
+// W-25: multi-chain mode driving the LIBRARY warmup controller
+// (walnutpie::detail::adapt_with_stats), which supports cross-chain early
+// exit plus the temporal step-drift gate. One BridgeStan model instance,
+// one mt19937_64 stream, and one StanHandler per chain (BridgeStan model
+// instances are not thread-safe; a shared std::normal_distribution across
+// streams is not reproducible). Seeding replicates the single-chain CLI
+// invoked once per chain with --seed (seed + c), so a full-warmup
+// multi-chain run consumes the same per-chain RNG streams.
+struct NullInterrupt {
+  void throw_if_interrupted() const {}
+};
+
+struct ChainTiming {
+  double logp_time = 0.0;
+  std::size_t logp_count = 0;
+};
+
+static auto make_timed_logp(DynamicStanModel& model, ChainTiming& t) {
+  using Clock = std::chrono::high_resolution_clock;
+  return [&model, &t](auto&&... args) {
+    auto start = Clock::now();
+    model.logp_grad(args...);
+    t.logp_time +=
+        std::chrono::duration<double>(Clock::now() - start).count();
+    ++t.logp_count;
+  };
+}
+
+template <typename Opt>
+void run_walnuts_multi(
+    const std::string& lib, const std::string& data, unsigned int seed,
+    std::size_t chains, std::size_t num_warmup, std::size_t num_draws,
+    bool save_warmup, const walnutpie::WarmupConfig& warmup_cfg,
+    const walnutpie::SamplingConfig& sample_cfg, double init_radius,
+    double step_size_init, const std::string& init_pattern,
+    const std::string& out_pattern) {
+  using Clock = std::chrono::high_resolution_clock;
+  using LogpT = decltype(make_timed_logp(std::declval<DynamicStanModel&>(),
+                                         std::declval<ChainTiming&>()));
+  using RNG = std::mt19937_64;
+  using Adapter =
+      walnutpie::AdaptiveWalnuts<LogpT, RNG, StanHandler, Opt>;
+  using Sampler = walnutpie::WalnutsSampler<LogpT, RNG, StanHandler>;
+
+  auto elapsed = [](auto t) {
+    return std::chrono::duration<double>(Clock::now() - t).count();
+  };
+  auto print_stanza = [&](std::size_t c, double total, ChainTiming& t) {
+    std::cout << "chain " << c << "    total time: " << total << "s"
+              << std::endl;
+    std::cout << "chain " << c << " logp_grad time: " << t.logp_time << "s"
+              << std::endl;
+    std::cout << "chain " << c << " logp_grad fraction: "
+              << t.logp_time / total << std::endl;
+    std::cout << "chain " << c << "     logp_grad calls: " << t.logp_count
+              << std::endl;
+    std::cout << "chain " << c << "     time per call: "
+              << t.logp_time / t.logp_count << "s" << std::endl;
+    std::cout << std::endl;
+  };
+
+  auto global_start = Clock::now();
+
+  // One model + timing + timed logp per chain (models are heap-stable).
+  std::vector<std::unique_ptr<DynamicStanModel>> models;
+  std::vector<ChainTiming> timing;
+  std::vector<LogpT> logps;
+  models.reserve(chains);
+  timing.reserve(chains);
+  logps.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    models.emplace_back(
+        std::make_unique<DynamicStanModel>(lib.c_str(), data.c_str(),
+                                           seed + static_cast<unsigned>(c)));
+    timing.emplace_back();
+    logps.push_back(
+        make_timed_logp(*models.back(), timing.back()));
+  }
+
+  // Initial positions per chain, replicating the single-chain CLI
+  // (--init-file wins; else model.initialize with the model's rng).
+  std::vector<Eigen::VectorXd> positions;
+  positions.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    if (!init_pattern.empty()) {
+      std::string f = init_pattern;
+      f.replace(f.find("{c}"), 3, std::to_string(c));
+      std::ifstream in(f);
+      if (!in) {
+        throw std::invalid_argument("cannot open init file: " + f);
+      }
+      std::vector<double> vals;
+      double v;
+      while (in >> v) {
+        vals.push_back(v);
+      }
+      if (vals.size() !=
+          static_cast<std::size_t>(models[c]->unconstrained_dimensions())) {
+        throw std::invalid_argument("init file dimension mismatch: " + f);
+      }
+      positions.emplace_back(
+          Eigen::VectorXd::Map(vals.data(), vals.size()));
+    } else {
+      auto mrng = models[c]->make_rng(seed + static_cast<unsigned>(c));
+      positions.push_back(
+          models[c]->initialize(nullptr, mrng, init_radius));
+    }
+  }
+
+  // Mass seeding via any chain's logp (deterministic; identical values).
+  auto init_cfg =
+      walnutpie::InitConfigBuilder{
+          chains, static_cast<std::size_t>(positions[0].size())}
+          .step_sizes(step_size_init)
+          .positions(std::move(positions))
+          .masses(logps[0], warmup_cfg.mass_additive_smoothing(), false, 0.0)
+          .build();
+
+  std::vector<RNG> rngs;
+  rngs.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    rngs.emplace_back(seed + static_cast<unsigned>(c));
+  }
+  std::vector<StanHandler> handlers;
+  handlers.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    handlers.emplace_back(*models[c], seed + static_cast<unsigned>(c),
+                          num_warmup, num_draws, save_warmup);
+  }
+  std::vector<Adapter> adapters;
+  adapters.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    adapters.emplace_back(rngs[c], handlers[c], logps[c],
+                          init_cfg.init_chain_config(c), warmup_cfg,
+                          sample_cfg);
+  }
+
+  NullInterrupt interrupt;
+  walnutpie::detail::AdaptResult ar = walnutpie::detail::adapt_with_stats(
+      init_cfg, warmup_cfg, adapters, interrupt);
+  double warm_wall = elapsed(global_start);
+  std::cout << "controller exit_iter=" << ar.exit_iter
+            << " early_exit=" << (ar.early_exit ? 1 : 0)
+            << " (max_iter=" << warmup_cfg.max_iter() << ")" << std::endl;
+  for (std::size_t c = 0; c < chains; ++c) {
+    print_stanza(c, warm_wall, timing[c]);
+  }
+
+  std::vector<Sampler> samplers;
+  samplers.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    samplers.emplace_back(adapters[c].sampler());
+  }
+
+  for (auto& t : timing) {
+    t = ChainTiming{};
+  }
+  global_start = Clock::now();
+  {
+    std::vector<std::jthread> ts;
+    ts.reserve(chains);
+    for (std::size_t c = 0; c < chains; ++c) {
+      ts.emplace_back([&samplers, c, num_draws]() {
+        walnutpie::detail::interactive_qos();
+        for (std::size_t n = 0; n < num_draws; ++n) {
+          samplers[c]();
+        }
+      });
+    }
+  }
+  double sample_wall = elapsed(global_start);
+  for (std::size_t c = 0; c < chains; ++c) {
+    print_stanza(c, sample_wall, timing[c]);
+  }
+
+  if (!out_pattern.empty()) {
+    for (std::size_t c = 0; c < chains; ++c) {
+      std::string f = out_pattern;
+      f.replace(f.find("{c}"), 3, std::to_string(c));
+      handlers[c].write_csv(f);
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   auto clock_count =
       std::chrono::system_clock::now().time_since_epoch().count();
@@ -287,6 +474,11 @@ int main(int argc, char** argv) {
   std::size_t metric_rank = 0;
   std::size_t metric_basis = 0;
   double early_exit_tol = 0.0;  // 0 = fixed warmup (default)
+  std::size_t chains = 1;  // 1 = legacy single-chain loop; >1 = library
+                           // multi-chain controller (adapt_with_stats)
+  double temporal_step_tol = 0.0;  // 0 = temporal gate off (multi-chain)
+  std::size_t temporal_window = 50;
+  std::size_t temporal_min_iter = 200;
   bool metric_full = false;
   double metric_auto = 0.0;
   double max_error_start = 0.0;
@@ -455,6 +647,32 @@ int main(int argc, char** argv) {
         ->default_val(early_exit_tol)
         ->check(CLI::NonNegativeNumber);
 
+    app.add_option("--chains", chains,
+                   "Number of chains; >1 runs the library multi-chain "
+                   "warmup controller (cross-chain convergence + optional "
+                   "temporal step-drift gate) in one process")
+        ->default_val(chains)
+        ->check(CLI::PositiveNumber);
+
+    app.add_option("--temporal-step-tol", temporal_step_tol,
+                   "Multi-chain controller temporal step-drift gate: require "
+                   "every chain's step size to drift less than this relative "
+                   "amount across the last --temporal-window iters before "
+                   "early exit (W-22; 0 = off; e.g. 0.05)")
+        ->default_val(temporal_step_tol)
+        ->check(CLI::NonNegativeNumber);
+
+    app.add_option("--temporal-window", temporal_window,
+                   "Window length (warmup iters) for the temporal step-drift "
+                   "gate")
+        ->default_val(temporal_window)
+        ->check(CLI::PositiveNumber);
+
+    app.add_option("--temporal-min-iter", temporal_min_iter,
+                   "Minimum warmup iters before the temporal step-drift gate "
+                   "may trigger early exit")
+        ->default_val(temporal_min_iter);
+
     app.add_option("--metric-window", metric_window,
                    "Memoryless metric windows: reset the draw/score moment "
                    "accumulators every N warmup iterations (0 = off; "
@@ -557,7 +775,7 @@ int main(int argc, char** argv) {
 
   DynamicStanModel model(lib.c_str(), data.c_str(), seed);
 
-  walnutpie::WarmupConfig warmup_cfg =
+  walnutpie::WarmupConfigBuilder warmup_builder =
       walnutpie::WarmupConfigBuilder()
           .mass_init_count(mass_init_count)
           .mass_additive_smoothing(mass_additive_smoothing)
@@ -588,7 +806,16 @@ int main(int argc, char** argv) {
           .metric_rank(metric_rank)
           .metric_basis(metric_basis)
           .metric_full(metric_full)
-          .metric_auto(metric_auto)
+          .metric_auto(metric_auto);
+  if (chains > 1) {
+    // Multi-chain: the controller bounds warmup (min 50, max num_warmup).
+    warmup_builder.min_max_iter(std::min<std::size_t>(50, num_warmup),
+                                num_warmup);
+  }
+  walnutpie::WarmupConfig warmup_cfg =
+      warmup_builder.temporal_step_drift_tol(temporal_step_tol)
+          .temporal_window(temporal_window)
+          .temporal_min_iter(temporal_min_iter)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
@@ -600,6 +827,41 @@ int main(int argc, char** argv) {
           .build();
 
   unique_bs_rng rng = model.make_rng(seed);
+
+  if (chains > 1) {
+    // W-25 multi-chain path: library controller, per-chain models.
+    if (early_exit_tol > 0.0 || step_init_heuristic || mass_init_clamp > 0.0) {
+      throw std::invalid_argument(
+          "--early-exit-warmup, --step-init-heuristic and --mass-init-clamp "
+          "are single-chain-only flags");
+    }
+    if (!init_file.empty() && init_file.find("{c}") == std::string::npos) {
+      throw std::invalid_argument(
+          "--init-file in multi-chain mode must contain {c}");
+    }
+    if (!output_file.empty() && output_file.find("{c}") ==
+                                    std::string::npos) {
+      throw std::invalid_argument(
+          "--output in multi-chain mode must contain {c}");
+    }
+    auto run_multi = [&](auto opt_tag) {
+      using Opt = typename decltype(opt_tag)::type;
+      run_walnuts_multi<Opt>(
+          lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
+          num_draws, save_warmup, warmup_cfg, sample_cfg, init,
+          step_size_init, init_file, output_file);
+    };
+    if (step_optimizer == "adam") {
+      run_multi(std::type_identity<walnutpie::detail::Adam>{});
+    } else if (step_optimizer == "da") {
+      run_multi(std::type_identity<walnutpie::detail::DualAveraging>{});
+    } else if (step_optimizer == "dem") {
+      run_multi(std::type_identity<walnutpie::detail::AdEMAMix>{});
+    } else {
+      run_multi(std::type_identity<walnutpie::detail::AdaBelief>{});
+    }
+    return 0;
+  }
 
   auto init_positions = [&]() {
     if (!init_file.empty()) {

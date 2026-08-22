@@ -673,9 +673,39 @@ class WarmupConfig {
   }
 
   /**
+   * @brief Return the temporal step-size drift tolerance for early exit.
+   *
+   * When positive, the multi-chain controller additionally requires every
+   * chain's step size to be temporally stable — relative drift below this
+   * tolerance across the last full `temporal_window()` iterations ending
+   * at or after `temporal_min_iter()` — before stopping warmup early on
+   * the cross-chain criteria. This guards against the failure mode where
+   * all chains agree with each other while their step sizes are still
+   * marching toward equilibrium (W-22: +170% late-warmup step growth with
+   * stable mass degraded post-warmup quality on the marginal model class).
+   *
+   * @return The temporal step drift tolerance (0 = gate off).
+   */
+  double temporal_step_drift_tol() const { return temporal_step_drift_tol_; }
+
+  /**
+   * @brief Return the window length for the temporal step-drift gate.
+   *
+   * @return The temporal window in warmup iterations.
+   */
+  std::size_t temporal_window() const { return temporal_window_; }
+
+  /**
+   * @brief Return the minimum iteration for the temporal step-drift gate.
+   *
+   * @return The minimum warmup iterations before temporal early exit.
+   */
+  std::size_t temporal_min_iter() const { return temporal_min_iter_; }
+
+  /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
-   * @return The stride for publishing updates for convergence monitoring.
+   * @return The stride for publishing updates.
    */
   std::size_t publish_stride() const { return publish_stride_; }
 
@@ -730,6 +760,9 @@ class WarmupConfig {
   std::size_t max_error_schedule_iters_ = 0;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
+  double temporal_step_drift_tol_ = 0.0;  // 0 = temporal gate off
+  std::size_t temporal_window_ = 50;
+  std::size_t temporal_min_iter_ = 200;
 };
 
 /**
@@ -1080,6 +1113,46 @@ class WarmupConfigBuilder {
   WarmupConfigBuilder& yield_period(std::size_t v) {
     detail::validate_positive(v, "yield_period");
     cfg_.yield_period_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the temporal step-size drift tolerance for early exit.
+   *
+   * @param[in] v The tolerance (0 = gate off; e.g. 0.05).
+   * @return This builder for chaining.
+   * @throw std::invalid_argument If the tolerance is negative.
+   */
+  WarmupConfigBuilder& temporal_step_drift_tol(double v) {
+    if (v < 0) {
+      throw std::invalid_argument(
+          "temporal_step_drift_tol must be >= 0 (0 = off)");
+    }
+    cfg_.temporal_step_drift_tol_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the window length for the temporal step-drift gate.
+   *
+   * @param[in] v The window in warmup iterations.
+   * @return This builder for chaining.
+   * @throw std::invalid_argument If the window is not positive.
+   */
+  WarmupConfigBuilder& temporal_window(std::size_t v) {
+    detail::validate_positive(v, "temporal_window");
+    cfg_.temporal_window_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the minimum iteration for the temporal step-drift gate.
+   *
+   * @param[in] v The minimum warmup iterations before temporal early exit.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& temporal_min_iter(std::size_t v) {
+    cfg_.temporal_min_iter_ = v;
     return *this;
   }
 

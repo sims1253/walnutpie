@@ -1,6 +1,9 @@
 #pragma once
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -174,10 +177,24 @@ struct AdaptResult {
    * @brief Per-chain log-mass diagonals at the end of adaptation.
    *
    * Size M; lets embedding code attribute the cross-chain dispersion to
-   * individual chains (the outlier chains in a scale-locked run) instead of
+   * individual chains (the outlier chains in a scale-lock run) instead of
    * only observing the aggregate.
    */
   std::vector<Eigen::VectorXd> chain_log_mass{};
+
+  /**
+   * @brief The smallest per-chain iteration count at controller exit.
+   *
+   * Equal to `max_iter` when the controller ran warmup to completion;
+   * smaller when the controller stopped warmup early (cross-chain
+   * convergence, subject to the temporal step-drift gate when enabled).
+   */
+  std::size_t exit_iter = 0;
+
+  /**
+   * @brief Whether the controller stopped warmup before the maximum.
+   */
+  bool early_exit = false;
 };
 
 /**
@@ -201,6 +218,29 @@ inline AdaptResult controller_loop(
   Eigen::VectorXd mean_log_mass(D);
   Eigen::VectorXd geom_mean_mass(D);
   Eigen::VectorXd scratch_mass(D);
+
+  // Temporal step-drift gate state (W-25): per-chain step size and mass
+  // diagonal at the last window boundary, the iteration of that boundary,
+  // and the drifts measured across the most recent completed window.
+  // Uninitialized (npos / NaN) until the chain crosses its first window
+  // boundary after min_iter. In temporal mode the cross-chain mass
+  // criterion (l2 diff vs the geometric mean) is replaced by per-chain
+  // temporal mass drift: windowed mass estimates are too noisy across
+  // chains for the cross-chain comparison to ever fire (measured 1.4-2.8
+  // vs tol 1.0 late in warmup on healthy models), while window-to-window
+  // drift within a chain is the stabilization signal W-21/W-22 used.
+  const double drift_tol = warmup_cfg.temporal_step_drift_tol();
+  const double mass_drift_tol = warmup_cfg.mass_converge_tol();
+  const std::size_t window = warmup_cfg.temporal_window();
+  const std::size_t temporal_min = warmup_cfg.temporal_min_iter();
+  std::vector<double> window_step(M, std::numeric_limits<double>::quiet_NaN());
+  std::vector<Eigen::VectorXd> window_mass(M);
+  std::vector<std::size_t> window_iter(M,
+                                       std::numeric_limits<std::size_t>::max());
+  std::vector<double> window_step_drift(M,
+                                        std::numeric_limits<double>::quiet_NaN());
+  std::vector<double> window_mass_drift(M,
+                                        std::numeric_limits<double>::quiet_NaN());
 
   std::size_t max_draws = M * warmup_cfg.max_iter();
   while (true) {
@@ -236,8 +276,72 @@ inline AdaptResult controller_loop(
         max_rel_diff_step = std::fmax(max_rel_diff_step, rel_diff_step);
       }
 
-      bool converged = max_rel_diff_mass <= warmup_cfg.mass_converge_tol() &&
-                       max_rel_diff_step <= warmup_cfg.step_size_converge_tol();
+      bool converged;
+      if (drift_tol > 0.0) {
+        // Temporal gate mode (W-22/W-25): cross-chain agreement can hold
+        // while every chain's step size is still marching toward its
+        // equilibrium; exiting then degraded post-warmup quality on the
+        // marginal model class. Early exit requires: cross-chain step
+        // agreement (the existing step tolerance), per-chain step drift
+        // below the temporal tolerance across the last full window, and
+        // per-chain mass drift below the mass tolerance across the same
+        // window (replacing the cross-chain mass comparison, which the
+        // noise of windowed estimates keeps from ever converging).
+        bool temporal_ok = true;
+        for (std::size_t m = 0; m < M; ++m) {
+          const std::size_t it = latest[m].iter;
+          if (it >= temporal_min &&
+              (window_iter[m] == std::numeric_limits<std::size_t>::max() ||
+               it >= window_iter[m] + window)) {
+            const double prev_step = window_step[m];
+            const double cur_step = std::exp(latest[m].log_step);
+            window_step_drift[m] =
+                std::abs(cur_step - prev_step) /
+                std::max(prev_step, std::numeric_limits<double>::min());
+            if (window_mass[m].size() == latest[m].mass.size()) {
+              window_mass_drift[m] =
+                  (latest[m].mass - window_mass[m]).norm() /
+                  std::max(window_mass[m].norm(),
+                           std::numeric_limits<double>::min());
+            }
+            window_step[m] = cur_step;
+            window_mass[m] = latest[m].mass;
+            window_iter[m] = it;
+          }
+          if (!(window_iter[m] != std::numeric_limits<std::size_t>::max() &&
+                window_iter[m] >= temporal_min &&
+                std::isfinite(window_step_drift[m]) &&
+                window_step_drift[m] <= drift_tol &&
+                std::isfinite(window_mass_drift[m]) &&
+                window_mass_drift[m] <= mass_drift_tol)) {
+            temporal_ok = false;
+          }
+        }
+        converged = max_rel_diff_step <=
+                        warmup_cfg.step_size_converge_tol() &&
+                    temporal_ok;
+      } else {
+        converged = max_rel_diff_mass <= warmup_cfg.mass_converge_tol() &&
+                    max_rel_diff_step <= warmup_cfg.step_size_converge_tol();
+      }
+      if (const char* dbg = [] {
+            static const char* d = std::getenv("WALNUTPIE_DEBUG_CTRL");
+            return d;
+          }()) {
+        static std::size_t dbg_n = 0;
+        if (dbg_n++ % atoi(dbg) == 0) {
+          std::cerr << "[ctrl it~" << latest[0].iter << "] mass_diff="
+                    << max_rel_diff_mass << " step_diff=" << max_rel_diff_step
+                    << " drift_gate="
+                    << (drift_tol > 0.0 ? "on" : "off");
+          for (std::size_t m = 0; m < M && m < 4; ++m) {
+            std::cerr << " c" << m << ":step=" << std::exp(latest[m].log_step)
+                      << ":sd=" << window_step_drift[m]
+                      << ":md=" << window_mass_drift[m];
+          }
+          std::cerr << std::endl;
+        }
+      }
       bool hit_max_iter = num_draws == max_draws;
       if (converged || hit_max_iter) {
         // Cross-chain scale disagreement: mean over coordinates of the
@@ -262,8 +366,13 @@ inline AdaptResult controller_loop(
         for (std::size_t m2 = 0; m2 < M; ++m2) {
           chain_lm.push_back(latest[m2].log_mass);
         }
+        std::size_t exit_iter = latest[0].iter;
+        for (std::size_t m2 = 1; m2 < M; ++m2) {
+          exit_iter = std::min(exit_iter, latest[m2].iter);
+        }
         return {geom_mean_mass, std::exp(mean_log_step),
-                disp_sum / static_cast<double>(D), std::move(chain_lm)};
+                disp_sum / static_cast<double>(D), std::move(chain_lm),
+                exit_iter, exit_iter < warmup_cfg.max_iter()};
       }
     }
 
