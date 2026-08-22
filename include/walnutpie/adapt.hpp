@@ -234,7 +234,10 @@ inline AdaptResult controller_loop(
   const std::size_t window = warmup_cfg.temporal_window();
   const std::size_t temporal_min = warmup_cfg.temporal_min_iter();
   std::vector<double> window_step(M, std::numeric_limits<double>::quiet_NaN());
+  std::vector<double> window_step2(
+      M, std::numeric_limits<double>::quiet_NaN());  // boundary k-2
   std::vector<Eigen::VectorXd> window_mass(M);
+  std::vector<Eigen::VectorXd> window_mass2(M);  // boundary k-2
   std::vector<std::size_t> window_iter(M,
                                        std::numeric_limits<std::size_t>::max());
   std::vector<double> window_step_drift(M,
@@ -293,17 +296,26 @@ inline AdaptResult controller_loop(
           if (it >= temporal_min &&
               (window_iter[m] == std::numeric_limits<std::size_t>::max() ||
                it >= window_iter[m] + window)) {
-            const double prev_step = window_step[m];
+            // Drift over the last TWO windows (boundary k vs k-2, ~2*window
+            // iterations apart): a single window can pass by luck while the
+            // step is still marching (measured: 1-window gate exited the
+            // marginal class at ~250-300 iters and degraded ESS 5-9x).
+            const double prev2_step = window_step2[m];
             const double cur_step = std::exp(latest[m].log_step);
-            window_step_drift[m] =
-                std::abs(cur_step - prev_step) /
-                std::max(prev_step, std::numeric_limits<double>::min());
-            if (window_mass[m].size() == latest[m].mass.size()) {
+            if (std::isfinite(prev2_step)) {
+              window_step_drift[m] =
+                  std::abs(cur_step - prev2_step) /
+                  std::max(prev2_step, std::numeric_limits<double>::min());
+            }
+            if (window_mass2[m].size() == latest[m].mass.size() &&
+                window_mass2[m].size() > 0) {
               window_mass_drift[m] =
-                  (latest[m].mass - window_mass[m]).norm() /
-                  std::max(window_mass[m].norm(),
+                  (latest[m].mass - window_mass2[m]).norm() /
+                  std::max(window_mass2[m].norm(),
                            std::numeric_limits<double>::min());
             }
+            window_step2[m] = window_step[m];
+            window_mass2[m] = window_mass[m];
             window_step[m] = cur_step;
             window_mass[m] = latest[m].mass;
             window_iter[m] = it;
