@@ -657,6 +657,7 @@ int main(int argc, char** argv) {
                            // multi-chain controller (adapt_with_stats)
   std::string chain_exec = "threads";  // W-30: multi-chain topology
   bool fixed_warmup = false;  // W-30: pin controller min_iter to budget
+  bool early_exit = false;  // W-31: opt in to controller early exit
   double temporal_step_tol = 0.0;  // 0 = temporal gate off (multi-chain)
   std::size_t temporal_window = 50;
   std::size_t temporal_min_iter = 200;
@@ -833,8 +834,10 @@ int main(int argc, char** argv) {
 
     app.add_option("--chains", chains,
                    "Number of chains; >1 runs the library multi-chain "
-                   "warmup controller (cross-chain convergence + optional "
-                   "temporal step-drift gate) in one process")
+                   "warmup controller (fixed-budget warmup by default; "
+                   "cross-chain convergence early exit only with "
+                   "--early-exit or --temporal-step-tol > 0) in one "
+                   "process")
         ->default_val(chains)
         ->check(CLI::PositiveNumber);
 
@@ -851,8 +854,19 @@ int main(int argc, char** argv) {
         "--fixed-warmup", fixed_warmup,
         "Multi-chain: pin the controller's minimum warmup to the full "
         "--warmup budget, so the cross-chain criteria can only stop at the "
-        "budget (deterministic warmup length; default early-exit behavior "
-        "unchanged)");
+        "budget (deterministic warmup length; redundant while early exit "
+        "is off — the W-31 default — but still meaningful with "
+        "--early-exit)");
+
+    app.add_flag(
+        "--early-exit", early_exit,
+        "Multi-chain: re-enable the controller's cross-chain convergence "
+        "early exit (the pre-W-31 default). UNSAFE with the default "
+        "tolerances (mass 1.0 / step 0.1): with good inits warmup stops "
+        "at iteration 50-80 and post-warmup quality collapses on hard "
+        "models (W-25: hier_2pl bulk-ESS 519 -> 61). Pass only for "
+        "reproducing those experiments or with tolerances you have "
+        "validated. Passing --temporal-step-tol > 0 also opts in.");
 
     app.add_option("--temporal-step-tol", temporal_step_tol,
                    "Multi-chain controller temporal step-drift gate: require "
@@ -1035,6 +1049,11 @@ int main(int argc, char** argv) {
     warmup_builder.min_max_iter(
         fixed_warmup ? num_warmup : std::min<std::size_t>(50, num_warmup),
         num_warmup);
+    // W-31: convergence-based early exit is opt-in — an explicit
+    // --early-exit, or a positive temporal tolerance (which is itself an
+    // explicit request for gated early exit; keeps the W-25/W-28 arm
+    // command lines reproducible verbatim).
+    warmup_builder.allow_early_exit(early_exit || temporal_step_tol > 0.0);
   }
   walnutpie::WarmupConfig warmup_cfg =
       warmup_builder.temporal_step_drift_tol(temporal_step_tol)
@@ -1072,6 +1091,15 @@ int main(int argc, char** argv) {
       throw std::invalid_argument(
           "--pilot-burst must be 0 (off) or an even number >= 2 (the gate "
           "splits each chain's pilot draws in half for the R-hat proxy)");
+    }
+    if (pilot_burst > 0 && !(early_exit || temporal_step_tol > 0.0)) {
+      // Fail loudly rather than silently no-op (the CLI dispatch
+      // lesson): with the W-31 safe default there are no candidate
+      // early exits for the pilot gate to inspect.
+      throw std::invalid_argument(
+          "--pilot-burst requires an early-exit enabler: --early-exit or "
+          "--temporal-step-tol > 0 (with early exit off, warmup always "
+          "runs to the --warmup budget and pilots can never fire)");
     }
     if (!init_file.empty() && init_file.find("{c}") == std::string::npos) {
       throw std::invalid_argument(

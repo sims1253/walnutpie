@@ -363,6 +363,10 @@ struct ControllerGateState {
  * stop decision exactly as the (former) spin loop did per pass: no chain
  * below `min_iter`, then cross-chain agreement and — when the temporal
  * drift tolerance is positive — per-chain two-window step/mass drift.
+ * The convergence criteria can only stop warmup when
+ * `warmup_cfg.allow_early_exit()` is true (W-31 safe default: OFF — the
+ * criteria are still computed for the debug trace, but the only stop is
+ * the `max_iter` budget). See `WarmupConfig::allow_early_exit`.
  * Returns the adaptation statistics when the controller should stop, and
  * `std::nullopt` when warmup should continue. Called by both the threaded
  * controller (woken by the monitor) and the serial controller (at every
@@ -432,61 +436,74 @@ inline std::optional<AdaptResult> poll_controller(
     max_rel_diff_step = std::fmax(max_rel_diff_step, rel_diff_step);
   }
 
-  bool converged;
-  if (drift_tol > 0.0) {
-    // Temporal gate mode (W-22/W-25): cross-chain agreement can hold
-    // while every chain's step size is still marching toward its
-    // equilibrium; exiting then degraded post-warmup quality on the
-    // marginal model class. Early exit requires: cross-chain step
-    // agreement (the existing step tolerance), per-chain step drift
-    // below the temporal tolerance across the last full window, and
-    // per-chain mass drift below the mass tolerance across the same
-    // window (replacing the cross-chain mass comparison, which the
-    // noise of windowed estimates keeps from ever converging).
-    bool temporal_ok = true;
-    for (std::size_t m = 0; m < M; ++m) {
-      const std::size_t it = latest[m].iter;
-      if (it >= temporal_min &&
-          (window_iter[m] == std::numeric_limits<std::size_t>::max() ||
-           it >= window_iter[m] + window)) {
-        // Drift over the last TWO windows (boundary k vs k-2, ~2*window
-        // iterations apart): a single window can pass by luck while the
-        // step is still marching (measured: 1-window gate exited the
-        // marginal class at ~250-300 iters and degraded ESS 5-9x).
-        const double prev2_step = window_step2[m];
-        const double cur_step = std::exp(latest[m].log_step);
-        if (std::isfinite(prev2_step)) {
-          window_step_drift[m] =
-              std::abs(cur_step - prev2_step) /
-              std::max(prev2_step, std::numeric_limits<double>::min());
+  // W-31 safe default: convergence-based early exit is opt-in. When
+  // allow_early_exit() is false the cross-chain criteria below are
+  // still computed (they feed the debug trace and remain observable)
+  // but can never stop warmup — the only stop is the max_iter budget.
+  // Rationale: with the default tolerances (mass 1.0 / step 0.1,
+  // temporal gate off) the criteria hold at iteration 50-80 with good
+  // inits and destroy post-warmup quality on the marginal model class
+  // (W-25 side finding 3), and no tolerance-based gate tested since
+  // preserved quality (W-25 temporal gate: hier_2pl bulk-ESS 519 -> 126;
+  // W-28 pilot gate: quality-preserving only by never exiting). See
+  // WarmupConfig::allow_early_exit.
+  bool converged = false;
+  if (warmup_cfg.allow_early_exit()) {
+    if (drift_tol > 0.0) {
+      // Temporal gate mode (W-22/W-25): cross-chain agreement can hold
+      // while every chain's step size is still marching toward its
+      // equilibrium; exiting then degraded post-warmup quality on the
+      // marginal model class. Early exit requires: cross-chain step
+      // agreement (the existing step tolerance), per-chain step drift
+      // below the temporal tolerance across the last full window, and
+      // per-chain mass drift below the mass tolerance across the same
+      // window (replacing the cross-chain mass comparison, which the
+      // noise of windowed estimates keeps from ever converging).
+      bool temporal_ok = true;
+      for (std::size_t m = 0; m < M; ++m) {
+        const std::size_t it = latest[m].iter;
+        if (it >= temporal_min &&
+            (window_iter[m] == std::numeric_limits<std::size_t>::max() ||
+             it >= window_iter[m] + window)) {
+          // Drift over the last TWO windows (boundary k vs k-2, ~2*window
+          // iterations apart): a single window can pass by luck while the
+          // step is still marching (measured: 1-window gate exited the
+          // marginal class at ~250-300 iters and degraded ESS 5-9x).
+          const double prev2_step = window_step2[m];
+          const double cur_step = std::exp(latest[m].log_step);
+          if (std::isfinite(prev2_step)) {
+            window_step_drift[m] =
+                std::abs(cur_step - prev2_step) /
+                std::max(prev2_step, std::numeric_limits<double>::min());
+          }
+          if (window_mass2[m].size() == latest[m].mass.size() &&
+              window_mass2[m].size() > 0) {
+            window_mass_drift[m] =
+                (latest[m].mass - window_mass2[m]).norm() /
+                std::max(window_mass2[m].norm(),
+                         std::numeric_limits<double>::min());
+          }
+          window_step2[m] = window_step[m];
+          window_mass2[m] = window_mass[m];
+          window_step[m] = cur_step;
+          window_mass[m] = latest[m].mass;
+          window_iter[m] = it;
         }
-        if (window_mass2[m].size() == latest[m].mass.size() &&
-            window_mass2[m].size() > 0) {
-          window_mass_drift[m] =
-              (latest[m].mass - window_mass2[m]).norm() /
-              std::max(window_mass2[m].norm(),
-                       std::numeric_limits<double>::min());
+        if (!(window_iter[m] != std::numeric_limits<std::size_t>::max() &&
+              window_iter[m] >= temporal_min &&
+              std::isfinite(window_step_drift[m]) &&
+              window_step_drift[m] <= drift_tol &&
+              std::isfinite(window_mass_drift[m]) &&
+              window_mass_drift[m] <= mass_drift_tol)) {
+          temporal_ok = false;
         }
-        window_step2[m] = window_step[m];
-        window_mass2[m] = window_mass[m];
-        window_step[m] = cur_step;
-        window_mass[m] = latest[m].mass;
-        window_iter[m] = it;
       }
-      if (!(window_iter[m] != std::numeric_limits<std::size_t>::max() &&
-            window_iter[m] >= temporal_min &&
-            std::isfinite(window_step_drift[m]) &&
-            window_step_drift[m] <= drift_tol &&
-            std::isfinite(window_mass_drift[m]) &&
-            window_mass_drift[m] <= mass_drift_tol)) {
-        temporal_ok = false;
-      }
+      converged = max_rel_diff_step <= warmup_cfg.step_size_converge_tol() &&
+                  temporal_ok;
+    } else {
+      converged = max_rel_diff_mass <= warmup_cfg.mass_converge_tol() &&
+                  max_rel_diff_step <= warmup_cfg.step_size_converge_tol();
     }
-    converged = max_rel_diff_step <= warmup_cfg.step_size_converge_tol() &&
-                temporal_ok;
-  } else {
-    converged = max_rel_diff_mass <= warmup_cfg.mass_converge_tol() &&
-                max_rel_diff_step <= warmup_cfg.step_size_converge_tol();
   }
   if (const char* dbg = [] {
         static const char* d = std::getenv("WALNUTPIE_DEBUG_CTRL");
@@ -495,7 +512,8 @@ inline std::optional<AdaptResult> poll_controller(
     if (gate.dbg_n++ % atoi(dbg) == 0) {
       std::cerr << "[ctrl it~" << latest[0].iter << "] mass_diff="
                 << max_rel_diff_mass << " step_diff=" << max_rel_diff_step
-                << " drift_gate=" << (drift_tol > 0.0 ? "on" : "off");
+                << " drift_gate=" << (drift_tol > 0.0 ? "on" : "off")
+                << " early_exit=" << (warmup_cfg.allow_early_exit() ? "on" : "off");
       for (std::size_t m = 0; m < M && m < 4; ++m) {
         std::cerr << " c" << m << ":step=" << std::exp(latest[m].log_step)
                   << ":sd=" << window_step_drift[m]

@@ -726,6 +726,27 @@ class WarmupConfig {
   std::size_t temporal_min_iter() const { return temporal_min_iter_; }
 
   /**
+   * @brief Return whether the multi-chain controller may stop warmup
+   * before the budget (W-31).
+   *
+   * When false (the DEFAULT), the controller never stops warmup early:
+   * the only stop is the `max_iter` budget, and `AdaptResult` reports
+   * `exit_iter == max_iter`, `early_exit == false`. This is the safe
+   * default: the cross-chain criteria with their default tolerances
+   * (mass 1.0 / step 0.1, temporal gate off) can hold at iteration
+   * 50-80 with good inits while warmup would still materially improve
+   * the frozen sampler (measured: hier_2pl bulk-ESS-min 519 -> 61, and
+   * even the temporal 2-window gate at tol 0.05 degraded it 519 -> 126;
+   * no cheap tolerance-based gate preserved quality in the W-25/W-28
+   * grids). Embedders who want the controller's convergence-based early
+   * exit must opt in explicitly via `WarmupConfigBuilder::allow_early_exit`,
+   * taking responsibility for the tolerances they set.
+   *
+   * @return Whether convergence-based early exit is enabled.
+   */
+  bool allow_early_exit() const { return allow_early_exit_; }
+
+  /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
    * @return The stride for publishing updates.
@@ -786,6 +807,7 @@ class WarmupConfig {
   double temporal_step_drift_tol_ = 0.0;  // 0 = temporal gate off
   std::size_t temporal_window_ = 50;
   std::size_t temporal_min_iter_ = 200;
+  bool allow_early_exit_ = false;  // W-31: early exit is opt-in
 };
 
 /**
@@ -1176,6 +1198,27 @@ class WarmupConfigBuilder {
    */
   WarmupConfigBuilder& temporal_min_iter(std::size_t v) {
     cfg_.temporal_min_iter_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Allow the multi-chain controller to stop warmup before the
+   * budget on its cross-chain criteria (W-31; opt-in).
+   *
+   * OFF by default: the default cross-chain tolerances (mass 1.0 /
+   * step 0.1, temporal gate off) stop warmup at iteration 50-80 with
+   * good initializations and destroy post-warmup quality on the
+   * marginal model class, and no tolerance-based gate tested preserved
+   * quality (W-25/W-28). With this flag false the controller runs
+   * warmup to the full `max_iter` budget; the convergence criteria
+   * (and the temporal gate) are only consulted — and may only stop
+   * warmup — when it is true. See `WarmupConfig::allow_early_exit`.
+   *
+   * @param[in] v Whether convergence-based early exit is allowed.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& allow_early_exit(bool v) {
+    cfg_.allow_early_exit_ = v;
     return *this;
   }
 
