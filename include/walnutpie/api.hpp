@@ -1,6 +1,9 @@
 #pragma once
 
+#include <cmath>
 #include <cstddef>
+#include <iostream>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <utility>
@@ -155,6 +158,44 @@ inline void walnuts_with_reinit(
     std::vector<Eigen::VectorXd> new_positions(M);
     std::vector<Eigen::VectorXd> new_masses(M);
     std::vector<double> new_steps(M);
+    // W-41: ar.step_bar is the geometric mean of the per-chain snapshot
+    // step sizes; one chain whose log step underflowed to -inf (or NaN)
+    // makes the mean degenerate, and reseeding a reinit round with a 0/NaN
+    // step poisons it — the same failure family as the freeze-time
+    // macro_time abort, one round later. Fall back to the geometric mean
+    // of the just-frozen per-chain macro times (finite positive by
+    // construction after the W-41 freeze clamp), else the round's initial
+    // step, else a hard floor; warn loudly so runs stay auditable.
+    double step_bar = ar.step_bar;
+    if (!(std::isfinite(step_bar) && step_bar > 0.0)) {
+      double log_sum = 0.0;
+      std::size_t n_ok = 0;
+      for (std::size_t m = 0; m < M; ++m) {
+        const double mt = samplers[m].macro_time();
+        if (std::isfinite(mt) && mt > 0.0) {
+          log_sum += std::log(mt);
+          ++n_ok;
+        }
+      }
+      const char* source = nullptr;
+      double fallback = 0.0;
+      if (n_ok > 0) {
+        fallback = std::exp(log_sum / static_cast<double>(n_ok));
+        source = "geometric mean of frozen chain steps";
+      }
+      if (!(std::isfinite(fallback) && fallback > 0.0)) {
+        fallback = cfg.init().init_chain_config(0).step_size();
+        source = "initial step size";
+      }
+      if (!(std::isfinite(fallback) && fallback > 0.0)) {
+        fallback = 1000.0 * std::numeric_limits<double>::min();
+        source = "hard floor (1000 * DBL_MIN)";
+      }
+      std::cerr << "WALNUTS WARNING: reinit step_bar degenerate ("
+                << ar.step_bar << "); falling back to " << fallback << " ("
+                << source << ")" << std::endl;
+      step_bar = fallback;
+    }
     for (std::size_t m = 0; m < M; ++m) {
       if (targeted && !outlier[m]) {
         new_positions[m] = samplers[m].position();
@@ -165,7 +206,7 @@ inline void walnuts_with_reinit(
       } else {
         new_positions[m] = cfg.init().init_chain_config(m).position();
         new_masses[m] = ar.mass_bar;
-        new_steps[m] = ar.step_bar;
+        new_steps[m] = step_bar;
       }
     }
     {  // both paths: outliers (or all chains, blanket) draw from the pool
