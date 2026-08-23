@@ -684,6 +684,9 @@ int main(int argc, char** argv) {
   double mass_shrink_kappa = 0.0;
   double mass_var_floor = 0.0;
   double mass_init_clamp = 0.0;
+  std::size_t mass_init_buffer = 0;
+  double grad_clip_scale = 0.0;
+  std::size_t grad_clip_iters = 200;
   bool step_init_heuristic = false;
   bool metric_drift_guard = false;
   double mass_combine_power = 0.0;
@@ -841,6 +844,26 @@ int main(int argc, char** argv) {
                    "Clamp gradient-seeded initial masses to [1/clamp, clamp] "
                    "(e.g. 100; 0 = off)")
         ->default_val(mass_init_clamp);
+
+    app.add_option("--mass-init-buffer", mass_init_buffer,
+                   "W-54 arm A: hold the mass at IDENTITY and skip mass-"
+                   "estimator observations for the first N warmup "
+                   "iterations (Stan-style init buffer; 0 = off; e.g. 75)")
+        ->default_val(mass_init_buffer);
+
+    app.add_option("--grad-clip-scale", grad_clip_scale,
+                   "W-54 arm B: soft-clip the gradient fed to the mass "
+                   "estimator during early warmup, g' = c*asinh(g/c) "
+                   "(identity below ~c/100, logarithmic beyond; adapter-"
+                   "only, the integrator gradient is never clipped; "
+                   "0 = off; thread value 1e10)")
+        ->default_val(grad_clip_scale);
+
+    app.add_option("--grad-clip-iters", grad_clip_iters,
+                   "W-54 arm B: apply the soft gradient clip only during "
+                   "the first M warmup iterations (requires --grad-clip-"
+                   "scale > 0)")
+        ->default_val(grad_clip_iters);
 
     app.add_option("--metric-auto", metric_auto,
                    "Auto-select the rank-corrected metric per window: apply "
@@ -1072,6 +1095,9 @@ int main(int argc, char** argv) {
           .mass_shrink_kappa(mass_shrink_kappa)
           .mass_var_floor(mass_var_floor)
           .mass_init_clamp(mass_init_clamp)
+          .mass_init_buffer(mass_init_buffer)
+          .grad_clip_scale(grad_clip_scale)
+          .grad_clip_iters(grad_clip_iters)
           .metric_drift_guard(metric_drift_guard)
           .mass_combine_power(mass_combine_power)
           .metric_collapse_reset(metric_collapse_reset)

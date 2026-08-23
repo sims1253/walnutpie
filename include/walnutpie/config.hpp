@@ -665,6 +665,52 @@ class WarmupConfig {
   double mass_init_clamp() const { return mass_init_clamp_; }
 
   /**
+   * @brief Return the init-buffer length for mass adaptation (W-54 arm A).
+   *
+   * When positive, the first N warmup iterations run with the IDENTITY
+   * inverse mass and do not feed the mass estimator at all (no
+   * observe(), no window chopping, no low-rank refresh); continuous
+   * adaptation begins at iteration N from identity-seeded accumulators
+   * (no metric discontinuity at the boundary). This is the Stan-style
+   * init buffer: tail geometry at a distant initialization cannot
+   * contaminate the metric while the chain drifts toward the typical
+   * set. 0 (the DEFAULT) = current behavior (continuous adaptation
+   * from iteration 0, gradient-seeded).
+   *
+   * @return The number of leading warmup iterations to buffer (0 = off).
+   */
+  std::size_t mass_init_buffer() const { return mass_init_buffer_; }
+
+  /**
+   * @brief Return the soft gradient-clipping scale for the adapter's
+   * score stream (W-54 arm B).
+   *
+   * When positive, the gradient fed to the mass estimator's score
+   * moments during warmup iterations below `grad_clip_iters()` is
+   * replaced elementwise by the soft clip g' = c * asinh(g / c)
+   * (identity below ~c/100, logarithmic beyond; smooth and
+   * sign-preserving). This bounds the score-variance scale tail
+   * gradients can imprint on the metric WITHOUT touching the
+   * trajectory integrator's gradient (which would change the
+   * Hamiltonian being sampled — a different target). The step adapter
+   * consumes only the scalar acceptance statistic and is unaffected
+   * by construction. 0.0 (the DEFAULT) = current behavior (raw
+   * scores).
+   *
+   * @return The clipping scale c in gradient units (0 = off).
+   */
+  double grad_clip_scale() const { return grad_clip_scale_; }
+
+  /**
+   * @brief Return the number of leading warmup iterations during which
+   * the soft gradient clip is applied (W-54 arm B; only meaningful
+   * when `grad_clip_scale()` is positive).
+   *
+   * @return The clipping window length in warmup iterations.
+   */
+  std::size_t grad_clip_iters() const { return grad_clip_iters_; }
+
+  /**
    * @brief Basis-extraction rule for the low-rank metric factors.
    *
    * 0 = windowed thin SVD of the standardized stacked draw/score matrix
@@ -793,6 +839,9 @@ class WarmupConfig {
   double metric_stall_reset_ = 0.0;
   std::size_t metric_stall_window_ = 100;
   double mass_init_clamp_ = 0.0;
+  std::size_t mass_init_buffer_ = 0;  // W-54 arm A: 0 = off
+  double grad_clip_scale_ = 0.0;      // W-54 arm B: 0 = off
+  std::size_t grad_clip_iters_ = 200;
   std::size_t metric_basis_ = 0;  // 0=svd 1=power 2=muon 3=muoneq
   std::size_t anti_windup_pass_rate_ = 0;
   std::size_t drift_iters_ = 0;
@@ -1069,6 +1118,47 @@ class WarmupConfigBuilder {
       throw std::invalid_argument("mass_init_clamp must be >= 0");
     }
     cfg_.mass_init_clamp_ = v;
+    return *this;
+  }
+
+  /**
+   * Set the init-buffer length for mass adaptation (W-54 arm A).
+   *
+   * @param[in] v Number of leading warmup iterations to hold the mass
+   * at identity and skip estimator feeding (0 = off, the default).
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& mass_init_buffer(std::size_t v) {
+    cfg_.mass_init_buffer_ = v;
+    return *this;
+  }
+
+  /**
+   * Set the soft gradient-clipping scale for the adapter's score
+   * stream (W-54 arm B). The clip is g' = c * asinh(g / c), applied to
+   * the mass estimator's score observations only.
+   *
+   * @param[in] v The clipping scale c in gradient units (0 = off, the
+   * default; thread values 1e10 / 1e8).
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& grad_clip_scale(double v) {
+    if (!(v >= 0.0)) {
+      throw std::invalid_argument("grad_clip_scale must be >= 0");
+    }
+    cfg_.grad_clip_scale_ = v;
+    return *this;
+  }
+
+  /**
+   * Set the warmup-only window length for the soft gradient clip
+   * (W-54 arm B; default 200).
+   *
+   * @param[in] v The clipping window in warmup iterations.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& grad_clip_iters(std::size_t v) {
+    cfg_.grad_clip_iters_ = v;
     return *this;
   }
 

@@ -57,14 +57,28 @@ class MassEstimator {
    */
   MassEstimator(const WarmupConfig& warmup_cfg, const InitChainConfig& init_cfg)
       : warmup_cfg_(warmup_cfg),
-        init_score_var_(init_cfg.mass()),
-        init_draw_var_(init_cfg.mass().array().inverse().matrix()) {
+        init_score_var_(warmup_cfg.mass_init_buffer() > 0
+                            ? Eigen::VectorXd::Ones(init_cfg.mass().size())
+                            : Eigen::VectorXd(init_cfg.mass())),
+        init_draw_var_(
+            warmup_cfg.mass_init_buffer() > 0
+                ? Eigen::VectorXd::Ones(init_cfg.mass().size())
+                : Eigen::VectorXd(init_cfg.mass().array().inverse().matrix())) {
+    // W-54 arm A (mass_init_buffer > 0): seed BOTH accumulators at the
+    // identity instead of the gradient-seeded init mass. During the
+    // buffer the sampler holds the metric at identity anyway; identity
+    // seeds make the estimate continuous across the buffer boundary
+    // (the first post-buffer estimate is identity, then real
+    // observations blend it), so no metric jump can throttle the chain
+    // exactly when adaptation begins. The gradient seed is itself the
+    // tail-contamination vector the init buffer exists to keep out.
+    // With mass_init_buffer == 0 (the default) the seeds are exactly
+    // today's values.
     Eigen::VectorXd zero = Eigen::VectorXd::Zero(init_cfg.position().size());
     score_var_estimator_ =
-        OnlineMoments(warmup_cfg.mass_init_count(), zero, init_cfg.mass());
+        OnlineMoments(warmup_cfg.mass_init_count(), zero, init_score_var_);
     draw_var_estimator_ =
-        OnlineMoments(warmup_cfg.mass_init_count(), zero,
-                      init_cfg.mass().array().inverse().matrix());
+        OnlineMoments(warmup_cfg.mass_init_count(), zero, init_draw_var_);
   }
 
   /**
@@ -620,8 +634,15 @@ class AdaptiveWalnuts {
 
   void operator()() {
     const bool drifting = iteration_ < warmup_cfg_.get().drift_iters();
+    // W-54 arm A: during the mass init buffer the estimator is not fed
+    // (no observe, no low-rank refresh) and the metric is held at the
+    // identity — the Stan-style init buffer. The error cap and the step
+    // adapter stay ACTIVE (unlike drift_iters): the pin's step-descent
+    // escape (W-43) must keep racing while the metric is protected.
+    const bool mass_buffered =
+        iteration_ < warmup_cfg_.get().mass_init_buffer();
     const std::size_t window = warmup_cfg_.get().metric_window();
-    if (window > 0 && !drifting && iteration_ > 0 &&
+    if (window > 0 && !drifting && !mass_buffered && iteration_ > 0 &&
         (iteration_ + 1) % window == 0) {
       mass_estimator_.low_rank_update();
     }
@@ -633,10 +654,11 @@ class AdaptiveWalnuts {
         (!auto_screen ||
          mass_estimator_.window_cross_ratio() <= warmup_cfg_.get().metric_auto());
     Eigen::VectorXd inv_mass =
-        drifting ? Eigen::VectorXd::Ones(theta_.size())
-                 : (rank_active
-                        ? mass_estimator_.rank_folded_estimate()
-                        : mass_estimator_.inv_mass_estimate());
+        (drifting || mass_buffered)
+            ? Eigen::VectorXd::Ones(theta_.size())
+            : (rank_active
+                   ? mass_estimator_.rank_folded_estimate()
+                   : mass_estimator_.inv_mass_estimate());
     Eigen::VectorXd chol_mass = inv_mass.array().inverse().sqrt().matrix();
     if (full_rank_mode) {
       detail::LowRankMass lrm;
@@ -659,8 +681,8 @@ class AdaptiveWalnuts {
       // start-position reuse (duplicate eval elimination, see W-20).
       cached_grad_ = grad_select;
       cached_logp_ = logp_select;
-      if (!drifting) {
-        mass_estimator_.observe(theta_, grad_select, iteration_);
+      if (!drifting && !mass_buffered) {
+        observe_estimator(grad_select);
       }
       // Full-rank mode integrates with the low-rank OPERATOR whose diagonal
       // is the UNFOLDED inv_mass_estimate() (see lrm.D above), not the folded
@@ -709,11 +731,12 @@ class AdaptiveWalnuts {
     }
     cached_grad_ = grad_select;
     cached_logp_ = logp_select;
-    if (!drifting) {
+    if (!drifting && !mass_buffered) {
       // Suspend metric estimation during drift: the draws observed while the
       // chain is pinned/throttled poison the variance estimates (the
       // self-locking failure mode documented in the init-robustness notes).
-      mass_estimator_.observe(theta_, grad_select, iteration_);
+      // W-54 arm A adds the same suspension during the mass init buffer.
+      observe_estimator(grad_select);
       // Memoryless windows ("chopping", Fisher-HMC discipline,
       // arXiv:2603.18845): at each window boundary, discard the accumulated
       // history entirely rather than exponentially discounting it forward.
@@ -870,6 +893,35 @@ class AdaptiveWalnuts {
 
   /** The current iteration. */
   std::size_t iteration_;
+
+  /**
+   * @brief Feed the mass estimator with this iteration's transition
+   * endpoint, applying the W-54 arm B soft gradient clip to the score
+   * stream when configured.
+   *
+   * Arm B scope (pre-registered): the clip g' = c*asinh(g/c) applies
+   * ONLY to the gradient the ADAPTER observes — the mass estimator's
+   * score moments — and only during warmup iterations below
+   * grad_clip_iters(). The trajectory integrator's gradient is never
+   * touched (that would change the Hamiltonian being integrated, i.e.
+   * target a smoothed posterior); the step adapter consumes only the
+   * scalar acceptance statistic and has no gradient input to clip.
+   * With grad_clip_scale() == 0 (the default) this is exactly the
+   * unmodified observe() call.
+   *
+   * @param[in] grad_select The endpoint gradient of the transition
+   * that just ran (the raw model gradient).
+   */
+  void observe_estimator(const Eigen::VectorXd& grad_select) {
+    const double clip_c = warmup_cfg_.get().grad_clip_scale();
+    if (clip_c > 0.0 && iteration_ < warmup_cfg_.get().grad_clip_iters()) {
+      Eigen::VectorXd clipped =
+          (clip_c * (grad_select.array() / clip_c).asinh()).matrix();
+      mass_estimator_.observe(theta_, clipped, iteration_);
+    } else {
+      mass_estimator_.observe(theta_, grad_select, iteration_);
+    }
+  }
 
   /** The optimizer for step size adaptation.
    */
