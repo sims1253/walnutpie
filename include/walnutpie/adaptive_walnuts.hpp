@@ -579,6 +579,21 @@ class AdaptiveWalnuts {
         handler_(handler),
         logp_grad_(logp_grad, handler),
         theta_(init_chain_cfg.position()),
+        // W-42: seed the endpoint cache with the init-position (grad,
+        // logp) recorded by InitConfigBuilder::masses() — the same
+        // (position, function) pair the first transition would otherwise
+        // re-evaluate at its start. Reused doubles change no arithmetic
+        // (W-23 precedent); the first warmup transition skips one
+        // logp_grad call.
+        cached_grad_(
+            (init_chain_cfg.has_init_eval() &&
+             init_chain_cfg.init_grad().size() ==
+                 init_chain_cfg.position().size())
+                ? init_chain_cfg.init_grad()
+                : Eigen::VectorXd()),
+        cached_logp_(init_chain_cfg.has_init_eval()
+                         ? init_chain_cfg.init_logp()
+                         : -std::numeric_limits<double>::infinity()),
         last_mass_(init_chain_cfg.mass()),
         iteration_(0),
         opt_(make_configured_adapter<Opt>(init_chain_cfg, warmup_cfg)),

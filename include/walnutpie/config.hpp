@@ -36,6 +36,33 @@ class InitChainConfig {
       : step_size_(step_size), position_(position), mass_(mass) {}
 
   /**
+   * @brief Construct an initialization configuration carrying the log
+   * density and gradient evaluated at the initial position (W-42).
+   *
+   * The pair comes from the evaluation `InitConfigBuilder::masses()`
+   * already performs at each chain's position (whose log density was
+   * previously discarded). Callers use it to (a) refuse non-finite
+   * initial log densities before warmup starts and (b) seed the first
+   * transition's start-position cache so the duplicate re-evaluation is
+   * skipped.
+   *
+   * @param[in] step_size The initial step size.
+   * @param[in] position The initial position.
+   * @param[in] mass The initial mass matrix (diagonal).
+   * @param[in] init_grad The gradient of the log density at `position`.
+   * @param[in] init_logp The log density at `position`.
+   */
+  InitChainConfig(double step_size, const Eigen::VectorXd& position,
+                  const Eigen::VectorXd& mass, const Eigen::VectorXd& init_grad,
+                  double init_logp)
+      : step_size_(step_size),
+        position_(position),
+        mass_(mass),
+        init_grad_(init_grad),
+        init_logp_(init_logp),
+        has_init_eval_(true) {}
+
+  /**
    * @brief Return the initial step size.
    *
    * @return The step size.
@@ -56,10 +83,45 @@ class InitChainConfig {
    */
   const Eigen::VectorXd& mass() const noexcept { return mass_; }
 
+  /**
+   * @brief Return whether a (log density, gradient) evaluation at the
+   * initial position is recorded in this configuration (W-42).
+   *
+   * @return True if `init_logp()`/`init_grad()` are meaningful.
+   */
+  bool has_init_eval() const noexcept { return has_init_eval_; }
+
+  /**
+   * @brief Return the recorded log density at the initial position.
+   *
+   * Only meaningful when `has_init_eval()` is true.
+   *
+   * @return The log density.
+   */
+  double init_logp() const noexcept { return init_logp_; }
+
+  /**
+   * @brief Return the recorded gradient at the initial position.
+   *
+   * Only meaningful when `has_init_eval()` is true; empty otherwise.
+   *
+   * @return The gradient.
+   */
+  const Eigen::VectorXd& init_grad() const noexcept { return init_grad_; }
+
  private:
   double step_size_;
   Eigen::VectorXd position_;
   Eigen::VectorXd mass_;
+
+  /** Gradient at the initial position from the mass-seeding eval (W-42). */
+  Eigen::VectorXd init_grad_;
+
+  /** Log density at the initial position from the mass-seeding eval. */
+  double init_logp_ = 0.0;
+
+  /** Whether the init evaluation above was recorded. */
+  bool has_init_eval_ = false;
 };
 
 /**
@@ -147,12 +209,31 @@ class InitConfig {
   }
 
   /**
+   * @brief Return the log densities at the initial positions (W-42).
+   *
+   * One entry per chain when the configuration was built through
+   * `InitConfigBuilder::masses(logp_grad, ...)` (which evaluates each
+   * chain's position); empty otherwise (no evaluation exists to
+   * report). Callers use this to refuse starting a chain at a
+   * non-finite log density.
+   *
+   * @return The initial log densities (empty if none were recorded).
+   */
+  const std::vector<double>& init_logps() const noexcept {
+    return init_logps_;
+  }
+
+  /**
    * @brief Return the initialization configuration for the specified chain.
    *
    * @param[in] n The chain index.
    * @return The indexed chain's initialization configuration.
    */
   InitChainConfig init_chain_config(std::size_t n) const {
+    if (n < init_logps_.size() && n < init_grads_.size()) {
+      return InitChainConfig(step_size(n), position(n), mass(n),
+                             init_grads_[n], init_logps_[n]);
+    }
     return InitChainConfig(step_size(n), position(n), mass(n));
   }
 
@@ -169,19 +250,33 @@ class InitConfig {
    * @param[in] step_sizes The step sizes.
    * @param[in] positions The positions.
    * @param[in] masses The diagonals of the diagonal mass matrixes.
+   * @param[in] init_logps Log densities at the positions (W-42; may be
+   * empty when no mass-seeding evaluation was performed).
+   * @param[in] init_grads Gradients at the positions (W-42; same
+   * emptiness rule as `init_logps`).
    */
   InitConfig(std::vector<double>&& step_sizes,
              std::vector<Eigen::VectorXd>&& positions,
-             std::vector<Eigen::VectorXd>&& masses)
+             std::vector<Eigen::VectorXd>&& masses,
+             std::vector<double>&& init_logps = {},
+             std::vector<Eigen::VectorXd>&& init_grads = {})
       : step_sizes_(std::move(step_sizes)),
         positions_(std::move(positions)),
-        masses_(std::move(masses)) {}
+        masses_(std::move(masses)),
+        init_logps_(std::move(init_logps)),
+        init_grads_(std::move(init_grads)) {}
 
   InitConfig() = default;
 
   std::vector<double> step_sizes_;
   std::vector<Eigen::VectorXd> positions_;
   std::vector<Eigen::VectorXd> masses_;
+
+  /** Log densities at the initial positions (empty if not evaluated). */
+  std::vector<double> init_logps_;
+
+  /** Gradients at the initial positions (empty if not evaluated). */
+  std::vector<Eigen::VectorXd> init_grads_;
 };
 
 /**
@@ -258,6 +353,7 @@ class InitConfigBuilder {
   template <std::uniform_random_bit_generator RNG>
   InitConfigBuilder& positions(RNG& rng, double init_scale) {
     detail::validate_finite_positive(init_scale, "init_scale");
+    invalidate_init_evals_();
     detail::Random<RNG> rand(rng);
     positions_.resize(num_chains_);
     for (std::size_t c = 0; c < num_chains_; ++c) {
@@ -280,6 +376,7 @@ class InitConfigBuilder {
   InitConfigBuilder& positions(const Eigen::VectorXd& v) {
     detail::validate_size(v, dims_, "position", "dims");
     detail::validate_finite(v, "position");
+    invalidate_init_evals_();
     positions_ = std::vector<Eigen::VectorXd>(num_chains_, v);
     return *this;
   }
@@ -303,6 +400,7 @@ class InitConfigBuilder {
     for (const auto& v : vs) {
       detail::validate_size(v, dims_, "position", "dims");
     }
+    invalidate_init_evals_();
     positions_ = vs;
     return *this;
   }
@@ -326,6 +424,7 @@ class InitConfigBuilder {
     for (const auto& v : vs) {
       detail::validate_size(v, dims_, "position", "dims");
     }
+    invalidate_init_evals_();
     positions_ = std::move(vs);
     return *this;
   }
@@ -364,9 +463,17 @@ class InitConfigBuilder {
     detail::validate_probability(mass_smoothing, "mass_smoothing");
     Eigen::VectorXd grad;
     masses_.resize(num_chains_);
+    init_logps_.resize(num_chains_);
+    init_grads_.resize(num_chains_);
     for (std::size_t c = 0; c < num_chains_; ++c) {
-      double lp_to_discard;
-      logp_grad(positions_[c], lp_to_discard, grad);
+      double lp;
+      logp_grad(positions_[c], lp, grad);
+      // W-42: record the mass-seeding evaluation (the log density was
+      // previously discarded) — callers use it to refuse non-finite
+      // initial log densities before warmup and to seed the first
+      // transition's start-position cache.
+      init_logps_[c] = lp;
+      init_grads_[c] = grad;
       masses_[c] = (1 - mass_smoothing) * grad.array().abs() + mass_smoothing;
       if (clamp > 0) {
         // Guard against far-from-typical-set initializations where the
@@ -461,7 +568,8 @@ class InitConfigBuilder {
    */
   InitConfig build() {
     return InitConfig{std::move(step_sizes_), std::move(positions_),
-                      std::move(masses_)};
+                      std::move(masses_), std::move(init_logps_),
+                      std::move(init_grads_)};
   }
 
   /**
@@ -483,11 +591,29 @@ class InitConfigBuilder {
   }
 
  private:
+  /**
+   * @brief Drop any recorded init evaluations (W-42 hygiene).
+   *
+   * Called whenever the positions change after a `masses(logp_grad,
+   * ...)` call: the recorded (logp, grad) pairs belong to the positions
+   * they were evaluated at and must not survive a position swap.
+   */
+  void invalidate_init_evals_() {
+    init_logps_.clear();
+    init_grads_.clear();
+  }
+
   std::size_t num_chains_;
   std::size_t dims_;
   std::vector<double> step_sizes_;
   std::vector<Eigen::VectorXd> positions_;
   std::vector<Eigen::VectorXd> masses_;
+
+  /** Log densities at the positions from the mass-seeding eval (W-42). */
+  std::vector<double> init_logps_;
+
+  /** Gradients at the positions from the mass-seeding eval (W-42). */
+  std::vector<Eigen::VectorXd> init_grads_;
 };
 
 /**

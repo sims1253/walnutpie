@@ -164,12 +164,31 @@ class DynamicStanModel {
     }
   }
 
+  /**
+   * Draw an initial unconstrained position uniformly in
+   * [-init_radius, init_radius].
+   *
+   * W-42 note: the underlying BridgeStan `param_initialize` implements
+   * Stan's random-init protocol — it evaluates the log density at each
+   * draw and REJECTS non-finite values, retrying up to `max_tries`
+   * draws from the same rng stream before throwing "Initialization
+   * failed" (cmdstan text). `max_tries` was previously hardcoded to
+   * 100 here; it is now exposed so callers can own the retry policy
+   * (the CLI passes 1 and runs its own auditable loop). The default
+   * keeps the historical behavior exactly.
+   *
+   * @param[in] json JSON string for parameters to fix (nullptr = none).
+   * @param[in,out] rng The model rng; each attempt consumes one draw's
+   * worth of stream, deterministically, in order.
+   * @param[in] init_radius Uniform draw radius.
+   * @param[in] max_tries Maximum attempts before throwing (default 100).
+   */
   Eigen::VectorXd initialize(const char* json, unique_bs_rng& rng,
-                             double init_radius) const {
+                             double init_radius, int max_tries = 100) const {
     Eigen::VectorXd params(unconstrained_dimensions());
     char* err = nullptr;
     int ret = param_initialize_(model_ptr_.get(), json, rng.get(), init_radius,
-                                100, true, params.data(), &err);
+                                max_tries, true, params.data(), &err);
     if (ret != 0) {
       if (err) {
         std::string error_string(err);

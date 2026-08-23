@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -66,6 +67,113 @@ static void write_draws(const std::string& filename,
 
   out << draws.transpose().format(EigenCommaFormat);
   out.close();
+}
+
+// ---------------------------------------------------------------------------
+// W-42 init-protocol guard: never start a chain at a non-finite-logp
+// position (the root cause behind the W-36 aborts / W-41 pinned
+// "recoveries"). Two modes:
+//  - FILE-INIT (--init-file): the provided draw is the draw; the logp is
+//    already evaluated by InitConfigBuilder::masses() (previously the lp
+//    was discarded), so the guard adds ZERO evaluations and fires before
+//    ANY warmup consumption.
+//  - RANDOM-INIT (default): rejection loop, Stan random-init convention —
+//    draw, check logp finite, retry up to --init-tries draws.
+// ---------------------------------------------------------------------------
+
+static std::string format_double(double v) {
+  std::ostringstream oss;
+  oss << v;
+  return oss.str();
+}
+
+// W-42 (a): loud, actionable, immediate failure for a provided init draw
+// whose logp is non-finite. Today's behavior for such a cell is a silent
+// 1000-iteration pin (the acceptance statistic is inf-inf=NaN, the step
+// adapter NaNs at iteration 0, the chain never leaves the init) ending in
+// a freeze abort (pre-W-41) or a zero-ESS completing chain (post-W-41) —
+// strictly worse than an early error.
+[[noreturn]] static void throw_nonfinite_init(std::size_t chain,
+                                              const std::string& source,
+                                              double lp) {
+  std::string msg = "initial position has non-finite log probability: chain " +
+                    std::to_string(chain) + ", init source: " + source +
+                    ", logp at init: " + format_double(lp);
+  std::cerr << "WALNUTS ERROR (init guard): " << msg << "\n"
+            << "  A chain started at a non-finite-logp position cannot adapt:\n"
+               "  the within-orbit acceptance statistic is NaN, the step\n"
+               "  adapter NaNs at its first update and the chain stays pinned\n"
+               "  for the whole warmup budget (W-36/W-41 pathology). Warmup\n"
+               "  was refused BEFORE starting; no budget was consumed.\n"
+               "  Provide an init draw with finite logp (or use random init,\n"
+               "  which retries: see --init-tries)."
+            << std::endl;
+  throw std::invalid_argument(msg);
+}
+
+// W-42 (b): random-init rejection loop, Stan convention (draw, check
+// logp finite, retry up to `tries` draws). LAYERING NOTE: BridgeStan's
+// param_initialize already implements this protocol internally
+// (stan::services::util::initialize, hardcoded max_tries=100 by walnutpie
+// before W-42, invisible to the CLI); W-42 moves the policy here — the
+// inner layer is called with max_tries=1 (one draw per call) and THIS
+// loop owns the budget, the per-draw audit lines and the loud failure.
+// RNG discipline (pre-registered): candidates are drawn from the chain's
+// BridgeStan init RNG stream (the `rng` passed in), EXACTLY one
+// one-draw initialize() per attempt, consumed strictly in order and
+// BEFORE any warmup consumption (warmup runs on the separate
+// std::mt19937_64 stream, untouched by init retries) — the identical
+// draw sequence the inner loop consumed historically, so any run the
+// stock binary started lands on the same accepted position. The first
+// ACCEPTED draw is the final init-stream consumption and then seeds the
+// chain exactly as before.
+static Eigen::VectorXd initialize_finite(DynamicStanModel& model,
+                                         unique_bs_rng& rng, double init_radius,
+                                         unsigned int seed, std::size_t chain,
+                                         std::size_t tries) {
+  std::string last_err;
+  for (std::size_t attempt = 1; attempt <= tries; ++attempt) {
+    Eigen::VectorXd pos;
+    double lp = -std::numeric_limits<double>::infinity();
+    Eigen::VectorXd grad;
+    bool rejected = false;
+    try {
+      // max_tries=1: exactly one draw; the inner Stan protocol throws on
+      // a non-finite-logp draw instead of silently redrawing.
+      pos = model.initialize(nullptr, rng, init_radius, 1);
+      // Belt-and-braces verification on the returned draw (direct model
+      // call, outside the timing stanzas; the accepted position is
+      // re-evaluated by the builder's mass seeding exactly as before).
+      // load_stan maps a model error to lp = -inf.
+      model.logp_grad(pos, lp, grad);
+      rejected = !std::isfinite(lp);
+    } catch (const std::exception& e) {
+      // The inner layer's rejection ("Initialization failed") or any
+      // other per-draw failure counts as one rejected draw.
+      rejected = true;
+      last_err = e.what();
+    }
+    if (!rejected) {
+      return pos;
+    }
+    std::cerr << "WALNUTS WARNING (init guard): random init draw rejected "
+              << "(chain " << chain << ", seed " << seed << ", attempt "
+              << attempt << "/" << tries
+              << ", logp=" << format_double(lp)
+              << (last_err.empty() ? std::string()
+                                   : "; inner: " + last_err)
+              << "); redrawing" << std::endl;
+    last_err.clear();
+  }
+  std::string msg =
+      "random initialization failed: all " + std::to_string(tries) +
+      " draws have non-finite log probability (chain " + std::to_string(chain) +
+      ", seed " + std::to_string(seed) + ")";
+  std::cerr << "WALNUTS ERROR (init guard): " << msg << "\n"
+            << "  Increase --init-tries, adjust --init, or provide "
+               "--init-file draws from the typical set."
+            << std::endl;
+  throw std::invalid_argument(msg);
 }
 
 class StanHandler {
@@ -139,7 +247,8 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                         walnutpie::SamplingConfig& sample_cfg,
                         double mass_init_clamp = 0.0,
                         bool step_init_heuristic = false,
-                        double early_exit_tol = 0.0) {
+                        double early_exit_tol = 0.0,
+                        const std::string& init_file = "") {
   using Clock = std::chrono::high_resolution_clock;
   auto elapsed_seconds = [](auto t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
@@ -172,6 +281,21 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   auto init_cfg = init_builder.masses(logp, warmup_cfg.mass_additive_smoothing(),
                                     false, mass_init_clamp)
                       .build();
+  // W-42 (a): file-init guard. masses() just evaluated the logp at the
+  // provided draw (recorded, no new evaluation); refuse to start warmup
+  // from a non-finite logp BEFORE the step heuristic probe and before the
+  // adapter exists (zero warmup consumption, zero budget burned).
+  {
+    const std::vector<double>& init_logps = init_cfg.init_logps();
+    for (std::size_t c = 0; c < init_logps.size(); ++c) {
+      if (!std::isfinite(init_logps[c])) {
+        throw_nonfinite_init(
+            c, init_file.empty() ? "random init (seed " + std::to_string(seed) + ")"
+                                 : init_file,
+            init_logps[c]);
+      }
+    }
+  }
   auto inits = init_cfg.init_chain_config(0);
   std::mt19937_64 rng{seed};
   if (step_init_heuristic) {
@@ -179,7 +303,14 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
     walnutpie::detail::Random heur_rand(rng);
     double eps = walnutpie::detail::find_reasonable_step(
         heur_rand, logp, inits.position(), inv_mass, inits.step_size());
-    inits = walnutpie::InitChainConfig(eps, inits.position(), inits.mass());
+    // W-42: keep the recorded init evaluation (the probe does not move the
+    // position) so the first transition's cache seed survives.
+    inits = inits.has_init_eval()
+                ? walnutpie::InitChainConfig(eps, inits.position(),
+                                             inits.mass(), inits.init_grad(),
+                                             inits.init_logp())
+                : walnutpie::InitChainConfig(eps, inits.position(),
+                                             inits.mass());
     std::cout << "Heuristic initial step size: " << eps << std::endl;
   }
 
@@ -389,7 +520,8 @@ void run_walnuts_multi(
     const walnutpie::SamplingConfig& sample_cfg, double init_radius,
     double step_size_init, const std::string& init_pattern,
     const std::string& out_pattern, std::size_t pilot_burst,
-    double pilot_rho1_max, double pilot_rhat_max, bool serial_exec) {
+    double pilot_rho1_max, double pilot_rhat_max, bool serial_exec,
+    std::size_t init_tries) {
   using Clock = std::chrono::high_resolution_clock;
   using LogpT = decltype(make_timed_logp(std::declval<DynamicStanModel&>(),
                                          std::declval<ChainTiming&>()));
@@ -435,6 +567,9 @@ void run_walnuts_multi(
 
   // Initial positions per chain, replicating the single-chain CLI
   // (--init-file wins; else model.initialize with the model's rng).
+  // W-42 (b): random inits go through the finite-logp rejection loop
+  // (one initialize() per attempt from the chain's own init stream, in
+  // order, before any warmup consumption).
   std::vector<Eigen::VectorXd> positions;
   positions.reserve(chains);
   for (std::size_t c = 0; c < chains; ++c) {
@@ -458,8 +593,9 @@ void run_walnuts_multi(
           Eigen::VectorXd::Map(vals.data(), vals.size()));
     } else {
       auto mrng = models[c]->make_rng(seed + static_cast<unsigned>(c));
-      positions.push_back(
-          models[c]->initialize(nullptr, mrng, init_radius));
+      positions.push_back(initialize_finite(
+          *models[c], mrng, init_radius, seed + static_cast<unsigned>(c), c,
+          init_tries));
     }
   }
 
@@ -471,6 +607,19 @@ void run_walnuts_multi(
           .positions(std::move(positions))
           .masses(logps[0], warmup_cfg.mass_additive_smoothing(), false, 0.0)
           .build();
+  // W-42 (a): file-init guard — masses() just evaluated the logp at each
+  // chain's provided draw (recorded, no new evaluation); refuse to start
+  // warmup from a non-finite logp BEFORE any rng/handler/adapter exists.
+  if (!init_pattern.empty()) {
+    const std::vector<double>& init_logps = init_cfg.init_logps();
+    for (std::size_t c = 0; c < init_logps.size(); ++c) {
+      if (!std::isfinite(init_logps[c])) {
+        std::string f = init_pattern;
+        f.replace(f.find("{c}"), 3, std::to_string(c));
+        throw_nonfinite_init(c, f, init_logps[c]);
+      }
+    }
+  }
 
   std::vector<RNG> rngs;
   rngs.reserve(chains);
@@ -681,6 +830,7 @@ int main(int argc, char** argv) {
   double init = 2.0;
   double step_size_init = 1.0;
   std::string init_file = "";
+  std::size_t init_tries = 100;  // W-42: random-init rejection-loop budget
 
   std::string lib;
   std::string data;
@@ -734,6 +884,16 @@ int main(int argc, char** argv) {
                    "Range [-init,init] for uniform parameter initial values")
         ->default_val(init)
         ->check(CLI::NonNegativeNumber);
+
+    app.add_option("--init-tries", init_tries,
+                   "Random init (W-42): maximum draws rejecting non-finite "
+                   "log probability before failing (Stan convention: 100). "
+                   "Rejections draw again from the same init rng stream "
+                   "before any warmup consumption; a file init never "
+                   "resamples and instead fails immediately on non-finite "
+                   "logp")
+        ->default_val(init_tries)
+        ->check(CLI::PositiveNumber);
 
     app.add_option("--mass-init-count", mass_init_count,
                    "Initial count for the mass matrix adaptation")
@@ -1116,7 +1276,8 @@ int main(int argc, char** argv) {
           lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
           num_draws, save_warmup, warmup_cfg, sample_cfg, init,
           step_size_init, init_file, output_file, pilot_burst,
-          pilot_rho1_max, pilot_rhat_max, chain_exec == "serial");
+          pilot_rho1_max, pilot_rhat_max, chain_exec == "serial",
+          init_tries);
     };
     if (step_optimizer == "adam") {
       run_multi(std::type_identity<walnutpie::detail::Adam>{});
@@ -1150,7 +1311,12 @@ int main(int argc, char** argv) {
       }
       return Eigen::VectorXd(Eigen::VectorXd::Map(vals.data(), vals.size()));
     }
-    return model.initialize(nullptr, rng, init);
+    // W-42 (b): random init goes through the finite-logp rejection loop
+    // (one initialize() per attempt from the init rng stream, in order,
+    // before any warmup consumption; finite first draw = today's exact
+    // stream state).
+    return initialize_finite(model, rng, init, static_cast<unsigned int>(seed),
+                             0, init_tries);
   }();
 
   auto init_cfg =
@@ -1178,36 +1344,43 @@ int main(int argc, char** argv) {
           return run_walnuts<
               AntiWindupAdapter<ClippedAdapter<BatchedAdapter<Opt>>>>(
               model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol,
+              init_file);
         } else if (step_opt_batch_stride > 1) {
           return run_walnuts<AntiWindupAdapter<BatchedAdapter<Opt>>>(
               model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol,
+              init_file);
         } else if (step_grad_clip > 0.0) {
           return run_walnuts<AntiWindupAdapter<ClippedAdapter<Opt>>>(
               model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol,
+              init_file);
         }
         return run_walnuts<AntiWindupAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol,
+            init_file);
       }
       if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol,
+            init_file);
       } else if (step_opt_batch_stride > 1) {
         return run_walnuts<BatchedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol,
+            init_file);
       } else if (step_grad_clip > 0.0) {
         return run_walnuts<ClippedAdapter<Opt>>(
             model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol,
+            init_file);
       }
       return run_walnuts<Opt>(model, seed, init_cfg, num_warmup, num_draws,
                               save_warmup, warmup_cfg, sample_cfg, extra.first,
-                              extra.second, early_exit_tol);
+                              extra.second, early_exit_tol, init_file);
     };
     if (step_optimizer == "adam") {
       return run_base(std::type_identity<Adam>{});
