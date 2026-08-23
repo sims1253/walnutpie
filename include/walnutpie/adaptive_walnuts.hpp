@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <vector>
 #include <cstddef>
@@ -19,6 +20,7 @@
 #include "walnutpie/low_rank_metric.hpp"
 #include "walnutpie/util.hpp"
 #include "walnutpie/walnuts.hpp"
+#include "walnutpie/warmup_heuristics.hpp"
 
 namespace walnutpie::detail {
 
@@ -584,7 +586,9 @@ class AdaptiveWalnuts {
         opt_(make_configured_adapter<Opt>(init_chain_cfg, warmup_cfg)),
         mass_estimator_(warmup_cfg, init_chain_cfg),
         min_micro_estimator_(warmup_cfg.max_macro_steps_target(),
-                             sampling_cfg.min_micro_steps()) {}
+                             sampling_cfg.min_micro_steps()),
+        init_step_(init_chain_cfg.step_size()),
+        last_finite_step_(init_step_) {}
 
   /**
    * @brief Generate the next state for adaptation and the handler.
@@ -666,6 +670,7 @@ class AdaptiveWalnuts {
       last_mass_ = lrm.D.cwiseInverse();
       min_micro_estimator_.observe(1 << depth);
       handler_.get().on_warmup(theta_, logp_select, step_size(), lrm.D);
+      note_step_();
       ++iteration_;
       return;
     }
@@ -720,6 +725,7 @@ class AdaptiveWalnuts {
     last_mass_ = inv_mass.cwiseInverse();
     min_micro_estimator_.observe(1 << depth);
     handler_.get().on_warmup(theta_, logp_select, step_size(), inv_mass);
+    note_step_();
     ++iteration_;
   }
 
@@ -731,13 +737,29 @@ class AdaptiveWalnuts {
    * along the compound random number generator and log density function and
    * is hence not marked `const`.
    *
+   * W-41 freeze clamp: a degenerate warmup (e.g. a non-finite log density
+   * at the init, which NaNs the adapter) can leave `step_size()` 0, NaN,
+   * or +inf, and the WalnutsSampler constructor throws on that — a
+   * whole-run abort at the end of the budget. Fall back to a finite
+   * positive step instead (see `freeze_step_fallback`) and warn on
+   * stderr; the clamp is dead code while `step_size()` is finite and
+   * positive.
+   *
    * @return The Walnuts sampler with current tuning parameter estimates.
    */
   WalnutsSampler<F, RNG, H> sampler() {
-    handler_.get().on_warmup_complete(step_size(), inv_mass());
+    double macro_time = step_size();
+    if (!(std::isfinite(macro_time) && macro_time > 0.0)) {
+      if (!freeze_clamped_) {
+        freeze_fallback_step_ = freeze_step_fallback(macro_time);
+        freeze_clamped_ = true;
+      }
+      macro_time = freeze_fallback_step_;
+    }
+    handler_.get().on_warmup_complete(macro_time, inv_mass());
     WalnutsSampler<F, RNG, H> out(
         rand_.rng(), handler_, logp_grad_.logp_grad_, theta_, inv_mass(),
-        step_size(), sampling_cfg_.get().max_trajectory_doublings(),
+        macro_time, sampling_cfg_.get().max_trajectory_doublings(),
         sampling_cfg_.get().max_step_halvings(),
         min_micro_estimator_.min_micro_steps(),
         sampling_cfg_.get().max_hamiltonian_error());
@@ -862,6 +884,71 @@ class AdaptiveWalnuts {
 
   /** The estimator for the minimum number of micro steps per macro step. */
   detail::MinMicroStepsAdaptHandler min_micro_estimator_;
+
+  /**
+   * @brief Remember the adapter's step size when it is usable.
+   *
+   * Pure observation of `opt_.step_size()` after the iteration's adapter
+   * updates; it changes no warmup arithmetic (W-41 gate: bit-identical
+   * draws when the freeze is healthy).
+   */
+  void note_step_() noexcept {
+    const double s = opt_.step_size();
+    if (std::isfinite(s) && s > 0.0) {
+      last_finite_step_ = s;
+    }
+  }
+
+  /**
+   * @brief Resolve a finite positive freeze step for a degenerate
+   * `step_size()`.
+   *
+   * Fallback order: (a) `last_finite_step_` (seeded with the initial
+   * step), (b) a find_reasonable_step probe at the current position with
+   * the current metric — consumes RNG draws and evaluations on a path
+   * with no bit-identity contract, (c) the hard floor 1000 *
+   * numeric_limits<double>::min(). Emits one stderr warning naming the
+   * degenerate value, the fallback, and its source.
+   */
+  double freeze_step_fallback(double degenerate) {
+    const double floor_v = 1000.0 * std::numeric_limits<double>::min();
+    const char* source = nullptr;
+    double fallback = last_finite_step_;
+    if (std::isfinite(fallback) && fallback > 0.0) {
+      source = "last finite warmup step size";
+    }
+    if (source == nullptr) {
+      try {
+        fallback = detail::find_reasonable_step(
+            rand_, logp_grad_.logp_grad_, theta_, inv_mass(), init_step_);
+      } catch (...) {
+        fallback = 0.0;
+      }
+      if (std::isfinite(fallback) && fallback > 0.0) {
+        source = "find_reasonable_step heuristic";
+      }
+    }
+    if (source == nullptr) {
+      fallback = floor_v;
+      source = "hard floor (1000 * DBL_MIN)";
+    }
+    std::cerr << "WALNUTS WARNING: freeze step size degenerate (step_size()="
+              << degenerate << "); falling back to " << fallback << " ("
+              << source << "); warmup iterations=" << iteration_ << std::endl;
+    return fallback;
+  }
+
+  /** The initial step size the adapter was seeded with. */
+  double init_step_;
+
+  /** Last finite positive step size observed during warmup. */
+  double last_finite_step_;
+
+  /** Cached freeze fallback, computed once. */
+  double freeze_fallback_step_ = 0.0;
+
+  /** Whether the freeze fallback has been computed. */
+  bool freeze_clamped_ = false;
 };
 
 }  // namespace walnutpie
