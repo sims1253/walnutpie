@@ -666,6 +666,7 @@ class AdaptiveWalnuts {
       lrm.U = mass_estimator_.rank_U();
       lrm.c = mass_estimator_.rank_c();
       Eigen::VectorXd grad_select;
+      Eigen::VectorXd rho_select;
       double logp_select;
       std::size_t depth;
       theta_ = detail::transition_w_lr(
@@ -676,11 +677,14 @@ class AdaptiveWalnuts {
           drifting ? std::numeric_limits<double>::infinity()
                    : effective_max_error(),
           std::move(theta_), depth, grad_select, logp_select, opt_,
-          cached_grad_, cached_logp_);
+          cached_grad_, cached_logp_, cached_rho_, &rho_select);
       // W-23: cache the endpoint (grad, logp) for the next transition's
       // start-position reuse (duplicate eval elimination, see W-20).
+      // W-63: also thread the selected state's momentum into the next
+      // transition's partial refresh.
       cached_grad_ = grad_select;
       cached_logp_ = logp_select;
+      cached_rho_ = std::move(rho_select);
       if (!drifting && !mass_buffered) {
         observe_estimator(grad_select);
       }
@@ -697,6 +701,7 @@ class AdaptiveWalnuts {
       return;
     }
     Eigen::VectorXd grad_select;
+    Eigen::VectorXd rho_select;
     double logp_select;
     std::size_t depth;
     // During the drift phase the error cap is suspended entirely (option (b)):
@@ -719,7 +724,7 @@ class AdaptiveWalnuts {
                             min_micro_estimator_.min_micro_steps(), max_err,
                             std::move(theta_), depth, grad_select,
                             logp_select, drift_noop, cached_grad_,
-                            cached_logp_);
+                            cached_logp_, cached_rho_, &rho_select);
     } else {
       theta_ = transition_w(rand_, logp_grad_, inv_mass, chol_mass,
                             opt_.step_size(),
@@ -727,10 +732,12 @@ class AdaptiveWalnuts {
                             sampling_cfg_.get().max_step_halvings(),
                             min_micro_estimator_.min_micro_steps(), max_err,
                             std::move(theta_), depth, grad_select,
-                            logp_select, opt_, cached_grad_, cached_logp_);
+                            logp_select, opt_, cached_grad_, cached_logp_,
+                            cached_rho_, &rho_select);
     }
     cached_grad_ = grad_select;
     cached_logp_ = logp_select;
+    cached_rho_ = std::move(rho_select);
     if (!drifting && !mass_buffered) {
       // Suspend metric estimation during drift: the draws observed while the
       // chain is pinned/throttled poison the variance estimates (the
@@ -783,6 +790,11 @@ class AdaptiveWalnuts {
     // transition's (grad, logp) at exactly this position, so the first
     // sampling transition skips its start-position re-evaluation too.
     out.seed_endpoint_cache(cached_grad_, cached_logp_);
+    // W-63: carry the last warmup transition's selected momentum so the
+    // first sampling transition's partial refresh uses the correct rho_prev.
+    if (cached_rho_.size() == theta_.size()) {
+      out.seed_momentum_cache(cached_rho_);
+    }
     return out;
   }
 
@@ -875,6 +887,9 @@ class AdaptiveWalnuts {
 
   /** Cached endpoint gradient at `theta_` from the last transition (W-23). */
   Eigen::VectorXd cached_grad_;
+
+  /** Momentum of the selected state from the last transition (W-63). */
+  Eigen::VectorXd cached_rho_;
 
   /** Cached endpoint log density at `theta_` from the last transition. */
   double cached_logp_ = -std::numeric_limits<double>::infinity();

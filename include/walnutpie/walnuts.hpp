@@ -51,18 +51,23 @@ class SpanW {
                                   Eigen::VectorXd&& rho,
                                   Eigen::VectorXd&& grad_theta, double logp_pos,
                                   double logp_joint) {
-    return {theta,
-            rho,
-            grad_theta,
-            logp_joint,
-            theta,
-            std::move(rho),
-            grad_theta,
-            logp_joint,
-            std::move(theta),
-            std::move(grad_theta),
-            logp_pos,
-            logp_joint};
+    SpanW span{theta,
+               rho,
+               grad_theta,
+               logp_joint,
+               theta,
+               rho,
+               grad_theta,
+               logp_joint,
+               std::move(theta),
+               std::move(grad_theta),
+               Eigen::VectorXd(),  // rho_select_; overwritten below
+               logp_pos,
+               logp_joint};
+    // W-63 partial refresh: a single-state span's selected state is the
+    // state itself, so its momentum seeds the next transition's refresh.
+    span.rho_select_ = std::move(rho);
+    return span;
   }
 
   /**
@@ -74,6 +79,8 @@ class SpanW {
    * @param[in] theta_select The selected position.
    * @param[in] grad_select The gradient of the target log density at the
    * selected position.
+   * @param[in] rho_select The momentum of the selected state (W-63 partial
+   * refresh: seeds the next transition's momentum refresh).
    * @param[in] logp_pos_select The log density of the selected position.
    * @param[in] logp_joint_total The log of the sum of the joint densities of
    * positions and momentums on the trajectory.
@@ -81,6 +88,7 @@ class SpanW {
   static SpanW from_subspans(SpanW&& span1, SpanW&& span2,
                              Eigen::VectorXd&& theta_select,
                              Eigen::VectorXd&& grad_select,
+                             Eigen::VectorXd&& rho_select,
                              double logp_pos_select, double logp_joint_total) {
     return {std::move(span1.theta_bk_),
             std::move(span1.rho_bk_),
@@ -92,6 +100,7 @@ class SpanW {
             span2.logp_fw_,
             std::move(theta_select),
             std::move(grad_select),
+            std::move(rho_select),
             logp_pos_select,
             logp_joint_total};
   }
@@ -125,6 +134,9 @@ class SpanW {
 
   /** The gradient of the log density at the selected state. */
   Eigen::VectorXd grad_select_;
+
+  /** The momentum of the selected state (W-63 partial refresh). */
+  Eigen::VectorXd rho_select_;
 
   /** The log density of the selected state. */
   double logp_pos_select_;
@@ -406,12 +418,14 @@ inline SpanW combine(Random<RNG>& rng, SpanW&& span_old, SpanW&& span_new) {
   bool update = std::log(rng.uniform_real_01()) < update_logprob;
   auto& selected = update ? span_new.theta_select_ : span_old.theta_select_;
   auto& grad_selected = update ? span_new.grad_select_ : span_old.grad_select_;
+  auto& rho_selected = update ? span_new.rho_select_ : span_old.rho_select_;
   double logp_pos_select =
       update ? span_new.logp_pos_select_ : span_old.logp_pos_select_;
   auto&& [span_bk, span_fw] = order_forward_backward<D>(span_old, span_new);
   return SpanW::from_subspans(std::move(span_bk), std::move(span_fw),
                               std::move(selected), std::move(grad_selected),
-                              logp_pos_select, logp_total);
+                              std::move(rho_selected), logp_pos_select,
+                              logp_total);
 }
 
 /**
@@ -523,6 +537,37 @@ static std::optional<SpanW> build_span(Random<RNG>& rng, const F& logp_grad,
 }
 
 /**
+ * @brief Return the partial momentum refresh coefficient (W-63).
+ *
+ * Read once from `WALNUTPIE_PARTIAL_REFRESH_ALPHA` at first use. Empty or
+ * unset (the default) yields 1.0: every transition draws a fresh momentum
+ * and the sampler is bit-identical to the pre-W-63 behavior. A value in
+ * (0, 1) enables Horowitz partial refresh,
+ * ```
+ * rho' = alpha * rho_prev + sqrt(1 - alpha**2) * chol_mass * z,
+ * ```
+ * where `rho_prev` is the momentum of the state returned by the previous
+ * transition of the same chain.
+ */
+inline double partial_refresh_alpha() {
+  static const double alpha = []() {
+    const char* s = std::getenv("WALNUTPIE_PARTIAL_REFRESH_ALPHA");
+    if (!s || !*s) {
+      return 1.0;
+    }
+    double a = std::atof(s);
+    if (!(a > 0.0 && a < 1.0)) {
+      std::cout << "[walnutpie] WALNUTPIE_PARTIAL_REFRESH_ALPHA='" << s
+                << "' not in (0,1); falling back to full refresh (alpha=1.0)"
+                << std::endl;
+      return 1.0;
+    }
+    return a;
+  }();
+  return alpha;
+}
+
+/**
  * @brief Return the next state in the Markov chain given the previous state.
  *
  * @tparam F The type of the log density/gradient function.
@@ -548,6 +593,12 @@ static std::optional<SpanW> build_span(Random<RNG>& rng, const F& logp_grad,
  * transition (endpoint reuse); the start-position re-evaluation is skipped.
  * @param[in] logp_cached The log density at `theta` corresponding to
  * `grad_cached` (only used when the cache is valid).
+ * @param[in] rho_cached If non-empty and the same size as `theta`, the
+ * momentum of the state returned by the previous transition of this chain;
+ * used by the W-63 partial momentum refresh when alpha < 1.
+ * @param[out] rho_select_out If non-null, set to the momentum of the
+ * returned (selected) state so the caller can thread it into its next
+ * transition's `rho_cached`.
  * @return The next position in the Markov chain.
  */
 template <LogpGrad F, class Rand, StepSizeAdapter A>
@@ -558,10 +609,29 @@ inline Eigen::VectorXd transition_w(
     double max_error, Eigen::VectorXd&& theta, std::size_t& depth,
     Eigen::VectorXd& theta_grad, double& logp_pos_select,
     A& step_size_adapter, const Eigen::VectorXd& grad_cached = Eigen::VectorXd(),
-    double logp_cached = -std::numeric_limits<double>::infinity()) {
+    double logp_cached = -std::numeric_limits<double>::infinity(),
+    const Eigen::VectorXd& rho_cached = Eigen::VectorXd(),
+    Eigen::VectorXd* rho_select_out = nullptr) {
   pin_trace::begin_transition();     // W-43: env-gated, no-op off
   auto z = rand.standard_normal(chol_mass.size());
   Eigen::VectorXd rho = (chol_mass.array() * z.array()).matrix();
+  // W-63 partial momentum refresh (Horowitz): with probability-one mixture
+  // rho' = alpha*rho_prev + sqrt(1-alpha^2)*(chol_mass*z). VALIDITY: for any
+  // fixed alpha in [0,1] this is a pi-invariant kernel on momenta given the
+  // current position (rho_prev is a deterministic function of the previous
+  // selected state, so the momentum kernel remains a valid Gibbs-style
+  // conditional refresh), and WALNUTS' trajectory kernel is itself
+  // pi-invariant for any momentum; a composition of pi-invariant kernels
+  // preserves the stationary law. On every transition — accepted or rejected,
+  // since walnutpie always returns a selected state — the selected state's own
+  // momentum seeds the next refresh. When no cache exists (first transition of
+  // a chain) or alpha == 1.0, the fresh draw above is used unchanged and the
+  // behavior is bit-identical to the pre-W-63 sampler.
+  if (partial_refresh_alpha() < 1.0 && rho_cached.size() == theta.size()) {
+    double alpha = partial_refresh_alpha();
+    rho = alpha * rho_cached +
+          std::sqrt(1.0 - alpha * alpha) * rho;
+  }
   pin_trace::observe_step(step);  // W-43: env-gated, no-op off (macro step used)
   pin_trace::observe_z(z.norm());  // W-43: env-gated, no-op off (momentum draw)
   Eigen::VectorXd grad;
@@ -621,6 +691,9 @@ inline Eigen::VectorXd transition_w(
   }
   theta_grad = span_accum.grad_select_;
   logp_pos_select = span_accum.logp_pos_select_;
+  if (rho_select_out) {
+    *rho_select_out = std::move(span_accum.rho_select_);
+  }
   return std::move(span_accum.theta_select_);
 }
 
@@ -809,12 +882,20 @@ inline Eigen::VectorXd transition_w_lr(
     std::size_t min_micro_steps, double max_error, Eigen::VectorXd&& theta,
     std::size_t& depth, Eigen::VectorXd& theta_grad, double& logp_pos_select,
     A& step_size_adapter, const Eigen::VectorXd& grad_cached = Eigen::VectorXd(),
-    double logp_cached = -std::numeric_limits<double>::infinity()) {
+    double logp_cached = -std::numeric_limits<double>::infinity(),
+    const Eigen::VectorXd& rho_cached = Eigen::VectorXd(),
+    Eigen::VectorXd* rho_select_out = nullptr) {
   pin_trace::begin_transition();     // W-43: env-gated, no-op off
   // Momentum refresh via the exact low-rank Cholesky identity, using the
   // shared normal stream (z) for reproducibility with the diagonal path.
   Eigen::VectorXd z = rand.standard_normal(lrm.D.size()).matrix();
   Eigen::VectorXd rho = lrm.sample_momentum_from(z);
+  // W-63 partial momentum refresh; see transition_w for the validity note.
+  if (partial_refresh_alpha() < 1.0 && rho_cached.size() == theta.size()) {
+    double alpha = partial_refresh_alpha();
+    rho = alpha * rho_cached +
+          std::sqrt(1.0 - alpha * alpha) * rho;
+  }
   pin_trace::observe_step(step);   // W-43: env-gated, no-op off
   pin_trace::observe_z(z.norm());  // W-43: env-gated, no-op off
   Eigen::VectorXd grad;
@@ -851,6 +932,9 @@ inline Eigen::VectorXd transition_w_lr(
   }
   theta_grad = span_accum.grad_select_;
   logp_pos_select = span_accum.logp_pos_select_;
+  if (rho_select_out) {
+    *rho_select_out = std::move(span_accum.rho_select_);
+  }
   return std::move(span_accum.theta_select_);
 }
 
@@ -967,6 +1051,7 @@ class WalnutsSampler {
   double operator()() {
     std::size_t depth;
     Eigen::VectorXd grad_next;
+    Eigen::VectorXd rho_next;
     double logp_pos;
     if (lrm_.U.cols() > 0) {
       lrm_.D = inv_mass_;  // keep diagonal in sync (lr factors fixed post-warmup)
@@ -974,19 +1059,23 @@ class WalnutsSampler {
           rand_, logp_grad_.logp_grad_, lrm_, macro_time_, max_nuts_depth_,
           max_step_halvings_, min_micro_steps_, max_error_,
           std::move(theta_), depth, grad_next, logp_pos,
-          no_op_step_size_adapter_, cached_grad_, cached_logp_);
+          no_op_step_size_adapter_, cached_grad_, cached_logp_,
+          cached_rho_, &rho_next);
     } else {
       theta_ = transition_w(rand_, logp_grad_, inv_mass_, cholesky_mass_,
                             macro_time_, max_nuts_depth_, max_step_halvings_,
                             min_micro_steps_, max_error_, std::move(theta_),
                             depth, grad_next, logp_pos,
                             no_op_step_size_adapter_, cached_grad_,
-                            cached_logp_);
+                            cached_logp_, cached_rho_, &rho_next);
     }
     // Cache the endpoint (grad, logp) so the next transition's start-position
     // evaluation reuses them (W-23 endpoint-gradient threading).
     cached_grad_ = std::move(grad_next);
     cached_logp_ = logp_pos;
+    // W-63: thread the selected state's momentum into the next transition's
+    // partial refresh (first transition of a chain has no cache => fresh draw).
+    cached_rho_ = std::move(rho_next);
     sample_handler_.get().on_sample(theta_, logp_pos);
     return logp_pos;
   }
@@ -999,6 +1088,15 @@ class WalnutsSampler {
   void seed_endpoint_cache(Eigen::VectorXd grad, double logp) {
     cached_grad_ = std::move(grad);
     cached_logp_ = logp;
+  }
+
+  /**
+   * @brief Seed the momentum cache with the momentum of the state at the
+   * warmup/sampling boundary (W-63 partial refresh), so the frozen chain's
+   * first sampling transition refreshes from the correct rho_prev.
+   */
+  void seed_momentum_cache(Eigen::VectorXd rho) {
+    cached_rho_ = std::move(rho);
   }
 
   /**
@@ -1101,6 +1199,9 @@ class WalnutsSampler {
 
   /** Cached endpoint log density at `theta_` from the last transition. */
   double cached_logp_ = -std::numeric_limits<double>::infinity();
+
+  /** Momentum of the selected state from the last transition (W-63). */
+  Eigen::VectorXd cached_rho_;
 };
 
 }  // namespace walnutpie
