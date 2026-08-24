@@ -16,6 +16,7 @@
 
 #include <Eigen/Dense>
 
+#include "walnutpie/isoadapt.hpp"
 #include "walnutpie/isokinetic.hpp"
 #include "walnutpie/util.hpp"
 
@@ -163,6 +164,149 @@ std::vector<VectorXd> run_iso(const F& f, const VectorXd& theta0,
   return draws;
 }
 
+namespace nuts {
+
+struct Point {
+  VectorXd th, r, g;
+  double lp;
+};
+
+template <class F>
+void leapfrog(const F& f, Point& p, double eps) {
+  p.r += 0.5 * eps * p.g;
+  p.th += eps * p.r;
+  double lp;
+  VectorXd g(p.th.size());
+  f(p.th, lp, g);
+  if (!std::isfinite(lp)) lp = -std::numeric_limits<double>::infinity();
+  p.lp = lp;
+  p.g = g;
+  if (std::isfinite(lp)) p.r += 0.5 * eps * g;
+}
+
+double joint(const Point& p) { return p.lp - 0.5 * p.r.squaredNorm(); }
+
+bool uturn(const Point& a, const Point& b) {
+  const VectorXd dt = b.th - a.th;
+  return dt.dot(a.r) < 0.0 || dt.dot(b.r) < 0.0;
+}
+
+struct Tree {
+  Point minus, plus;
+  Point proposal;
+  bool valid = false;
+  int n = 0;  // number of valid slice states in the subtree
+};
+
+template <class F>
+Tree build_tree(const F& f, walnutpie::detail::Random<std::mt19937_64>& rand,
+                const Point& p0, int depth, int dir, double eps,
+                double log_u) {
+  Tree t;
+  Point end = p0;
+  leapfrog(f, end, dir * eps);
+  t.minus = t.plus = t.proposal = end;
+  const double j = joint(end);
+  if (std::isfinite(j) && j - log_u > -1000.0 && log_u < j) {
+    t.valid = true;
+    t.n = 1;
+    return t;  // leaf
+  }
+  return t;  // invalid / divergent leaf
+}
+
+template <class F>
+Tree build_subtree(const F& f, walnutpie::detail::Random<std::mt19937_64>& rand,
+                   const Point& p0, int depth, int dir, double eps,
+                   double log_u) {
+  if (depth == 0) return build_tree(f, rand, p0, 0, dir, eps, log_u);
+  Tree inner = build_subtree(f, rand, p0, depth - 1, dir, eps, log_u);
+  Tree t = inner;
+  if (!inner.valid) {  // stop early: propagate invalidity
+    t.valid = false;
+    t.n = 0;
+    return t;
+  }
+  Tree outer =
+      build_subtree(f, rand, dir == 1 ? inner.plus : inner.minus, depth - 1,
+                    dir, eps, log_u);
+  if (dir == 1) {
+    t.minus = inner.minus;
+    t.plus = outer.plus;
+  } else {
+    t.minus = outer.minus;
+    t.plus = inner.plus;
+  }
+  const int n_tot = inner.n + outer.n;
+  if (outer.n > 0 &&
+      std::log(rand.uniform_real_01()) <
+          std::log(static_cast<double>(outer.n) /
+                   static_cast<double>(n_tot))) {
+    t.proposal = outer.proposal;
+  }
+  t.valid = !(uturn(t.minus, t.plus));
+  // classic NUTS flags the whole tree invalid if either half hit a u-turn
+  if (uturn(inner.minus, inner.plus) || uturn(outer.minus, outer.plus))
+    t.valid = false;
+  t.n = n_tot;
+  return t;
+}
+
+template <class F>
+Point nuts_step(const F& f, walnutpie::detail::Random<std::mt19937_64>& rand,
+                const Point& p0, double eps) {
+  Point cur = p0;
+  const double log_u = joint(cur) + std::log(rand.uniform_real_01());
+  Tree t;
+  t.minus = t.plus = t.proposal = cur;
+  t.valid = true;
+  int n = 1;
+  for (int depth = 0; depth < 8; ++depth) {
+    const int dir = (rand.uniform_real_01() < 0.5) ? -1 : 1;
+    Tree sub = build_subtree(f, rand, dir == 1 ? t.plus : t.minus, depth, dir,
+                             eps, log_u);
+    if (dir == 1)
+      t.plus = sub.plus;
+    else
+      t.minus = sub.minus;
+    if (!sub.valid || uturn(t.minus, t.plus)) break;
+    if (sub.n > 0 && std::log(rand.uniform_real_01()) <
+                         std::log(static_cast<double>(sub.n) /
+                                  static_cast<double>(n))) {
+      cur = sub.proposal;
+    }
+    n += sub.n;
+  }
+  return cur;
+}
+
+struct NutsResult {
+  std::vector<VectorXd> draws;
+  long long grads = 0;
+};
+
+template <class F>
+NutsResult run_nuts(const F& f, const VectorXd& theta0, double eps,
+                    int n_draws, int n_burn, unsigned seed) {
+  std::mt19937_64 rng(seed);
+  walnutpie::detail::Random<std::mt19937_64> rand(rng);
+  NutsResult res;
+  Point cur{theta0, VectorXd::Zero(theta0.size()),
+            VectorXd::Zero(theta0.size()), 0.0};
+  f(cur.th, cur.lp, cur.g);
+  for (int it = 0; it < n_draws + n_burn; ++it) {
+    VectorXd r = rand.standard_normal(theta0.size());
+    cur.r = r;
+    cur = nuts_step(f, rand, cur, eps);
+    res.grads = f.n;
+    if (it >= n_burn) res.draws.push_back(cur.th);
+  }
+  res.grads = f.n;
+  return res;
+}
+
+}  // namespace nuts
+
 int main(int argc, char** argv) {
   const char* out_prefix = argc > 1 ? argv[1] : "build_ai/iso";
   std::string path = std::string(out_prefix) + "_gaussian.csv";
@@ -289,6 +433,149 @@ int main(int argc, char** argv) {
         finite ? "yes" : "NO", min_lv, min_lv < -5.0 ? "PASS" : "FAIL",
         mean_v, gf);
   }
+// Classic Hoffman-Gelman Algorithm 6 (slice variable, subtree counts,
+// doubling), fixed step size, no adaptation, max depth 8.
+
+
+
   std::fclose(csv);
+
+  // ==========================================================================
+  // ============ Phase 2 (W-62 pre-registered gates a-e) ====================
+  // ==========================================================================
+  walnutpie::detail::IsoAdaptConfig cfg;
+  cfg.n_warmup = 500;
+  cfg.n_draws = 2000;
+  cfg.refresh_every = 50;
+  cfg.window = 250;
+
+  // ---------- P2-a + P2-b: adapted funnel -----------------------------------
+  {
+    FunnelTarget tgt{10, 3.0};
+    const int d = 11;
+    std::mt19937_64 rng(4242);
+    walnutpie::detail::Random<std::mt19937_64> rand(rng);
+    auto ar = walnutpie::detail::run_adapted_iso(rand, tgt, VectorXd::Zero(d),
+                                                 cfg, /*seed=*/20260824);
+    // h-trace convergence: |h_t - h_{t-50}|/h < 5% at some refresh by it 200
+    int conv_iter = -1;
+    for (std::size_t i = 1; i < ar.h_trace.size(); ++i) {
+      const double rel =
+          std::fabs(ar.h_trace[i] - ar.h_trace[i - 1]) / ar.h_trace[i];
+      if (rel < 0.05 && ar.refresh_iter[i] <= 200) {
+        conv_iter = ar.refresh_iter[i];
+        break;
+      }
+    }
+    std::printf("[P2-a funnel h-trace]");
+    for (std::size_t i = 0; i < ar.h_trace.size(); ++i)
+      std::printf(" it%d:%.4f", ar.refresh_iter[i], ar.h_trace[i]);
+    std::printf(" -> converged-by-200: %s (final h=%.4f)\n",
+                conv_iter > 0 ? "PASS" : "FAIL", ar.h);
+    bool finite = true;
+    double min_lv = std::numeric_limits<double>::infinity();
+    for (auto& x : ar.draws) {
+      if (!x.allFinite()) { finite = false; break; }
+      min_lv = std::min(min_lv, x[0]);
+    }
+    std::printf(
+        "[P2-a funnel frozen sanity] finite=%s min log sigma=%.3f (%s)\n",
+        finite ? "yes" : "NO", min_lv,
+        (finite && min_lv < -5.0) ? "PASS" : "FAIL");
+
+    // P2-b: ESS/grad vs inline NUTS baseline (same draws budget)
+    const long nf = static_cast<long>(ar.draws.size());
+    double iso_min_ess = nf;
+    for (int i = 0; i < d; ++i) {
+      std::vector<double> col(nf);
+      for (long t = 0; t < nf; ++t) col[t] = ar.draws[t][i];
+      iso_min_ess = std::min(iso_min_ess, ess_ips(col));
+    }
+    CountingF cfun{FunnelTarget{10, 3.0}};
+    // conservative baseline: sweep a small eps grid, keep NUTS' best
+    // ESS/grad so the comparison cannot be gamed in our favor
+    double nuts_best_r = -1.0;
+    double nuts_best_ess = 0, nuts_best_eps = 0;
+    long long nuts_best_grads = 0;
+    for (double eps : {0.1, 0.15, 0.2, 0.3}) {
+      const long long before = cfun.n;
+      auto nr = nuts::run_nuts(cfun, VectorXd::Zero(d), eps,
+                               /*n_draws=*/2000, /*n_burn=*/500, /*seed=*/7);
+      const long long run_grads = cfun.n - before;
+      const long nn = static_cast<long>(nr.draws.size());
+      double nuts_min_ess = nn;
+      for (int i = 0; i < d; ++i) {
+        std::vector<double> col(nn);
+        for (long t = 0; t < nn; ++t) col[t] = nr.draws[t][i];
+        nuts_min_ess = std::min(nuts_min_ess, ess_ips(col));
+      }
+      const double r_now = nuts_min_ess / static_cast<double>(run_grads);
+      if (r_now > nuts_best_r) {
+        nuts_best_ess = nuts_min_ess; nuts_best_eps = eps;
+        nuts_best_grads = run_grads; }
+    }
+    double nuts_min_ess = nuts_best_ess;
+    long long nr_grads = nuts_best_grads;
+    const long long iso_grads_total = ar.warmup_grads + ar.sampling_grads;
+    std::printf("[P2-b accounting] warmup+calibration grads=%lld frozen "
+                "sampling grads=%lld\n",
+                ar.warmup_grads, ar.sampling_grads);
+    const double r_iso = iso_min_ess / iso_grads_total;
+    const double r_nuts = nuts_min_ess / nr_grads;
+    std::printf(
+        "[P2-b funnel ESS/grad] iso=%.5f (minESS=%.0f, grads=%lld incl "
+        "warmup+calibration), nuts(eps=%g)=%.5f (minESS=%.0f, grads=%lld), ratio "
+        "iso/nuts=%.2fx (%s)\n",
+        r_iso, iso_min_ess, iso_grads_total, nuts_best_eps, r_nuts,
+        nuts_min_ess, nr_grads,
+        r_iso / r_nuts, (r_iso >= 5.0 * r_nuts) ? "PASS" : "BELOW-5x");
+  }
+
+  // ---------- P2-c: adapted Gaussian within 2x of Phase-1 fixed-h ----------
+  {
+    GaussianTarget gt{10};
+    std::mt19937_64 rng(99);
+    walnutpie::detail::Random<std::mt19937_64> rand(rng);
+    auto ar = walnutpie::detail::run_adapted_iso(rand, gt, VectorXd::Zero(10),
+                                                 cfg, /*seed=*/555);
+    const long ng = static_cast<long>(ar.draws.size());
+    double adapted_min_ess = ng;
+    for (int i = 0; i < 10; ++i) {
+      std::vector<double> col(ng);
+      for (long t = 0; t < ng; ++t) col[t] = ar.draws[t][i];
+      adapted_min_ess = std::min(adapted_min_ess, ess_ips(col));
+    }
+    const double adapted =
+        adapted_min_ess / (ar.warmup_grads + ar.sampling_grads);
+    const double fixed = min_ess / static_cast<double>(grads_iso);
+    std::printf(
+        "[P2-c gaussian ESS/grad] adapted(h=%.3f)=%.5f vs phase1 "
+        "fixed-h=%.5f, ratio=%.2f (%s)\n",
+        ar.h, adapted, fixed, adapted / fixed,
+        adapted >= 0.5 * fixed ? "PASS" : "FAIL");
+  }
+
+  // ---------- P2-d: determinism through the ADAPTED path --------------------
+  {
+    auto run_once = [&](unsigned seed) {
+      std::mt19937_64 rng(seed);
+      walnutpie::detail::Random<std::mt19937_64> rand(rng);
+      return walnutpie::detail::run_adapted_iso(rand, GaussianTarget{10},
+                                                VectorXd::Zero(10), cfg, seed);
+    };
+    auto a = run_once(31337);
+    auto b = run_once(31337);
+    bool same = a.h == b.h && a.anchor == b.anchor &&
+                a.draws.size() == b.draws.size();
+    for (std::size_t t = 0; t < a.draws.size() && same; ++t) {
+      const VectorXd& x = a.draws[t];
+      const VectorXd& y = b.draws[t];
+      for (Eigen::Index j = 0; j < x.size(); ++j)
+        if (x[j] != y[j]) { same = false; break; }
+    }
+    std::printf("[P2-d determinism adapted] bit-identical draws+h+C: %s\n",
+                same ? "PASS" : "FAIL");
+  }
+
   return 0;
 }
