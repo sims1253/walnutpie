@@ -345,7 +345,13 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
                     << " macro_step=" << std::fabs(step) << std::endl;
         }
       }
-      adapt_handler(min_accept);
+      // A failed logp evaluation carries no acceptance information; feeding
+      // the NaN to a step adapter would poison its state permanently.
+      // (pin_trace::observe_min_attempt from rob/nan-alpha-guard dropped:
+      //  W-61 instrumentation-only, not in this stack.)
+      if (std::isfinite(min_accept)) {
+        adapt_handler(min_accept);
+      }
     }
     if (std::fabs(logp - logp_next) <= max_error) {
       return reversible(logp_grad, inv_mass, step, num_steps, min_micro_steps,
@@ -703,7 +709,13 @@ static bool macro_step_lr(const F& logp_grad, const detail::LowRankMass& lrm,
     logp_next = logp_pos_next + lrm.logp_momentum(rho_next);
     if (num_steps == min_micro_steps) {
       double min_accept = std::exp(-std::fabs(logp - logp_next));
-      adapt_handler(min_accept);
+      // A failed logp evaluation carries no acceptance information; feeding
+      // the NaN to a step adapter would poison its state permanently.
+      // (pin_trace::observe_min_attempt from rob/nan-alpha-guard dropped:
+      //  W-61 instrumentation-only, not in this stack.)
+      if (std::isfinite(min_accept)) {
+        adapt_handler(min_accept);
+      }
     }
     if (std::fabs(logp - logp_next) <= max_error) {
       return reversible_lr(logp_grad, lrm, step, num_steps, min_micro_steps,
