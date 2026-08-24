@@ -334,7 +334,11 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
     logp_next = logp_pos_next + logp_momentum(rho_next, inv_mass);
     if (num_steps == min_micro_steps) {
       double min_accept = std::exp(-std::fabs(logp - logp_next));
-      adapt_handler(min_accept);
+      // A failed logp evaluation carries no acceptance information; feeding
+      // the NaN to a step adapter would poison its state permanently.
+      if (std::isfinite(min_accept)) {
+        adapt_handler(min_accept);
+      }
     }
     if (std::fabs(logp - logp_next) <= max_error) {
       return reversible(logp_grad, inv_mass, step, num_steps, min_micro_steps,
