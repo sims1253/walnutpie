@@ -1111,12 +1111,41 @@ int main(int argc, char** argv) {
           "--output in multi-chain mode must contain {c}");
     }
     auto run_multi = [&](auto opt_tag) {
+      using walnutpie::detail::AntiWindupAdapter;
+      using walnutpie::detail::BatchedAdapter;
+      using walnutpie::detail::ClippedAdapter;
       using Opt = typename decltype(opt_tag)::type;
-      run_walnuts_multi<Opt>(
-          lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
-          num_draws, save_warmup, warmup_cfg, sample_cfg, init,
-          step_size_init, init_file, output_file, pilot_burst,
-          pilot_rho1_max, pilot_rhat_max, chain_exec == "serial");
+      // The wrapper flags (--anti-windup, --step-opt-batch-stride,
+      // --step-grad-clip) select the adapter TYPE at compile time; this
+      // multi-chain dispatch must mirror the single-chain ladder below or
+      // those flags silently no-op whenever --chains > 1.
+      auto launch = [&](auto wrapped_tag) {
+        using W = typename decltype(wrapped_tag)::type;
+        run_walnuts_multi<W>(
+            lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
+            num_draws, save_warmup, warmup_cfg, sample_cfg, init,
+            step_size_init, init_file, output_file, pilot_burst,
+            pilot_rho1_max, pilot_rhat_max, chain_exec == "serial");
+      };
+      if (anti_windup > 0 && step_opt_batch_stride > 1
+          && step_grad_clip > 0.0) {
+        launch(std::type_identity<
+               AntiWindupAdapter<ClippedAdapter<BatchedAdapter<Opt>>>>{});
+      } else if (anti_windup > 0 && step_opt_batch_stride > 1) {
+        launch(std::type_identity<AntiWindupAdapter<BatchedAdapter<Opt>>>{});
+      } else if (anti_windup > 0 && step_grad_clip > 0.0) {
+        launch(std::type_identity<AntiWindupAdapter<ClippedAdapter<Opt>>>{});
+      } else if (anti_windup > 0) {
+        launch(std::type_identity<AntiWindupAdapter<Opt>>{});
+      } else if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
+        launch(std::type_identity<ClippedAdapter<BatchedAdapter<Opt>>>{});
+      } else if (step_opt_batch_stride > 1) {
+        launch(std::type_identity<BatchedAdapter<Opt>>{});
+      } else if (step_grad_clip > 0.0) {
+        launch(std::type_identity<ClippedAdapter<Opt>>{});
+      } else {
+        launch(std::type_identity<Opt>{});
+      }
     };
     if (step_optimizer == "adam") {
       run_multi(std::type_identity<walnutpie::detail::Adam>{});
