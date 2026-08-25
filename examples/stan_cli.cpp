@@ -1,10 +1,12 @@
 #include <walnutpie.hpp>
+#include <walnutpie/pair_emission.hpp>
 #include <walnutpie/load_stan.hpp>
 #include <walnutpie/warmup_heuristics.hpp>
 
 #include <CLI/CLI.hpp>
 #include <algorithm>
 #include <fstream>
+#include <iomanip>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -74,8 +76,13 @@ class StanHandler {
               std::size_t num_warmup, std::size_t num_draws, bool save_warmup)
       : model_(model),
         rng_(model.make_rng(seed + 1)),
+        // W-78: with WALNUTPIE_PAIR_EMISSION=pair_barker each sampling
+        // transition emits TWO draws (primary then secondary), so reserve
+        // twice the sampling capacity.
         draws_(model.constrained_dimensions(),
-               num_draws + static_cast<std::size_t>(save_warmup) * num_warmup),
+               (walnutpie::detail::pair_emission::enabled() ? 2 * num_draws
+                                                            : num_draws) +
+                   static_cast<std::size_t>(save_warmup) * num_warmup),
         save_warmup_(save_warmup) {}
 
   void on_sample(const Eigen::VectorXd& position, double lp) {
@@ -159,7 +166,35 @@ class StanHandler {
 
   void write_csv(std::string& output_file) {
     auto names = model_.param_names();
-    ::write_draws(output_file, names, draws_);
+    if (!walnutpie::detail::pair_emission::enabled()) {
+      ::write_draws(output_file, names, draws_);
+      return;
+    }
+    // W-78 pair-emission CSV variant: rows are interleaved primary/secondary
+    // per transition, and a leading integer column `transition__` carries the
+    // 0-based transition id shared by both rows of a transition:
+    //   transition__,<param_0>,...,<param_{D-1}>
+    // With the env gate off, the CSV is byte-identical to stock.
+    std::ofstream out(output_file);
+    if (!out) {
+      std::cerr << "Failed to open output file: " << output_file << std::endl;
+      return;
+    }
+    out << "transition__";
+    for (const auto& nm : names) {
+      out << "," << nm;
+    }
+    out << "\n";
+    out << std::setprecision(12);
+    const Eigen::Index D = draws_.rows();
+    const Eigen::Index N = n_;
+    for (Eigen::Index i = 0; i < N; ++i) {
+      out << (i / 2);
+      for (Eigen::Index d = 0; d < D; ++d) {
+        out << "," << draws_(d, i);
+      }
+      out << "\n";
+    }
   }
 
  private:
@@ -294,6 +329,7 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
     sampler();
   }
   end_timing();
+  walnutpie::detail::pair_emission::print_diag();  // W-78 (no-op off)
 
   return storage;
 }
@@ -651,6 +687,7 @@ void run_walnuts_multi(
   for (std::size_t c = 0; c < chains; ++c) {
     print_stanza(c, sample_wall, timing[c]);
   }
+  walnutpie::detail::pair_emission::print_diag();  // W-78 (no-op off)
 
   if (!out_pattern.empty()) {
     for (std::size_t c = 0; c < chains; ++c) {

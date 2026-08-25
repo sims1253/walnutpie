@@ -19,6 +19,7 @@
 #include "walnutpie/validate.hpp"
 #include "walnutpie/low_rank_mass.hpp"
 #include "walnutpie/pin_trace.hpp"
+#include "walnutpie/pair_emission.hpp"
 
 namespace walnutpie::detail {
 
@@ -460,6 +461,14 @@ static std::optional<SpanW> build_leaf(const F& logp_grad, const SpanW& span,
                      adapt_handler)) {
     return std::nullopt;
   }
+  {  // W-78: record the accepted leaf for pair emission (no-op when off)
+    auto& coll = pair_emission::collector();
+    if (coll.active) {
+      coll.logw.push_back(logp_next);
+      coll.logp_pos.push_back(logp_pos_next);
+      coll.theta.push_back(theta_next);
+    }
+  }
   return SpanW::from_initial_point(std::move(theta_next), std::move(rho_next),
                                    std::move(grad_theta_next), logp_pos_next,
                                    logp_next);
@@ -554,7 +563,12 @@ inline Eigen::VectorXd transition_w(
     double max_error, Eigen::VectorXd&& theta, std::size_t& depth,
     Eigen::VectorXd& theta_grad, double& logp_pos_select,
     A& step_size_adapter, const Eigen::VectorXd& grad_cached = Eigen::VectorXd(),
-    double logp_cached = -std::numeric_limits<double>::infinity()) {
+    double logp_cached = -std::numeric_limits<double>::infinity(),
+    // W-78 pair emission: when non-null, filled with a second draw from the
+    // accepted span's Barker leaf law (sampling phase only — the caller
+    // decides; warmup adapters leave these null so warmup is untouched).
+    Eigen::VectorXd* theta_pair = nullptr,
+    double* logp_pair = nullptr) {
   pin_trace::begin_transition();     // W-43: env-gated, no-op off
   auto z = rand.standard_normal(chol_mass.size());
   Eigen::VectorXd rho = (chol_mass.array() * z.array()).matrix();
@@ -575,6 +589,15 @@ inline Eigen::VectorXd transition_w(
   double logp_joint = logp_pos + logp_momentum(rho, inv_mass);
   auto span_accum = SpanW::from_initial_point(
       std::move(theta), std::move(rho), std::move(grad), logp_pos, logp_joint);
+  // W-78: when emitting a pair, collect leaves of the final accepted span.
+  auto& pe_coll = pair_emission::collector();
+  const bool pe_collect = theta_pair != nullptr;
+  if (pe_collect) {
+    pe_coll.start();
+    pe_coll.logw.push_back(logp_joint);
+    pe_coll.logp_pos.push_back(logp_pos);
+    pe_coll.theta.push_back(span_accum.theta_bk_);
+  }
   if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_SPAN")) {
     std::cout << "[tw enter] theta0=" << span_accum.theta_select_[0]
               << " step=" << step << " max_depth=" << max_depth
@@ -584,9 +607,13 @@ inline Eigen::VectorXd transition_w(
     // helper to turn runtime direction into compile-time template enum
     auto expand_in_direction = [&](auto direction) -> bool {
       constexpr Direction D = direction;
+      const std::size_t pe_mark = pe_collect ? pe_coll.logw.size() : 0;
       auto maybe_next_span = build_span<D>(
           rand, logp_grad, inv_mass, step, depth - 1, max_step_halvings,
           min_micro_steps, max_error, span_accum, step_size_adapter);
+      if (!maybe_next_span && pe_collect) {
+        pe_coll.truncate(pe_mark);  // W-78: discarded subtree's leaves removed
+      }
       if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_SPAN")) {
         static std::size_t span_calls = 0;
         ++span_calls;
@@ -617,7 +644,12 @@ inline Eigen::VectorXd transition_w(
   }
   theta_grad = span_accum.grad_select_;
   logp_pos_select = span_accum.logp_pos_select_;
-  return std::move(span_accum.theta_select_);
+  Eigen::VectorXd pe_result = std::move(span_accum.theta_select_);
+  if (pe_collect) {  // W-78: second draw from p_B(.|S), zero extra gradients
+    *theta_pair = pair_emission::sample_leaf(rand, pe_coll, logp_pair);
+    pe_coll.active = false;
+  }
+  return pe_result;
 }
 
 /**
@@ -759,6 +791,14 @@ static std::optional<SpanW> build_leaf_lr(const F& logp_grad, const SpanW& span,
                         adapt_handler)) {
     return std::nullopt;
   }
+  {  // W-78: record the accepted leaf for pair emission (no-op when off)
+    auto& coll = pair_emission::collector();
+    if (coll.active) {
+      coll.logw.push_back(logp_next);
+      coll.logp_pos.push_back(logp_pos_next);
+      coll.theta.push_back(theta_next);
+    }
+  }
   return SpanW::from_initial_point(std::move(theta_next), std::move(rho_next),
                                    std::move(grad_theta_next), logp_pos_next,
                                    logp_next);
@@ -801,7 +841,12 @@ inline Eigen::VectorXd transition_w_lr(
     std::size_t min_micro_steps, double max_error, Eigen::VectorXd&& theta,
     std::size_t& depth, Eigen::VectorXd& theta_grad, double& logp_pos_select,
     A& step_size_adapter, const Eigen::VectorXd& grad_cached = Eigen::VectorXd(),
-    double logp_cached = -std::numeric_limits<double>::infinity()) {
+    double logp_cached = -std::numeric_limits<double>::infinity(),
+    // W-78 pair emission: when non-null, filled with a second draw from the
+    // accepted span's Barker leaf law (sampling phase only — the caller
+    // decides; warmup adapters leave these null so warmup is untouched).
+    Eigen::VectorXd* theta_pair = nullptr,
+    double* logp_pair = nullptr) {
   pin_trace::begin_transition();     // W-43: env-gated, no-op off
   // Momentum refresh via the exact low-rank Cholesky identity, using the
   // shared normal stream (z) for reproducibility with the diagonal path.
@@ -821,12 +866,25 @@ inline Eigen::VectorXd transition_w_lr(
   double logp_joint = logp_pos + lrm.logp_momentum(rho);
   auto span_accum = SpanW::from_initial_point(
       std::move(theta), std::move(rho), std::move(grad), logp_pos, logp_joint);
+  // W-78: when emitting a pair, collect leaves of the final accepted span.
+  auto& pe_coll = pair_emission::collector();
+  const bool pe_collect = theta_pair != nullptr;
+  if (pe_collect) {
+    pe_coll.start();
+    pe_coll.logw.push_back(logp_joint);
+    pe_coll.logp_pos.push_back(logp_pos);
+    pe_coll.theta.push_back(span_accum.theta_bk_);
+  }
   for (depth = 1; depth <= max_depth; ++depth) {
     auto expand_lr = [&](auto direction) -> bool {
       constexpr Direction D = direction;
+      const std::size_t pe_mark = pe_collect ? pe_coll.logw.size() : 0;
       auto maybe_next_span = build_span_lr<D>(
           rand, logp_grad, lrm, step, depth - 1, max_step_halvings,
           min_micro_steps, max_error, span_accum, step_size_adapter);
+      if (!maybe_next_span.has_value() && pe_collect) {
+        pe_coll.truncate(pe_mark);  // W-78: discarded subtree's leaves removed
+      }
       if (!maybe_next_span) {
         return true;
       }
@@ -843,7 +901,12 @@ inline Eigen::VectorXd transition_w_lr(
   }
   theta_grad = span_accum.grad_select_;
   logp_pos_select = span_accum.logp_pos_select_;
-  return std::move(span_accum.theta_select_);
+  Eigen::VectorXd pe_result = std::move(span_accum.theta_select_);
+  if (pe_collect) {  // W-78: second draw from p_B(.|S), zero extra gradients
+    *theta_pair = pair_emission::sample_leaf(rand, pe_coll, logp_pair);
+    pe_coll.active = false;
+  }
+  return pe_result;
 }
 
 class NoOpStepSizeAdapter {
@@ -960,26 +1023,39 @@ class WalnutsSampler {
     std::size_t depth;
     Eigen::VectorXd grad_next;
     double logp_pos;
+    // W-78 pair emission: this functor runs ONLY in the sampling phase
+    // (warmup goes through the AdaptiveWalnuts adapters, which never request
+    // emission), so gating here leaves warmup and its adaptation statistics
+    // untouched. The extra draw costs zero gradients.
+    const bool pe_emit = detail::pair_emission::enabled();
+    Eigen::VectorXd pe_theta;
+    double pe_logp = -std::numeric_limits<double>::infinity();
     if (lrm_.U.cols() > 0) {
-      lrm_.D = inv_mass_;  // keep diagonal in sync (lr factors fixed post-warmup)
+      lrm_.D = inv_mass_;  // keep diagonal in sync (lr metrics fixed post-warmup)
       theta_ = detail::transition_w_lr(
           rand_, logp_grad_.logp_grad_, lrm_, macro_time_, max_nuts_depth_,
           max_step_halvings_, min_micro_steps_, max_error_,
           std::move(theta_), depth, grad_next, logp_pos,
-          no_op_step_size_adapter_, cached_grad_, cached_logp_);
+          no_op_step_size_adapter_, cached_grad_, cached_logp_,
+          pe_emit ? &pe_theta : nullptr, pe_emit ? &pe_logp : nullptr);
     } else {
       theta_ = transition_w(rand_, logp_grad_, inv_mass_, cholesky_mass_,
                             macro_time_, max_nuts_depth_, max_step_halvings_,
                             min_micro_steps_, max_error_, std::move(theta_),
                             depth, grad_next, logp_pos,
                             no_op_step_size_adapter_, cached_grad_,
-                            cached_logp_);
+                            cached_logp_,
+                            pe_emit ? &pe_theta : nullptr,
+                            pe_emit ? &pe_logp : nullptr);
     }
     // Cache the endpoint (grad, logp) so the next transition's start-position
     // evaluation reuses them (W-23 endpoint-gradient threading).
     cached_grad_ = std::move(grad_next);
     cached_logp_ = logp_pos;
     sample_handler_.get().on_sample(theta_, logp_pos);
+    if (pe_emit && pe_theta.size() > 0) {  // W-78: interleaved extra draw
+      sample_handler_.get().on_sample(pe_theta, pe_logp);
+    }
     return logp_pos;
   }
 
