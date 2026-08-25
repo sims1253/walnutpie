@@ -638,7 +638,12 @@ class AdaptiveWalnuts {
                         ? mass_estimator_.rank_folded_estimate()
                         : mass_estimator_.inv_mass_estimate());
     Eigen::VectorXd chol_mass = inv_mass.array().inverse().sqrt().matrix();
-    if (full_rank_mode) {
+    // W-65: the auto-screen must gate the FULL operator too — without
+    // this, --metric-auto only screened the folded diagonal and a
+    // full+auto config ran the low-rank operator unconditionally (the
+    // W-63 A3-is-A2 wiring artifact). When the screen declines, warmup
+    // falls through to the plain diagonal transition below.
+    if (full_rank_mode && rank_active) {
       detail::LowRankMass lrm;
       lrm.D = mass_estimator_.inv_mass_estimate();
       lrm.U = mass_estimator_.rank_U();
@@ -664,6 +669,7 @@ class AdaptiveWalnuts {
       // (mass convention) or sampling silently runs a different operator than
       // warmup tuned under — the third instance of the freeze-mismatch family.
       last_mass_ = lrm.D.cwiseInverse();
+      last_lr_active_ = true;
       min_micro_estimator_.observe(1 << depth);
       handler_.get().on_warmup(theta_, logp_select, step_size(), lrm.D);
       ++iteration_;
@@ -718,6 +724,7 @@ class AdaptiveWalnuts {
       }
     }
     last_mass_ = inv_mass.cwiseInverse();
+    last_lr_active_ = false;
     min_micro_estimator_.observe(1 << depth);
     handler_.get().on_warmup(theta_, logp_select, step_size(), inv_mass);
     ++iteration_;
@@ -741,11 +748,14 @@ class AdaptiveWalnuts {
         sampling_cfg_.get().max_step_halvings(),
         min_micro_estimator_.min_micro_steps(),
         sampling_cfg_.get().max_hamiltonian_error());
-    if (warmup_cfg_.get().metric_rank() > 0 &&
-        warmup_cfg_.get().metric_full()) {
-      // Preserve the low-rank factors the warmup adapted with: freezing to
-      // the diagonal alone would sample under a different metric than the
-      // one step size and micro-step tuning were calibrated for.
+    if (last_lr_active_) {
+      // Preserve the low-rank factors the LAST warmup transition actually
+      // used (W-65: screen-gated, memoized — re-evaluating the auto-screen
+      // here could flip the decision at the freeze boundary and mismatch
+      // the metric step size was tuned under; same family as the
+      // last_mass_ memo above). Freezing to the diagonal alone when warmup
+      // ran the low-rank operator would sample under a different metric
+      // than the one step size and micro-step tuning were calibrated for.
       out.set_low_rank(mass_estimator_.rank_U(), mass_estimator_.rank_c());
     }
     return out;
@@ -849,6 +859,9 @@ class AdaptiveWalnuts {
    * samplers must carry the metric they were tuned with, hence the memo.
    */
   Eigen::VectorXd last_mass_;
+  // W-65: whether the last warmup transition used the low-rank operator
+  // (screen-gated in full mode); the freeze memoizes this decision.
+  bool last_lr_active_ = false;
 
   /** The current iteration. */
   std::size_t iteration_;
