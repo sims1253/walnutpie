@@ -19,6 +19,7 @@
 #include "walnutpie/low_rank_metric.hpp"
 #include "walnutpie/util.hpp"
 #include "walnutpie/walnuts.hpp"
+#include "walnutpie/unadjusted_warmup.hpp"
 
 namespace walnutpie::detail {
 
@@ -633,6 +634,22 @@ class AdaptiveWalnuts {
   }
 
   void operator()() {
+    // W-73 two-phase warmup: during the first f*num_warmup iterations the
+    // reversibility certificate is bypassed (reversible()/_lr return true).
+    // Set before any transition runs so BOTH diagonal and low-rank paths
+    // are covered; the sampling phase never calls operator().
+    const double unadj_frac = detail::unadjusted_warmup::configured_frac();
+    const std::size_t unadj_boundary =
+        static_cast<std::size_t>(unadj_frac *
+                                 static_cast<double>(warmup_cfg_.get().max_iter()));
+    detail::unadjusted_warmup::active = unadj_frac > 0.0 && iteration_ < unadj_boundary;
+    if (detail::unadjusted_warmup::phase_reset() && unadj_boundary > 0 &&
+        iteration_ == unadj_boundary) {
+      // Optional variant: at the phase boundary, discard the metric
+      // accumulators (which saw biased phase-1 draws) and re-learn from
+      // post-boundary draws only.
+      mass_estimator_.reset_to_seeds();
+    }
     const bool drifting = iteration_ < warmup_cfg_.get().drift_iters();
     // W-54 arm A: during the mass init buffer the estimator is not fed
     // (no observe, no low-rank refresh) and the metric is held at the
@@ -765,6 +782,7 @@ class AdaptiveWalnuts {
    * @return The Walnuts sampler with current tuning parameter estimates.
    */
   WalnutsSampler<F, RNG, H> sampler() {
+    detail::unadjusted_warmup::active = false;  // W-73: sampling never unadjusted
     handler_.get().on_warmup_complete(step_size(), inv_mass());
     WalnutsSampler<F, RNG, H> out(
         rand_.rng(), handler_, logp_grad_.logp_grad_, theta_, inv_mass(),

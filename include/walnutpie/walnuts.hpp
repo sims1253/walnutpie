@@ -19,6 +19,7 @@
 #include "walnutpie/validate.hpp"
 #include "walnutpie/low_rank_mass.hpp"
 #include "walnutpie/pin_trace.hpp"
+#include "walnutpie/unadjusted_warmup.hpp"
 
 namespace walnutpie::detail {
 
@@ -261,6 +262,9 @@ static bool reversible(const F& logp_grad, const Eigen::VectorXd& inv_mass,
                        double logp_next, const Eigen::VectorXd& theta,
                        const Eigen::VectorXd& rho,
                        const Eigen::VectorXd& grad) {
+  if (unadjusted_warmup::active) {  // W-73: unadjusted phase — no ladder
+    return true;
+  }
   if (num_steps == 1) {
     return true;
   }
@@ -660,6 +664,9 @@ static bool reversible_lr(const F& logp_grad, const detail::LowRankMass& lrm,
                           double logp_next, const Eigen::VectorXd& theta,
                           const Eigen::VectorXd& rho,
                           const Eigen::VectorXd& grad) {
+  if (unadjusted_warmup::active) {  // W-73: unadjusted phase — no ladder
+    return true;
+  }
   if (num_steps == 1) {
     return true;
   }
