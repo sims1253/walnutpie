@@ -163,6 +163,23 @@ struct IsoLeaf {
   double log_weight;       /**< accumulated weight (-inf => inadmissible) */
 };
 
+// ---- W-62b opt-in gradient-cost probe (default OFF; no arithmetic change) --
+// When g_iso_probe is non-null, build_leaf_iso attributes its work between
+// (a) the forward level search (attempted levels until ell_star is found)
+// and (b) the accepted-leaf integration (p-micro draw + capped reverse
+// search), and records the accepted ell_star. Purely observational.
+struct IsoLeafProbe {
+  long long attempt_grads = 0;   /**< grads in forward level-search loop */
+  long long accepted_grads = 0;  /**< grads in p-micro + reverse search */
+  long long leaves = 0;          /**< leaves built */
+  long long failed_leaves = 0;   /**< leaves with no admissible level */
+  long long ell_sum = 0;         /**< sum of accepted ell_star */
+  std::size_t ell_max_seen = 0;  /**< max accepted ell_star */
+};
+inline IsoLeafProbe* g_iso_probe = nullptr;
+// 0 = outside leaf, 1 = forward level search, 2 = accepted-leaf integration
+inline int g_iso_probe_mode = 0;
+
 /**
  * @brief One macro leaf with randomized micro level (Listing build-leaf-rand,
  * isokinetic BAB branch).
@@ -195,6 +212,7 @@ IsoLeaf build_leaf_iso(Random<RNG>& rand, const F& logp_grad,
                        const Eigen::VectorXd& theta,
                        const Eigen::VectorXd& rho, double logw_start, int dir,
                        double h, double delta_tol, std::size_t max_ell) {
+  if (g_iso_probe) ++g_iso_probe->leaves;
   const double l0 = [&] {
     double lp;
     Eigen::VectorXd g;
@@ -202,6 +220,7 @@ IsoLeaf build_leaf_iso(Random<RNG>& rand, const F& logp_grad,
     return lp;
   }();
   const Eigen::Index d = theta.size();
+  g_iso_probe_mode = g_iso_probe ? 1 : 0;
 
   // ---- forward level search (Listing micro, fused with integration) ----
   std::size_t ell_star = max_ell + 1;
@@ -237,6 +256,16 @@ IsoLeaf build_leaf_iso(Random<RNG>& rand, const F& logp_grad,
       g_s = g_end;
       break;
     }
+  }
+  if (g_iso_probe) {
+    g_iso_probe_mode = 2;
+    if (!fwd) ++g_iso_probe->failed_leaves;
+    else {
+      g_iso_probe->ell_sum += static_cast<long long>(ell_star);  // full value
+    }
+    const std::size_t ell_now = fwd ? ell_star : std::size_t{0};
+    if (ell_now > g_iso_probe->ell_max_seen)
+      g_iso_probe->ell_max_seen = ell_now;
   }
 
   // ---- p-micro randomization ----
@@ -321,6 +350,7 @@ IsoLeaf build_leaf_iso(Random<RNG>& rand, const F& logp_grad,
   out.theta = std::move(th1);
   out.rho = std::move(q_int);
   out.grad = std::move(g1);
+  g_iso_probe_mode = g_iso_probe ? 0 : g_iso_probe_mode;
   return out;
 }
 
