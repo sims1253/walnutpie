@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <functional>
 #include <limits>
@@ -688,8 +689,65 @@ class WalnutsSampler {
                           min_micro_steps_, max_error_, std::move(theta_),
                           depth, grad_next, logp_pos, no_op_step_size_adapter_);
     sample_handler_.get().on_sample(theta_, logp_pos);
+    // Diagnostics: trajectory-depth observables per draw (pure counters;
+    // no effect on the draw path or RNG). "Depth-cap hit" counts draws
+    // that reached the doubling cap (depth == max_nuts_depth_).
+    ++draws_;
+    depth_sum_ += depth;
+    states_sum_ += std::uint64_t{1} << depth;
+    depth_max_observed_ = std::max(depth_max_observed_, depth);
+    if (depth >= max_nuts_depth_) {
+      ++depth_cap_hits_;
+    }
     return logp_pos;
   }
+
+  /**
+   * @brief Number of sampling draws generated so far.
+   */
+  std::uint64_t draw_count() const noexcept { return draws_; }
+
+  /**
+   * @brief Mean trajectory depth (doublings) across sampling draws.
+   */
+  double mean_trajectory_depth() const noexcept {
+    return draws_ == 0
+               ? 0.0
+               : static_cast<double>(depth_sum_) /
+                     static_cast<double>(draws_);
+  }
+
+  /**
+   * @brief Largest trajectory depth observed while sampling.
+   */
+  std::size_t max_trajectory_depth() const noexcept {
+    return depth_max_observed_;
+  }
+
+  /**
+   * @brief Mean number of leapfrog states per draw (mean of 2^depth).
+   */
+  double mean_states_per_draw() const noexcept {
+    return draws_ == 0
+               ? 0.0
+               : static_cast<double>(states_sum_) /
+                     static_cast<double>(draws_);
+  }
+
+  /**
+   * @brief Fraction of draws that reached the trajectory-depth cap.
+   */
+  double depth_cap_rate() const noexcept {
+    return draws_ == 0
+               ? 0.0
+               : static_cast<double>(depth_cap_hits_) /
+                     static_cast<double>(draws_);
+  }
+
+  /**
+   * @brief The frozen minimum micro-steps-per-macro-step setting.
+   */
+  std::size_t min_micro_steps() const noexcept { return min_micro_steps_; }
 
   /**
    * @brief  Return a constant reference the diagonal of the diagonal inverse
@@ -751,6 +809,12 @@ class WalnutsSampler {
 
   /** The maximum number of doublings in Nuts trajectories. */
   const std::size_t max_nuts_depth_;
+  // Diagnostics accumulators (see operator() and the getters above).
+  std::uint64_t draws_ = 0;
+  std::uint64_t depth_sum_ = 0;
+  std::uint64_t states_sum_ = 0;
+  std::size_t depth_max_observed_ = 0;
+  std::uint64_t depth_cap_hits_ = 0;
 
   /** The maximum number of halvings of the step size. */
   const std::size_t max_step_halvings_;
