@@ -68,7 +68,11 @@ static void write_draws(const std::string& filename,
 
 // W-42 init guard: refuse to start a chain at a non-finite-logp position
 // (file init fails immediately; random init retries up to --init-tries
-// draws).
+// draws). W-78 extends the same guard points to the EVAL-THROWS class:
+// a model evaluation that fails at the init position (the kronecker_gp
+// LKJ-Cholesky-boundary dead inits) is treated identically to a
+// non-finite logp — file init aborts loudly naming the exception,
+// random init counts it as a rejected draw.
 
 static std::string format_double(double v) {
   std::ostringstream oss;
@@ -97,6 +101,35 @@ static std::string format_double(double v) {
   throw std::invalid_argument(msg);
 }
 
+// W-78: fail before warmup when the model EVALUATION itself fails at the
+// init position (throws / returns an error state), not merely a non-finite
+// logp value. Root cause class: the kronecker_gp dead init on the
+// LKJ-Cholesky constraint boundary — every logp_grad eval throws (log rate
+// NaN inside poisson_log_lpmf; eigenvectors_sym rejects the degenerate
+// kernel). BridgeStan maps the throw to logp = -inf, so the W-42 value
+// guard sees it, but without naming the exception; and a poisoned
+// gradient with finite logp slips past a logp-only check entirely. Either
+// way the chain "zombies" (the per-eval "Error in logp_grad" loop, pinned
+// or garbage draws through the whole budget). Treated exactly like the
+// non-finite case: loud abort naming the failure, warmup refused.
+[[noreturn]] static void throw_eval_failed_init(std::size_t chain,
+                                                const std::string& source,
+                                                const std::string& what) {
+  std::string msg = "model evaluation failed at initial position: chain " +
+                    std::to_string(chain) + ", init source: " + source +
+                    ", failure: " + what;
+  std::cerr << "WALNUTS ERROR (init guard): " << msg << "\n"
+            << "  The Stan model threw / returned an error when evaluated at\n"
+               "  the initial position (e.g. the kronecker_gp LKJ-Cholesky\n"
+               "  boundary class: every eval fails, so the chain can only\n"
+               "  zombie on the error loop instead of sampling). Warmup was\n"
+               "  refused BEFORE starting; no budget was consumed.\n"
+               "  Provide an init draw the model can evaluate (or use random\n"
+               "  init, which retries: see --init-tries)."
+            << std::endl;
+  throw std::invalid_argument(msg);
+}
+
 // W-42: random-init rejection loop, Stan convention (draw, check logp
 // finite, retry). BridgeStan's param_initialize implements the same
 // protocol internally; it is called with max_tries=1 (one draw, throws
@@ -105,6 +138,11 @@ static std::string format_double(double v) {
 // chain's init stream, in order and before any warmup consumption
 // (warmup uses the separate std::mt19937_64 stream), so the accepted
 // position matches the stock binary's.
+// W-78: a draw whose EVALUATION fails counts as rejected too — the model
+// throwing at the draw (load_stan maps it to logp = -inf and reports the
+// BridgeStan error text) or returning a poisoned gradient with a finite
+// logp (Stan's own init-validity rule: finite logp AND finite gradient).
+// Same failure family as the kronecker_gp LKJ-Cholesky-boundary class.
 static Eigen::VectorXd initialize_finite(DynamicStanModel& model,
                                          unique_bs_rng& rng, double init_radius,
                                          unsigned int seed, std::size_t chain,
@@ -114,6 +152,7 @@ static Eigen::VectorXd initialize_finite(DynamicStanModel& model,
     Eigen::VectorXd pos;
     double lp = -std::numeric_limits<double>::infinity();
     Eigen::VectorXd grad;
+    std::string eval_err;
     bool rejected = false;
     try {
       // one draw per call: the inner protocol throws instead of redrawing
@@ -121,21 +160,32 @@ static Eigen::VectorXd initialize_finite(DynamicStanModel& model,
       // Re-check the draw the inner layer accepted: a model error maps to
       // lp = -inf (load_stan), and this call stays outside the timing
       // stanzas.
-      model.logp_grad(pos, lp, grad);
-      rejected = !std::isfinite(lp);
+      model.logp_grad(pos, lp, grad, &eval_err);
+      rejected = !std::isfinite(lp) || !eval_err.empty() ||
+                 (grad.size() > 0 && !grad.allFinite());
     } catch (const std::exception& e) {
-      // The inner layer's rejection ("Initialization failed") or any
-      // other per-draw failure counts as one rejected draw.
+      // The inner layer's rejection ("Initialization failed"), a bridgestan
+      // boundary throw, or any other per-draw failure counts as one
+      // rejected draw.
       rejected = true;
       last_err = e.what();
     }
     if (!rejected) {
       return pos;
     }
+    // W-78: name the failure when the draw's evaluation errored or the
+    // gradient is poisoned; a plain non-finite logp keeps the W-42 audit
+    // line format.
+    std::string detail;
+    if (!eval_err.empty()) {
+      detail = "; eval failed: " + eval_err;
+    } else if (grad.size() > 0 && !grad.allFinite()) {
+      detail = "; gradient non-finite at init";
+    }
     std::cerr << "WALNUTS WARNING (init guard): random init draw rejected "
               << "(chain " << chain << ", seed " << seed << ", attempt "
               << attempt << "/" << tries
-              << ", logp=" << format_double(lp)
+              << ", logp=" << format_double(lp) << detail
               << (last_err.empty() ? std::string()
                                    : "; inner: " + last_err)
               << "); redrawing" << std::endl;
@@ -143,8 +193,9 @@ static Eigen::VectorXd initialize_finite(DynamicStanModel& model,
   }
   std::string msg =
       "random initialization failed: all " + std::to_string(tries) +
-      " draws have non-finite log probability (chain " + std::to_string(chain) +
-      ", seed " + std::to_string(seed) + ")";
+      " draws have non-finite log probability or failed to evaluate "
+      "(chain " +
+      std::to_string(chain) + ", seed " + std::to_string(seed) + ")";
   std::cerr << "WALNUTS ERROR (init guard): " << msg << "\n"
             << "  Increase --init-tries, adjust --init, or provide "
                "--init-file draws from the typical set."
@@ -247,27 +298,62 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
 
   StanHandler storage(model, seed, num_warmup, num_draws, save_warmup);
 
-  auto logp = [&](auto&&... args) {
+  // W-78: error text from the last model evaluation (empty on success).
+  // Filled by every logp_grad below via load_stan's eval-error out-param;
+  // at the init guard point it names the exception behind a failed init
+  // eval (the kronecker_gp LKJ-Cholesky-boundary class), which otherwise
+  // surfaces only as the mapped logp = -inf.
+  std::string init_eval_error;
+  auto logp = [&](const Eigen::VectorXd& x, double& lp, Eigen::VectorXd& grad) {
     auto start = Clock::now();
-    model.logp_grad(args...);
+    model.logp_grad(x, lp, grad, &init_eval_error);
     logp_time += elapsed_seconds(start);
     ++logp_count;
   };
 
-  auto init_cfg = init_builder.masses(logp, warmup_cfg.mass_additive_smoothing(),
-                                    false, mass_init_clamp)
-                      .build();
   // W-42: masses() already evaluated the logp at each init position;
   // refuse a non-finite one before the step heuristic and the adapter
-  // exist (no warmup consumption).
+  // exist (no warmup consumption). W-78: an exception ESCAPING the
+  // mass-seeding eval (load_stan throws only when bridgestan returns an
+  // error with no message) is converted to the same loud init-guard
+  // abort instead of an uncaught terminate.
+  const std::string init_source =
+      init_file.empty() ? "random init (seed " + std::to_string(seed) + ")"
+                        : init_file;
+  auto init_cfg = [&]() {
+    try {
+      return init_builder.masses(logp, warmup_cfg.mass_additive_smoothing(),
+                                 false, mass_init_clamp)
+          .build();
+    } catch (const std::exception& e) {
+      throw_eval_failed_init(0, init_source, e.what());
+    }
+  }();
   {
     const std::vector<double>& init_logps = init_cfg.init_logps();
     for (std::size_t c = 0; c < init_logps.size(); ++c) {
+      // W-78: the init eval THREW / returned an error state. load_stan
+      // maps the failure to logp = -inf, so W-42's check below would also
+      // fire — this branch fires first to NAME the exception (kronecker_gp
+      // LKJ-Cholesky-boundary root cause: the model errors at every eval
+      // from this init). The CLI runs a single chain, so the last
+      // evaluation's error text is exactly chain c's mass-seeding eval.
+      if (!init_eval_error.empty()) {
+        throw_eval_failed_init(c, init_source, init_eval_error);
+      }
       if (!std::isfinite(init_logps[c])) {
-        throw_nonfinite_init(
-            c, init_file.empty() ? "random init (seed " + std::to_string(seed) + ")"
-                                 : init_file,
-            init_logps[c]);
+        throw_nonfinite_init(c, init_source, init_logps[c]);
+      }
+      // W-78: finite logp but a poisoned gradient (the "logp stays
+      // finite" miss variant). masses() seeds the mass from |grad|, so a
+      // non-finite gradient yields a non-finite mass and the pinned-chain
+      // pathology — reject it like a failed evaluation.
+      if (auto inits_c = init_cfg.init_chain_config(c);
+          inits_c.has_init_eval() && !inits_c.init_grad().allFinite()) {
+        throw_eval_failed_init(
+            c, init_source,
+            "logp finite but gradient non-finite at init (Stan init "
+            "validity requires a finite gradient)");
       }
     }
   }
@@ -471,10 +557,12 @@ int main(int argc, char** argv) {
     app.add_option("--init-tries", init_tries,
                    "Random init (W-42): maximum draws rejecting non-finite "
                    "log probability before failing (Stan convention: 100). "
-                   "Rejections draw again from the same init rng stream "
-                   "before any warmup consumption; a file init never "
-                   "resamples and instead fails immediately on non-finite "
-                   "logp")
+                   "W-78: draws whose evaluation fails or whose gradient is "
+                   "non-finite count as rejected too. Rejections draw again "
+                   "from the same init rng stream before any warmup "
+                   "consumption; a file init never resamples and instead "
+                   "fails immediately on non-finite logp or a failed "
+                   "evaluation")
         ->default_val(init_tries)
         ->check(CLI::PositiveNumber);
 

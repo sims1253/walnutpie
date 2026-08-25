@@ -124,8 +124,23 @@ class DynamicStanModel {
     return static_cast<std::size_t>(param_num_(model_ptr_.get(), true, true));
   }
 
+  // W-78: eval-failure observability. When the Stan model THROWS inside an
+  // evaluation (e.g. the kronecker_gp LKJ-Cholesky-boundary init: log rate
+  // NaNs inside poisson_log_lpmf, eigenvectors_sym rejects a degenerate
+  // kernel), BridgeStan's C wrapper catches it and returns ret != 0 with an
+  // error string, which logp_grad maps to logp = -inf below. The W-42 guard
+  // catches the -inf VALUE; callers that also want to name the exception
+  // (the init guard's loud abort) pass a string to the 4-arg overload that
+  // receives the BridgeStan error text on failure and is cleared on success.
+  // Purely additive: the 3-arg overload keeps today's behavior bit-for-bit.
   template <typename M>
   inline void logp_grad(const M& x, double& logp, M& grad) const {
+    logp_grad(x, logp, grad, static_cast<std::string*>(nullptr));
+  }
+
+  template <typename M>
+  inline void logp_grad(const M& x, double& logp, M& grad,
+                        std::string* eval_error) const {
     grad.resizeLike(x);
 
     char* err = nullptr;
@@ -138,11 +153,22 @@ class DynamicStanModel {
         free_error_msg_(err);
         std::cerr << "Error in logp_grad: " << error_string << std::endl;
 
+        // W-78: surface the eval-failure text to the init guard so its
+        // abort names the exception class instead of only the mapped
+        // -inf logp (the "Error in logp_grad" line above stays the
+        // per-eval audit channel).
+        if (eval_error) {
+          *eval_error = error_string;
+        }
         logp = -std::numeric_limits<double>::infinity();
         grad.setZero();
         return;
       }
       throw std::runtime_error("Failed to compute log density and gradient");
+    }
+    // W-78: no stale failure text may survive a successful evaluation.
+    if (eval_error) {
+      eval_error->clear();
     }
   }
 

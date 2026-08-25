@@ -2,6 +2,7 @@
 
 #include <Eigen/Dense>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -410,6 +411,43 @@ TEST(InitConfigBuilder, LogpGradMassesThrowsOnInvalidSmoothing) {
   for (auto x : inf_nan_neg()) {
     EXPECT_THROW(b.masses(std_normal, x), std::invalid_argument);
   }
+}
+
+// W-78 init-eval-failure guard: the throw-class contracts the CLI guard
+// relies on (kronecker_gp LKJ-Cholesky-boundary dead inits — the model
+// throws at every eval from the init position).
+
+TEST(InitConfigBuilder, LogpGradMassesPropagatesEvalException) {
+  // masses() must PROPAGATE an exception escaping the init evaluation
+  // (load_stan only throws when bridgestan errors without a message);
+  // the CLI converts it into the loud init-guard abort.
+  Eigen::VectorXd pos(2);
+  pos << 1.0, 2.0;
+  auto builder = walnutpie::InitConfigBuilder(1, 2).positions(pos);
+  EXPECT_THROW(builder.masses(ThrowingLogpGrad{}, 0.5), std::runtime_error);
+}
+
+TEST(InitConfigBuilder, LogpGradMassesRecordsPoisonedGradient) {
+  // The "logp stays finite" miss variant: a finite logp with a non-finite
+  // gradient must remain OBSERVABLE at the guard point via the recorded
+  // init evaluation, so the CLI can reject it (masses() seeds the mass
+  // from |grad| — a poisoned gradient yields a poisoned mass).
+  auto poisoned = [](const Eigen::VectorXd& x, double& lp,
+                     Eigen::VectorXd& grad) {
+    lp = -0.5 * x.dot(x);
+    grad = x;
+    grad(0) = std::numeric_limits<double>::quiet_NaN();
+  };
+  Eigen::VectorXd pos(2);
+  pos << 1.0, 2.0;
+  walnutpie::InitConfig cfg = walnutpie::InitConfigBuilder(1, 2)
+                                  .positions(pos)
+                                  .masses(poisoned, 0.5)
+                                  .build();
+  auto inits = cfg.init_chain_config(0);
+  ASSERT_TRUE(inits.has_init_eval());
+  EXPECT_TRUE(std::isfinite(inits.init_logp()));
+  EXPECT_FALSE(inits.init_grad().allFinite());
 }
 
 TEST(InitConfigBuilder, LogpGradMassesAveraged) {
