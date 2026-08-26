@@ -7,6 +7,7 @@
 #include <vector>
 #include <Eigen/Dense>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -65,6 +66,26 @@ static void write_draws(const std::string& filename,
   out.close();
 }
 
+// W-82 (min-micro guard): reactive pin-detection for --min-micro-steps > 1.
+// The chain runs exactly as it would without the guard; after the first
+// `probe` sampling draws the stored parameter rows are checked for
+// uniqueness. A pinned chain (fewer than `min_unique` unique rows) is
+// discarded and the whole chain re-runs from the same init/seed with
+// min-micro-steps forced to 1.
+struct MicroGuardSpec {
+  bool armed = false;
+  std::size_t probe = 50;
+  std::size_t min_unique = 25;
+};
+
+// Outcome of one guarded run. `pinned` is only meaningful when the spec
+// was armed and the probe ran (probe > 0).
+struct MicroGuardResult {
+  bool pinned = false;
+  std::size_t probe = 0;
+  std::size_t unique = 0;
+};
+
 class StanHandler {
  public:
   StanHandler(DynamicStanModel& model, unsigned int seed,
@@ -110,6 +131,35 @@ class StanHandler {
               << position.transpose() << "\n";
   }
 
+  // W-82 (min-micro guard): count unique position rows among the last
+  // `count` stored draws. Only the parameter block is compared — the
+  // leading unconstrained_dimensions() rows, a deterministic function of
+  // the chain position. Transformed parameters are also deterministic
+  // but generated quantities are excluded: they consume the constrain
+  // RNG and would mask a pin with fresh noise on every draw. Read-only
+  // inspection of storage AFTER the draws were generated; no RNG is
+  // touched, so the draw stream is unaffected (W-54 lesson).
+  std::size_t count_unique_param_rows(std::size_t count) const {
+    const Eigen::Index d =
+        static_cast<Eigen::Index>(model_.unconstrained_dimensions());
+    const Eigen::Index end = n_;
+    const Eigen::Index begin = end - static_cast<Eigen::Index>(count);
+    std::size_t unique = 0;
+    for (Eigen::Index c = begin; c < end; ++c) {
+      bool seen = false;
+      for (Eigen::Index p = begin; p < c; ++p) {
+        if (draws_.col(c).head(d) == draws_.col(p).head(d)) {
+          seen = true;
+          break;
+        }
+      }
+      if (!seen) {
+        ++unique;
+      }
+    }
+    return unique;
+  }
+
   void summarize() {
     auto names = model_.param_names();
     ::summarize(names, draws_);
@@ -136,7 +186,9 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                         walnutpie::SamplingConfig& sample_cfg,
                         double mass_init_clamp = 0.0,
                         bool step_init_heuristic = false,
-                        double early_exit_tol = 0.0) {
+                        double early_exit_tol = 0.0,
+                        const MicroGuardSpec& micro_guard = MicroGuardSpec{},
+                        MicroGuardResult* micro_guard_result = nullptr) {
   using Clock = std::chrono::high_resolution_clock;
   auto elapsed_seconds = [](auto t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
@@ -235,8 +287,30 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   logp_time = 0.0;
   logp_count = 0;
   global_start = Clock::now();
+  // W-82 (min-micro guard): with the guard armed, once the first
+  // `probe` sampling draws exist (they are the trailing columns of
+  // storage at that moment, regardless of --save-warmup / early warmup
+  // exit), check their position diversity. A pinned chain stops here
+  // and the caller re-runs it from the same init/seed with min-micro
+  // forced to 1; the discarded attempt costs warmup + probe draws on
+  // pinned chains only. With the guard off, guard_probe_n is 0 and the
+  // loop below is the original `for (n < num_draws) sampler();` — a
+  // dead boolean check, no RNG reordering (W-54 draw-neutrality).
+  const std::size_t guard_probe_n =
+      micro_guard.armed ? std::min(micro_guard.probe, num_draws) : 0;
   for (std::size_t n = 0; n < num_draws; ++n) {
     sampler();
+    if (guard_probe_n > 0 && n + 1 == guard_probe_n) {
+      const std::size_t unique = storage.count_unique_param_rows(guard_probe_n);
+      if (micro_guard_result != nullptr) {
+        micro_guard_result->probe = guard_probe_n;
+        micro_guard_result->unique = unique;
+        micro_guard_result->pinned = unique < micro_guard.min_unique;
+      }
+      if (unique < micro_guard.min_unique) {
+        break;
+      }
+    }
   }
   end_timing();
 
@@ -300,6 +374,9 @@ int main(int argc, char** argv) {
   std::size_t max_step_halvings = default_sampling.max_step_halvings();
   double max_hamiltonian_error = default_sampling.max_hamiltonian_error();
   std::size_t min_micro_steps = default_sampling.min_micro_steps();
+  bool min_micro_guard = false;  // W-82: only meaningful with min-micro > 1
+  std::size_t min_micro_guard_probe = 50;
+  std::size_t min_micro_guard_min_unique = 25;
 
   double init = 2.0;
   double step_size_init = 1.0;
@@ -341,6 +418,27 @@ int main(int argc, char** argv) {
     app.add_option("--min-micro-steps", min_micro_steps,
                    "Minimum micro steps per macro step")
         ->default_val(min_micro_steps)
+        ->check(CLI::PositiveNumber);
+
+    app.add_flag("--min-micro-guard", min_micro_guard,
+                 "Guard against pinned chains when --min-micro-steps > 1: "
+                 "after the first --min-micro-guard-probe sampling draws, if "
+                 "fewer than --min-micro-guard-min-unique unique parameter "
+                 "rows were drawn, discard the attempt and re-run the whole "
+                 "chain from the same init and seed with min-micro-steps "
+                 "forced to 1 (the final output is the re-run's)")
+        ->default_val(min_micro_guard);
+
+    app.add_option("--min-micro-guard-probe", min_micro_guard_probe,
+                   "Number of initial sampling draws examined by "
+                   "--min-micro-guard")
+        ->default_val(min_micro_guard_probe)
+        ->check(CLI::PositiveNumber);
+
+    app.add_option("--min-micro-guard-min-unique", min_micro_guard_min_unique,
+                   "Unique parameter-row threshold that trips "
+                   "--min-micro-guard")
+        ->default_val(min_micro_guard_min_unique)
         ->check(CLI::PositiveNumber);
 
     app.add_option("--max-hamiltonian-error", max_hamiltonian_error,
@@ -599,97 +697,153 @@ int main(int argc, char** argv) {
           .min_micro_steps(min_micro_steps)
           .build();
 
-  unique_bs_rng rng = model.make_rng(seed);
+  // W-82 (min-micro guard): armed only when explicitly requested AND
+  // min-micro-steps > 1 — otherwise the run must be semantically
+  // identical to the unguarded CLI (W-54 draw-neutrality).
+  MicroGuardSpec micro_guard;
+  micro_guard.armed = min_micro_guard && min_micro_steps > 1;
+  micro_guard.probe = min_micro_guard_probe;
+  micro_guard.min_unique = min_micro_guard_min_unique;
 
-  auto init_positions = [&]() {
-    if (!init_file.empty()) {
-      // plain text: one unconstrained coordinate per line
-      std::ifstream in(init_file);
-      if (!in) {
-        throw std::invalid_argument("cannot open --init-file: " + init_file);
-      }
-      std::vector<double> vals;
-      double v;
-      while (in >> v) {
-        vals.push_back(v);
-      }
-      if (vals.size() != model.unconstrained_dimensions()) {
-        throw std::invalid_argument(
-            "--init-file dimension mismatch: file has " +
-            std::to_string(vals.size()) + ", model has " +
-            std::to_string(model.unconstrained_dimensions()));
-      }
-      return Eigen::VectorXd(Eigen::VectorXd::Map(vals.data(), vals.size()));
-    }
-    return model.initialize(nullptr, rng, init);
-  }();
+  // W-82: the whole single-chain run path — init construction through
+  // the run_walnuts dispatch — as one callable, so the min-micro guard
+  // can re-invoke it verbatim with min-micro-steps forced to 1.
+  // Everything is rebuilt per call: the init builder is moved-from by
+  // build(), so a fallback MUST construct a fresh one, and the init RNG
+  // is seeded fresh from `seed`, so the fallback trajectory is exactly
+  // an MM1 run launched with the same command-line arguments.
+  auto run_chain = [&](walnutpie::SamplingConfig& cfg,
+                       MicroGuardResult* micro_guard_result) -> StanHandler {
+    unique_bs_rng init_rng = model.make_rng(seed);
 
-  auto init_cfg =
-      walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
-          .step_sizes(step_size_init)
-          .positions(init_positions);
-
-  auto res = [&]() {
-    using walnutpie::detail::Adam;
-    using walnutpie::detail::AntiWindupAdapter;
-    using walnutpie::detail::AdaBelief;
-    using walnutpie::detail::AdEMAMix;
-    using walnutpie::detail::BatchedAdapter;
-    using walnutpie::detail::ClippedAdapter;
-    using walnutpie::detail::DualAveraging;
-    // dispatch: base optimizer, optional batching, optional clipping
-    auto run_base = [&](auto opt_tag) -> StanHandler {
-      using Opt = typename decltype(opt_tag)::type;
-      auto extra = std::make_pair(mass_init_clamp, step_init_heuristic);
-      // --anti-windup selects the AntiWindupAdapter wrapper around whatever
-      // optimizer/composition the other flags chose; the wrapper's pass rate
-      // comes from warmup_cfg (StepAdapterFactory<AntiWindupAdapter<Inner>>).
-      if (anti_windup > 0) {
-        if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
-          return run_walnuts<
-              AntiWindupAdapter<ClippedAdapter<BatchedAdapter<Opt>>>>(
-              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
-        } else if (step_opt_batch_stride > 1) {
-          return run_walnuts<AntiWindupAdapter<BatchedAdapter<Opt>>>(
-              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
-        } else if (step_grad_clip > 0.0) {
-          return run_walnuts<AntiWindupAdapter<ClippedAdapter<Opt>>>(
-              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-              warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+    auto init_positions = [&]() {
+      if (!init_file.empty()) {
+        // plain text: one unconstrained coordinate per line
+        std::ifstream in(init_file);
+        if (!in) {
+          throw std::invalid_argument("cannot open --init-file: " + init_file);
         }
-        return run_walnuts<AntiWindupAdapter<Opt>>(
-            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+        std::vector<double> vals;
+        double v;
+        while (in >> v) {
+          vals.push_back(v);
+        }
+        if (vals.size() != model.unconstrained_dimensions()) {
+          throw std::invalid_argument(
+              "--init-file dimension mismatch: file has " +
+              std::to_string(vals.size()) + ", model has " +
+              std::to_string(model.unconstrained_dimensions()));
+        }
+        return Eigen::VectorXd(Eigen::VectorXd::Map(vals.data(), vals.size()));
       }
-      if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
-        return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
-            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
-      } else if (step_opt_batch_stride > 1) {
-        return run_walnuts<BatchedAdapter<Opt>>(
-            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
-      } else if (step_grad_clip > 0.0) {
-        return run_walnuts<ClippedAdapter<Opt>>(
-            model, seed, init_cfg, num_warmup, num_draws, save_warmup,
-            warmup_cfg, sample_cfg, extra.first, extra.second, early_exit_tol);
+      return model.initialize(nullptr, init_rng, init);
+    }();
+
+    auto init_cfg =
+        walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
+            .step_sizes(step_size_init)
+            .positions(init_positions);
+
+    return [&]() {
+      using walnutpie::detail::Adam;
+      using walnutpie::detail::AntiWindupAdapter;
+      using walnutpie::detail::AdaBelief;
+      using walnutpie::detail::AdEMAMix;
+      using walnutpie::detail::BatchedAdapter;
+      using walnutpie::detail::ClippedAdapter;
+      using walnutpie::detail::DualAveraging;
+      // dispatch: base optimizer, optional batching, optional clipping
+      auto run_base = [&](auto opt_tag) -> StanHandler {
+        using Opt = typename decltype(opt_tag)::type;
+        auto extra = std::make_pair(mass_init_clamp, step_init_heuristic);
+        // --anti-windup selects the AntiWindupAdapter wrapper around whatever
+        // optimizer/composition the other flags chose; the wrapper's pass rate
+        // comes from warmup_cfg (StepAdapterFactory<AntiWindupAdapter<Inner>>).
+        if (anti_windup > 0) {
+          if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
+            return run_walnuts<
+                AntiWindupAdapter<ClippedAdapter<BatchedAdapter<Opt>>>>(
+                model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+                warmup_cfg, cfg, extra.first, extra.second, early_exit_tol,
+                micro_guard, micro_guard_result);
+          } else if (step_opt_batch_stride > 1) {
+            return run_walnuts<AntiWindupAdapter<BatchedAdapter<Opt>>>(
+                model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+                warmup_cfg, cfg, extra.first, extra.second, early_exit_tol,
+                micro_guard, micro_guard_result);
+          } else if (step_grad_clip > 0.0) {
+            return run_walnuts<AntiWindupAdapter<ClippedAdapter<Opt>>>(
+                model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+                warmup_cfg, cfg, extra.first, extra.second, early_exit_tol,
+                micro_guard, micro_guard_result);
+          }
+          return run_walnuts<AntiWindupAdapter<Opt>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, cfg, extra.first, extra.second, early_exit_tol,
+              micro_guard, micro_guard_result);
+        }
+        if (step_opt_batch_stride > 1 && step_grad_clip > 0.0) {
+          return run_walnuts<ClippedAdapter<BatchedAdapter<Opt>>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, cfg, extra.first, extra.second, early_exit_tol,
+              micro_guard, micro_guard_result);
+        } else if (step_opt_batch_stride > 1) {
+          return run_walnuts<BatchedAdapter<Opt>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, cfg, extra.first, extra.second, early_exit_tol,
+              micro_guard, micro_guard_result);
+        } else if (step_grad_clip > 0.0) {
+          return run_walnuts<ClippedAdapter<Opt>>(
+              model, seed, init_cfg, num_warmup, num_draws, save_warmup,
+              warmup_cfg, cfg, extra.first, extra.second, early_exit_tol,
+              micro_guard, micro_guard_result);
+        }
+        return run_walnuts<Opt>(model, seed, init_cfg, num_warmup, num_draws,
+                                save_warmup, warmup_cfg, cfg, extra.first,
+                                extra.second, early_exit_tol, micro_guard,
+                                micro_guard_result);
+      };
+      if (step_optimizer == "adam") {
+        return run_base(std::type_identity<Adam>{});
+      } else if (step_optimizer == "da") {
+        return run_base(std::type_identity<DualAveraging>{});
+      } else if (step_optimizer == "dem") {
+        return run_base(std::type_identity<AdEMAMix>{});
+      } else {
+        return run_base(std::type_identity<AdaBelief>{});
       }
-      return run_walnuts<Opt>(model, seed, init_cfg, num_warmup, num_draws,
-                              save_warmup, warmup_cfg, sample_cfg, extra.first,
-                              extra.second, early_exit_tol);
-    };
-    if (step_optimizer == "adam") {
-      return run_base(std::type_identity<Adam>{});
-    } else if (step_optimizer == "da") {
-      return run_base(std::type_identity<DualAveraging>{});
-    } else if (step_optimizer == "dem") {
-      return run_base(std::type_identity<AdEMAMix>{});
-    } else {
-      return run_base(std::type_identity<AdaBelief>{});
-    }
-  }();
+    }();
+  };
+
+  MicroGuardResult micro_guard_result;
+  auto res = run_chain(sample_cfg,
+                       micro_guard.armed ? &micro_guard_result : nullptr);
+
+  // W-82 (min-micro guard): pinned chain detected — discard the attempt
+  // and re-run the entire chain from the same init and seed with
+  // min-micro-steps forced to 1. The final output/storage is the
+  // fallback run's. (StanHandler holds a model reference, so it is
+  // movable but not assignable — the fallback result is written in
+  // this branch rather than assigned over `res`.)
+  if (micro_guard.armed && micro_guard_result.pinned) {
+    std::cout << "[min-micro-guard] " << lib << " chain 0: chain pinned — "
+              << micro_guard_result.unique << "/" << micro_guard_result.probe
+              << " unique parameter rows (< " << micro_guard.min_unique
+              << "); re-running from the same init/seed with "
+                 "min-micro-steps=1"
+              << std::endl;
+    walnutpie::SamplingConfig mm1_cfg =
+        walnutpie::SamplingConfigBuilder()
+            .max_trajectory_doublings(max_trajectory_doublings)
+            .max_step_halvings(max_step_halvings)
+            .max_hamiltonian_error(max_hamiltonian_error)
+            .min_micro_steps(1)
+            .build();
+    auto fallback = run_chain(mm1_cfg, nullptr);
+    fallback.summarize();
+    fallback.write_csv(output_file);
+    return 0;
+  }
 
   res.summarize();
   res.write_csv(output_file);
