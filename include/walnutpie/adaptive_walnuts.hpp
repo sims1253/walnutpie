@@ -806,6 +806,41 @@ class AdaptiveWalnuts {
   }
 
   /**
+   * @brief Return a frozen sampler that overrides the min micro-step count.
+   *
+   * Identical to sampler() (same freeze clamp, metric, endpoint cache)
+   * except the frozen trajectory budget. Used by the multi-chain driver's
+   * ridge guard: when chains have locked onto different points of an
+   * exactly-null ridge (cross-chain position dispersion far above the
+   * adapted within-chain scale), longer trajectories restore traversal.
+   *
+   * @param[in] min_micro_steps The minimum micro steps per macro step.
+   * @return The Walnuts sampler with current tuning and the given budget.
+   */
+  WalnutsSampler<F, RNG, H> sampler_min_micro(std::size_t min_micro_steps) {
+    double macro_time = step_size();
+    if (!(std::isfinite(macro_time) && macro_time > 0.0)) {
+      if (!freeze_clamped_) {
+        freeze_fallback_step_ = freeze_step_fallback(macro_time);
+        freeze_clamped_ = true;
+      }
+      macro_time = freeze_fallback_step_;
+    }
+    handler_.get().on_warmup_complete(macro_time, inv_mass());
+    WalnutsSampler<F, RNG, H> out(
+        rand_.rng(), handler_, logp_grad_.logp_grad_, theta_, inv_mass(),
+        macro_time, sampling_cfg_.get().max_trajectory_doublings(),
+        sampling_cfg_.get().max_step_halvings(), min_micro_steps,
+        sampling_cfg_.get().max_hamiltonian_error());
+    if (warmup_cfg_.get().metric_rank() > 0 &&
+        warmup_cfg_.get().metric_full()) {
+      out.set_low_rank(mass_estimator_.rank_U(), mass_estimator_.rank_c());
+    }
+    out.seed_endpoint_cache(cached_grad_, cached_logp_);
+    return out;
+  }
+
+  /**
    * @brief Return the diagonal of the diagonal inverse mass matrix.
    *
    * @return The diagonal of the inverse mass matrix.

@@ -720,6 +720,57 @@ void run_walnuts_multi(
     samplers.emplace_back(adapters[c].sampler());
   }
 
+  // W-86 ridge guard (opt-in, env-gated; default off = no change): chains
+  // locked on different points of an exactly-null ridge disperse far more
+  // across chains than the adapted within-chain scale sqrt(inv_mass).
+  // log-mass dispersion cannot see this (invariant along the ridge), but
+  // positions can. On detection, raise the frozen trajectory budget:
+  // longer trajectories traverse the ridge (W-85 length-binding result).
+  if (const char* rg = std::getenv("WALNUTPIE_RIDGE_GUARD")) {
+    double ridge_thresh = 5.0;
+    try { ridge_thresh = std::stod(rg); } catch (...) {}
+    if (ridge_thresh <= 0) ridge_thresh = 5.0;
+    std::size_t ridge_min_micro = 128;
+    if (const char* bm = std::getenv("WALNUTPIE_RIDGE_MINMICRO")) {
+      try { ridge_min_micro = std::stoul(bm); } catch (...) {}
+    }
+    const std::size_t d =
+        static_cast<std::size_t>(samplers[0].position().size());
+    double worst_f = 0.0;
+    std::size_t worst_j = 0;
+    for (std::size_t j = 0; j < d; ++j) {
+      double mean_of_means = 0.0, mean_scale = 0.0;
+      for (std::size_t c = 0; c < chains; ++c) {
+        mean_of_means += samplers[c].position()[j];
+        mean_scale += std::sqrt(samplers[c].inv_mass()[j]);
+      }
+      mean_of_means /= static_cast<double>(chains);
+      mean_scale /= static_cast<double>(chains);
+      if (!(mean_scale > 0.0)) continue;
+      double ss = 0.0;
+      for (std::size_t c = 0; c < chains; ++c) {
+        const double dev = samplers[c].position()[j] - mean_of_means;
+        ss += dev * dev;
+      }
+      const double between =
+          std::sqrt(ss / std::max<std::size_t>(chains - 1, 1));
+      const double f = between / mean_scale;
+      if (f > worst_f) { worst_f = f; worst_j = j; }
+    }
+    if (worst_f > ridge_thresh) {
+      std::cerr << "ridge guard: cross-chain position F=" << worst_f
+                << " at coord " << worst_j << " > " << ridge_thresh
+                << " -> raising min micro steps to " << ridge_min_micro
+                << " for sampling" << std::endl;
+      std::vector<Sampler> replaced;
+      replaced.reserve(chains);
+      for (std::size_t c = 0; c < chains; ++c) {
+        replaced.emplace_back(adapters[c].sampler_min_micro(ridge_min_micro));
+      }
+      samplers = std::move(replaced);
+    }
+  }
+
   for (auto& t : timing) {
     t = ChainTiming{};
   }
