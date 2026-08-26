@@ -4,6 +4,7 @@
 #include <CLI/CLI.hpp>
 #include <Eigen/Dense>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -62,6 +63,26 @@ static void write_draws(const std::string& filename,
   out.close();
 }
 
+// W-82 (min-micro guard): reactive pin-detection for --min-micro-steps > 1.
+// The chain runs exactly as it would without the guard; after the first
+// `probe` sampling draws the stored parameter rows are checked for
+// uniqueness. A pinned chain (fewer than `min_unique` unique rows) is
+// discarded and the whole chain re-runs from the same init/seed with
+// min-micro-steps forced to 1.
+struct MicroGuardSpec {
+  bool armed = false;
+  std::size_t probe = 50;
+  std::size_t min_unique = 25;
+};
+
+// Outcome of one guarded run. `pinned` is only meaningful when the spec
+// was armed and the probe ran (probe > 0).
+struct MicroGuardResult {
+  bool pinned = false;
+  std::size_t probe = 0;
+  std::size_t unique = 0;
+};
+
 class StanHandler {
  public:
   StanHandler(DynamicStanModel& model, unsigned int seed,
@@ -95,6 +116,35 @@ class StanHandler {
               << position.transpose() << "\n";
   }
 
+  // W-82 (min-micro guard): count unique position rows among the last
+  // `count` stored draws. Only the parameter block is compared — the
+  // leading unconstrained_dimensions() rows, a deterministic function of
+  // the chain position. Transformed parameters are also deterministic
+  // but generated quantities are excluded: they consume the constrain
+  // RNG and would mask a pin with fresh noise on every draw. Read-only
+  // inspection of storage AFTER the draws were generated; no RNG is
+  // touched, so the draw stream is unaffected (W-54 lesson).
+  std::size_t count_unique_param_rows(std::size_t count) const {
+    const Eigen::Index d =
+        static_cast<Eigen::Index>(model_.unconstrained_dimensions());
+    const Eigen::Index end = n_;
+    const Eigen::Index begin = end - static_cast<Eigen::Index>(count);
+    std::size_t unique = 0;
+    for (Eigen::Index c = begin; c < end; ++c) {
+      bool seen = false;
+      for (Eigen::Index p = begin; p < c; ++p) {
+        if (draws_.col(c).head(d) == draws_.col(p).head(d)) {
+          seen = true;
+          break;
+        }
+      }
+      if (!seen) {
+        ++unique;
+      }
+    }
+    return unique;
+  }
+
   void summarize() {
     auto names = model_.param_names();
     ::summarize(names, draws_);
@@ -117,7 +167,9 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
                         walnutpie::InitConfigBuilder& init_builder,
                         std::size_t num_warmup, std::size_t num_draws,
                         bool save_warmup, walnutpie::WarmupConfig& warmup_cfg,
-                        walnutpie::SamplingConfig& sample_cfg) {
+                        walnutpie::SamplingConfig& sample_cfg,
+                        const MicroGuardSpec& micro_guard = MicroGuardSpec{},
+                        MicroGuardResult* micro_guard_result = nullptr) {
   using Clock = std::chrono::high_resolution_clock;
   auto elapsed_seconds = [](auto t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
@@ -169,8 +221,30 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   logp_time = 0.0;
   logp_count = 0;
   global_start = Clock::now();
+  // W-82 (min-micro guard): with the guard armed, once the first
+  // `probe` sampling draws exist (they are the trailing columns of
+  // storage at that moment, regardless of --save-warmup / early warmup
+  // exit), check their position diversity. A pinned chain stops here
+  // and the caller re-runs it from the same init/seed with min-micro
+  // forced to 1; the discarded attempt costs warmup + probe draws on
+  // pinned chains only. With the guard off, guard_probe_n is 0 and the
+  // loop below is the original `for (n < num_draws) sampler();` — a
+  // dead boolean check, no RNG reordering (W-54 draw-neutrality).
+  const std::size_t guard_probe_n =
+      micro_guard.armed ? std::min(micro_guard.probe, num_draws) : 0;
   for (std::size_t n = 0; n < num_draws; ++n) {
     sampler();
+    if (guard_probe_n > 0 && n + 1 == guard_probe_n) {
+      const std::size_t unique = storage.count_unique_param_rows(guard_probe_n);
+      if (micro_guard_result != nullptr) {
+        micro_guard_result->probe = guard_probe_n;
+        micro_guard_result->unique = unique;
+        micro_guard_result->pinned = unique < micro_guard.min_unique;
+      }
+      if (unique < micro_guard.min_unique) {
+        break;
+      }
+    }
   }
   end_timing();
 
@@ -208,6 +282,9 @@ int main(int argc, char** argv) {
   std::size_t max_step_halvings = default_sampling.max_step_halvings();
   double max_hamiltonian_error = default_sampling.max_hamiltonian_error();
   std::size_t min_micro_steps = default_sampling.min_micro_steps();
+  bool min_micro_guard = false;  // W-82: only meaningful with min-micro > 1
+  std::size_t min_micro_guard_probe = 50;
+  std::size_t min_micro_guard_min_unique = 25;
 
   double init = 2.0;
   double step_size_init = 1.0;
@@ -248,6 +325,27 @@ int main(int argc, char** argv) {
     app.add_option("--min-micro-steps", min_micro_steps,
                    "Minimum micro steps per macro step")
         ->default_val(min_micro_steps)
+        ->check(CLI::PositiveNumber);
+
+    app.add_flag("--min-micro-guard", min_micro_guard,
+                 "Guard against pinned chains when --min-micro-steps > 1: "
+                 "after the first --min-micro-guard-probe sampling draws, if "
+                 "fewer than --min-micro-guard-min-unique unique parameter "
+                 "rows were drawn, discard the attempt and re-run the whole "
+                 "chain from the same init and seed with min-micro-steps "
+                 "forced to 1 (the final output is the re-run's)")
+        ->default_val(min_micro_guard);
+
+    app.add_option("--min-micro-guard-probe", min_micro_guard_probe,
+                   "Number of initial sampling draws examined by "
+                   "--min-micro-guard")
+        ->default_val(min_micro_guard_probe)
+        ->check(CLI::PositiveNumber);
+
+    app.add_option("--min-micro-guard-min-unique", min_micro_guard_min_unique,
+                   "Unique parameter-row threshold that trips "
+                   "--min-micro-guard")
+        ->default_val(min_micro_guard_min_unique)
         ->check(CLI::PositiveNumber);
 
     app.add_option("--max-hamiltonian-error", max_hamiltonian_error,
@@ -349,15 +447,34 @@ int main(int argc, char** argv) {
           .min_micro_steps(min_micro_steps)
           .build();
 
-  unique_bs_rng rng = model.make_rng(seed);
+  // W-82 (min-micro guard): armed only when explicitly requested AND
+  // min-micro-steps > 1 — otherwise the run must be semantically
+  // identical to the unguarded CLI (W-54 draw-neutrality).
+  MicroGuardSpec micro_guard;
+  micro_guard.armed = min_micro_guard && min_micro_steps > 1;
+  micro_guard.probe = min_micro_guard_probe;
+  micro_guard.min_unique = min_micro_guard_min_unique;
 
-  auto init_cfg =
-      walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
-          .step_sizes(step_size_init)
-          .positions(model.initialize(nullptr, rng, init));
+  // W-82: the single-chain run path as one callable so the min-micro
+  // guard can re-invoke it verbatim with min-micro-steps forced to 1.
+  // The init builder is moved-from by build(), so a fallback constructs
+  // a fresh one; the init RNG is seeded fresh from `seed`, making the
+  // fallback trajectory exactly an MM1 run with the same CLI arguments.
+  auto run_chain = [&](walnutpie::SamplingConfig& cfg,
+                       MicroGuardResult* micro_guard_result) -> StanHandler {
+    unique_bs_rng init_rng = model.make_rng(seed);
+    auto init_cfg =
+        walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
+            .step_sizes(step_size_init)
+            .positions(model.initialize(nullptr, init_rng, init));
+    return run_walnuts(model, seed, init_cfg, num_warmup, num_draws,
+                       save_warmup, warmup_cfg, cfg, micro_guard,
+                       micro_guard_result);
+  };
 
-  auto res = run_walnuts(model, seed, init_cfg, num_warmup, num_draws,
-                         save_warmup, warmup_cfg, sample_cfg);
+  MicroGuardResult micro_guard_result;
+  auto res = run_chain(sample_cfg,
+                       micro_guard.armed ? &micro_guard_result : nullptr);
 
   res.summarize();
   res.write_csv(output_file);
