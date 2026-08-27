@@ -768,6 +768,12 @@ void run_walnuts_multi(
         replaced.emplace_back(adapters[c].sampler_min_micro(ridge_min_micro));
       }
       samplers = std::move(replaced);
+    } else {
+      // Diagnostic (still env-gated): report the statistic when silent so
+      // threshold sweeps can be run warmup-only without sampling cost.
+      std::cerr << "ridge guard: silent (max cross-chain position F="
+                << worst_f << " at coord " << worst_j << " <= "
+                << ridge_thresh << ")" << std::endl;
     }
   }
 
