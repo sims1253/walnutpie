@@ -626,6 +626,34 @@ void run_walnuts_multi(
   for (std::size_t c = 0; c < chains; ++c) {
     rngs.emplace_back(seed + static_cast<unsigned>(c));
   }
+  // W-100: per-chain find_reasonable_step probe for the multi-chain path
+  // (env-gated; the --step-init-heuristic FLAG stays single-chain-only until
+  // validated). Mirrors the single-chain W-43 flow: probe with the chain's
+  // own rng BEFORE adapter construction, preserving the recorded init
+  // evaluation (the probe does not move the position).
+  std::vector<walnutpie::InitChainConfig> chain_inits;
+  chain_inits.reserve(chains);
+  const bool mc_step_heuristic =
+      std::getenv("WALNUTPIE_MC_STEP_HEURISTIC") != nullptr;
+  for (std::size_t c = 0; c < chains; ++c) {
+    auto inits = init_cfg.init_chain_config(c);
+    if (mc_step_heuristic) {
+      const auto inv_mass = inits.mass().array().inverse().matrix().eval();
+      walnutpie::detail::Random heur_rand(rngs[c]);
+      const double eps = walnutpie::detail::find_reasonable_step(
+          heur_rand, logps[c], inits.position(), inv_mass,
+          inits.step_size());
+      inits = inits.has_init_eval()
+                  ? walnutpie::InitChainConfig(eps, inits.position(),
+                                               inits.mass(), inits.init_grad(),
+                                               inits.init_logp())
+                  : walnutpie::InitChainConfig(eps, inits.position(),
+                                               inits.mass());
+      std::cout << "chain " << c
+                << " heuristic initial step size: " << eps << std::endl;
+    }
+    chain_inits.push_back(std::move(inits));
+  }
   std::vector<StanHandler> handlers;
   handlers.reserve(chains);
   for (std::size_t c = 0; c < chains; ++c) {
@@ -636,7 +664,7 @@ void run_walnuts_multi(
   adapters.reserve(chains);
   for (std::size_t c = 0; c < chains; ++c) {
     adapters.emplace_back(rngs[c], handlers[c], logps[c],
-                          init_cfg.init_chain_config(c), warmup_cfg,
+                          std::move(chain_inits[c]), warmup_cfg,
                           sample_cfg);
   }
 
