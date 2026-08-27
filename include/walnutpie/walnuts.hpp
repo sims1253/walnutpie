@@ -354,7 +354,11 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
       }
       pin_trace::observe_min_attempt(min_accept, logp - logp_next,
                                      std::fabs(step));  // W-43: no-op off
-      adapt_handler(min_accept);
+      // A failed logp evaluation carries no acceptance information; feeding
+      // the NaN to a step adapter would poison its state permanently.
+      if (std::isfinite(min_accept)) {
+        adapt_handler(min_accept);
+      }
     }
     if (std::fabs(logp - logp_next) <= max_error) {
       bool reversible_ok =
@@ -727,7 +731,11 @@ static bool macro_step_lr(const F& logp_grad, const detail::LowRankMass& lrm,
       double min_accept = std::exp(-std::fabs(logp - logp_next));
       pin_trace::observe_min_attempt(min_accept, logp - logp_next,
                                      std::fabs(step));  // W-43: no-op off
-      adapt_handler(min_accept);
+      // A failed logp evaluation carries no acceptance information; feeding
+      // the NaN to a step adapter would poison its state permanently.
+      if (std::isfinite(min_accept)) {
+        adapt_handler(min_accept);
+      }
     }
     if (std::fabs(logp - logp_next) <= max_error) {
       bool reversible_ok = reversible_lr(logp_grad, lrm, step, num_steps,
