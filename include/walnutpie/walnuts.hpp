@@ -356,6 +356,8 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
                                      std::fabs(step));  // W-43: no-op off
       // A failed logp evaluation carries no acceptance information; feeding
       // the NaN to a step adapter would poison its state permanently.
+      // (W-96 assembly: pin_trace call retained — it belongs to the
+      //  rob/init-screen stack merged at HEAD, not to the guard itself.)
       if (std::isfinite(min_accept)) {
         adapt_handler(min_accept);
       }
@@ -733,6 +735,8 @@ static bool macro_step_lr(const F& logp_grad, const detail::LowRankMass& lrm,
                                      std::fabs(step));  // W-43: no-op off
       // A failed logp evaluation carries no acceptance information; feeding
       // the NaN to a step adapter would poison its state permanently.
+      // (W-96 assembly: pin_trace call retained — it belongs to the
+      //  rob/init-screen stack merged at HEAD, not to the guard itself.)
       if (std::isfinite(min_accept)) {
         adapt_handler(min_accept);
       }

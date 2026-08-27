@@ -151,6 +151,8 @@ static void write_draws(const std::string& filename,
 // LKJ-Cholesky-boundary dead inits) is treated identically to a
 // non-finite logp — file init aborts loudly naming the exception,
 // random init counts it as a rejected draw.
+// (W-96 assembly note: identical feature existed on the
+// exp/robust-stack-w75 lineage; HEAD variant kept, superset wording.)
 
 static std::string format_double(double v) {
   std::ostringstream oss;
@@ -712,7 +714,7 @@ void run_walnuts_multi(
     double step_size_init, const std::string& init_pattern,
     const std::string& out_pattern, std::size_t pilot_burst,
     double pilot_rho1_max, double pilot_rhat_max, bool serial_exec,
-    bool init_screen) {
+    bool init_screen, std::size_t init_tries) {
   using Clock = std::chrono::high_resolution_clock;
   using LogpT = decltype(make_timed_logp(std::declval<DynamicStanModel&>(),
                                          std::declval<ChainTiming&>()));
@@ -758,6 +760,9 @@ void run_walnuts_multi(
 
   // Initial positions per chain, replicating the single-chain CLI
   // (--init-file wins; else model.initialize with the model's rng).
+  // W-42 (b): random inits go through the finite-logp rejection loop
+  // (one initialize() per attempt from the chain's own init stream, in
+  // order, before any warmup consumption).
   std::vector<Eigen::VectorXd> positions;
   positions.reserve(chains);
   for (std::size_t c = 0; c < chains; ++c) {
@@ -787,13 +792,16 @@ void run_walnuts_multi(
               + " (--init-file " + f + ")",
           init_screen));
     } else {
-      positions.push_back(
-          screened_init(*models[c], mrng, init_radius,
-                        models[c]->initialize(nullptr, mrng, init_radius),
-                        "model " + lib + ", chain "
-                            + std::to_string(c) + " (random --init "
-                            + std::to_string(init_radius) + ")",
-                        init_screen));
+      // W-96 assembly: BOTH guards compose — the finite-logp rejection
+      // loop (W-42) produces the candidate, the W-77 env-gated screen
+      // re-checks it (pass-through when WALNUTPIE_INIT_SCREEN is unset).
+      positions.push_back(screened_init(
+          *models[c], mrng, init_radius,
+          initialize_finite(*models[c], mrng, init_radius,
+                            seed + static_cast<unsigned>(c), c, init_tries),
+          "model " + lib + ", chain " + std::to_string(c) + " (random --init "
+              + std::to_string(init_radius) + ")",
+          init_screen));
     }
   }
 
@@ -805,6 +813,19 @@ void run_walnuts_multi(
           .positions(std::move(positions))
           .masses(logps[0], warmup_cfg.mass_additive_smoothing(), false, 0.0)
           .build();
+  // W-42 (a): file-init guard — masses() just evaluated the logp at each
+  // chain's provided draw (recorded, no new evaluation); refuse to start
+  // warmup from a non-finite logp BEFORE any rng/handler/adapter exists.
+  if (!init_pattern.empty()) {
+    const std::vector<double>& init_logps = init_cfg.init_logps();
+    for (std::size_t c = 0; c < init_logps.size(); ++c) {
+      if (!std::isfinite(init_logps[c])) {
+        std::string f = init_pattern;
+        f.replace(f.find("{c}"), 3, std::to_string(c));
+        throw_nonfinite_init(c, f, init_logps[c]);
+      }
+    }
+  }
 
   std::vector<RNG> rngs;
   rngs.reserve(chains);
@@ -903,6 +924,63 @@ void run_walnuts_multi(
   samplers.reserve(chains);
   for (std::size_t c = 0; c < chains; ++c) {
     samplers.emplace_back(adapters[c].sampler());
+  }
+
+  // W-86 ridge guard (opt-in, env-gated; default off = no change): chains
+  // locked on different points of an exactly-null ridge disperse far more
+  // across chains than the adapted within-chain scale sqrt(inv_mass).
+  // log-mass dispersion cannot see this (invariant along the ridge), but
+  // positions can. On detection, raise the frozen trajectory budget:
+  // longer trajectories traverse the ridge (W-85 length-binding result).
+  if (const char* rg = std::getenv("WALNUTPIE_RIDGE_GUARD")) {
+    double ridge_thresh = 5.0;
+    try { ridge_thresh = std::stod(rg); } catch (...) {}
+    if (ridge_thresh <= 0) ridge_thresh = 5.0;
+    std::size_t ridge_min_micro = 128;
+    if (const char* bm = std::getenv("WALNUTPIE_RIDGE_MINMICRO")) {
+      try { ridge_min_micro = std::stoul(bm); } catch (...) {}
+    }
+    const std::size_t d =
+        static_cast<std::size_t>(samplers[0].position().size());
+    double worst_f = 0.0;
+    std::size_t worst_j = 0;
+    for (std::size_t j = 0; j < d; ++j) {
+      double mean_of_means = 0.0, mean_scale = 0.0;
+      for (std::size_t c = 0; c < chains; ++c) {
+        mean_of_means += samplers[c].position()[j];
+        mean_scale += std::sqrt(samplers[c].inv_mass()[j]);
+      }
+      mean_of_means /= static_cast<double>(chains);
+      mean_scale /= static_cast<double>(chains);
+      if (!(mean_scale > 0.0)) continue;
+      double ss = 0.0;
+      for (std::size_t c = 0; c < chains; ++c) {
+        const double dev = samplers[c].position()[j] - mean_of_means;
+        ss += dev * dev;
+      }
+      const double between =
+          std::sqrt(ss / std::max<std::size_t>(chains - 1, 1));
+      const double f = between / mean_scale;
+      if (f > worst_f) { worst_f = f; worst_j = j; }
+    }
+    if (worst_f > ridge_thresh) {
+      std::cerr << "ridge guard: cross-chain position F=" << worst_f
+                << " at coord " << worst_j << " > " << ridge_thresh
+                << " -> raising min micro steps to " << ridge_min_micro
+                << " for sampling" << std::endl;
+      std::vector<Sampler> replaced;
+      replaced.reserve(chains);
+      for (std::size_t c = 0; c < chains; ++c) {
+        replaced.emplace_back(adapters[c].sampler_min_micro(ridge_min_micro));
+      }
+      samplers = std::move(replaced);
+    } else {
+      // Diagnostic (still env-gated): report the statistic when silent so
+      // threshold sweeps can be run warmup-only without sampling cost.
+      std::cerr << "ridge guard: silent (max cross-chain position F="
+                << worst_f << " at coord " << worst_j << " <= "
+                << ridge_thresh << ")" << std::endl;
+    }
   }
 
   for (auto& t : timing) {
@@ -1490,7 +1568,7 @@ int main(int argc, char** argv) {
           num_draws, save_warmup, warmup_cfg, sample_cfg, init,
           step_size_init, init_file, output_file, pilot_burst,
           pilot_rho1_max, pilot_rhat_max, chain_exec == "serial",
-          init_screen_enabled());
+          init_screen_enabled(), init_tries);
     };
     if (step_optimizer == "adam") {
       run_multi(std::type_identity<walnutpie::detail::Adam>{});

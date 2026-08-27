@@ -197,8 +197,9 @@ class DynamicStanModel {
    * BridgeStan's `param_initialize` implements Stan's random-init
    * protocol: it evaluates the log density at each draw, rejects
    * non-finite values, and retries up to `max_tries` draws from the
-   * same rng stream before throwing. `max_tries` was hardcoded to 100
-   * until W-42 exposed it; the default keeps the historical behavior.
+   * same rng stream before throwing ("Initialization failed", cmdstan
+   * text). `max_tries` was hardcoded to 100 until W-42 exposed it; the
+   * default keeps the historical behavior exactly.
    *
    * @param[in] json JSON string for parameters to fix (nullptr = none).
    * @param[in,out] rng The model rng; each attempt consumes one draw

@@ -36,9 +36,15 @@ class InitChainConfig {
       : step_size_(step_size), position_(position), mass_(mass) {}
 
   /**
-   * @brief Construct with the (log density, gradient) that
-   * `InitConfigBuilder::masses()` evaluated at the initial position
-   * (W-42).
+   * @brief Construct an initialization configuration carrying the log
+   * density and gradient evaluated at the initial position (W-42).
+   *
+   * The pair comes from the evaluation `InitConfigBuilder::masses()`
+   * already performs at each chain's position (whose log density was
+   * previously discarded). Callers use it to (a) refuse non-finite
+   * initial log densities before warmup starts and (b) seed the first
+   * transition's start-position cache so the duplicate re-evaluation is
+   * skipped.
    *
    * @param[in] step_size The initial step size.
    * @param[in] position The initial position.
@@ -78,7 +84,8 @@ class InitChainConfig {
   const Eigen::VectorXd& mass() const noexcept { return mass_; }
 
   /**
-   * @brief Return whether an init evaluation is recorded (W-42).
+   * @brief Return whether a (log density, gradient) evaluation at the
+   * initial position is recorded in this configuration (W-42).
    *
    * @return True if `init_logp()`/`init_grad()` are meaningful.
    */
@@ -204,8 +211,11 @@ class InitConfig {
   /**
    * @brief Return the log densities at the initial positions (W-42).
    *
-   * One entry per chain when built through `InitConfigBuilder::masses`;
-   * empty when no evaluation was performed.
+   * One entry per chain when the configuration was built through
+   * `InitConfigBuilder::masses(logp_grad, ...)` (which evaluates each
+   * chain's position); empty otherwise (no evaluation exists to
+   * report). Callers use this to refuse starting a chain at a
+   * non-finite log density.
    *
    * @return The initial log densities (empty if none were recorded).
    */
@@ -240,10 +250,10 @@ class InitConfig {
    * @param[in] step_sizes The step sizes.
    * @param[in] positions The positions.
    * @param[in] masses The diagonals of the diagonal mass matrixes.
-   * @param[in] init_logps Log densities at the positions (W-42; empty
-   * if no mass-seeding evaluation was performed).
-   * @param[in] init_grads Gradients at the positions (W-42; same rule
-   * as `init_logps`).
+   * @param[in] init_logps Log densities at the positions (W-42; may be
+   * empty when no mass-seeding evaluation was performed).
+   * @param[in] init_grads Gradients at the positions (W-42; same
+   * emptiness rule as `init_logps`).
    */
   InitConfig(std::vector<double>&& step_sizes,
              std::vector<Eigen::VectorXd>&& positions,
@@ -458,7 +468,10 @@ class InitConfigBuilder {
     for (std::size_t c = 0; c < num_chains_; ++c) {
       double lp;
       logp_grad(positions_[c], lp, grad);
-      // W-42: record the evaluation the mass seeding already performs.
+      // W-42: record the mass-seeding evaluation (the log density was
+      // previously discarded) — callers use it to refuse non-finite
+      // initial log densities before warmup and to seed the first
+      // transition's start-position cache.
       init_logps_[c] = lp;
       init_grads_[c] = grad;
       masses_[c] = (1 - mass_smoothing) * grad.array().abs() + mass_smoothing;
@@ -579,10 +592,11 @@ class InitConfigBuilder {
 
  private:
   /**
-   * @brief Drop any recorded init evaluations (W-42).
+   * @brief Drop any recorded init evaluations (W-42 hygiene).
    *
-   * Recorded pairs belong to the positions they were evaluated at and
-   * must not survive a position change.
+   * Called whenever the positions change after a `masses(logp_grad,
+   * ...)` call: the recorded (logp, grad) pairs belong to the positions
+   * they were evaluated at and must not survive a position swap.
    */
   void invalidate_init_evals_() {
     init_logps_.clear();
