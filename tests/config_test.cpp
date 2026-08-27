@@ -593,6 +593,10 @@ TEST(WarmupConfig, DefaultValuesAreCorrect) {
   EXPECT_DOUBLE_EQ(cfg.step_learn_rate_decay(), 0.5);
   EXPECT_EQ(cfg.publish_stride(), std::size_t{5});
   EXPECT_EQ(cfg.yield_period(), std::size_t{32});
+  // W-31 safe default: the controller's convergence-based early exit is
+  // opt-in (tolerances unchanged — see allow_early_exit()).
+  EXPECT_FALSE(cfg.allow_early_exit());
+  EXPECT_DOUBLE_EQ(cfg.temporal_step_drift_tol(), 0.0);
 }
 
 // min_max_iter()
@@ -614,6 +618,14 @@ TEST(WarmupConfigBuilder, MinMaxIterAllowsEqualMinAndMax) {
 TEST(WarmupConfigBuilder, MinMaxIterThrowsWhenMinExceedsMax) {
   walnutpie::WarmupConfigBuilder b;
   EXPECT_THROW(b.min_max_iter(500, 10), std::invalid_argument);
+}
+
+// allow_early_exit()
+
+TEST(WarmupConfigBuilder, AllowEarlyExitSetsCorrectly) {
+  walnutpie::WarmupConfig cfg =
+      walnutpie::WarmupConfigBuilder().allow_early_exit(true).build();
+  EXPECT_TRUE(cfg.allow_early_exit());
 }
 
 // step_size_converge_tol()

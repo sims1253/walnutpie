@@ -646,6 +646,29 @@ class WarmupConfig {
   std::size_t max_iter() const { return max_iter_; }
 
   /**
+   * @brief Return a copy of this configuration with a different iteration
+   * range (W-28 pilot-gate resume: resumed warmup phases run against a
+   * shorter per-phase budget while the total budget is enforced by the
+   * caller).
+   *
+   * @param[in] min_iter The new minimum warmup iterations.
+   * @param[in] max_iter The new maximum warmup iterations.
+   * @throw std::invalid_argument If `min_iter > max_iter`.
+   * @return The configuration copy with the new iteration range.
+   */
+  WarmupConfig with_min_max_iter(std::size_t min_iter,
+                                 std::size_t max_iter) const {
+    if (min_iter > max_iter) {
+      throw std::invalid_argument(
+          "min_iter cannot be greater than max_iter");
+    }
+    WarmupConfig out = *this;
+    out.min_iter_ = min_iter;
+    out.max_iter_ = max_iter;
+    return out;
+  }
+
+  /**
    * @brief Return the step-size convergence tolerance.
    *
    * @return The step-size convergence tolerance.
@@ -754,6 +777,52 @@ class WarmupConfig {
   double mass_init_clamp() const { return mass_init_clamp_; }
 
   /**
+   * @brief Return the init-buffer length for mass adaptation (W-54 arm A).
+   *
+   * When positive, the first N warmup iterations run with the IDENTITY
+   * inverse mass and do not feed the mass estimator at all (no
+   * observe(), no window chopping, no low-rank refresh); continuous
+   * adaptation begins at iteration N from identity-seeded accumulators
+   * (no metric discontinuity at the boundary). This is the Stan-style
+   * init buffer: tail geometry at a distant initialization cannot
+   * contaminate the metric while the chain drifts toward the typical
+   * set. 0 (the DEFAULT) = current behavior (continuous adaptation
+   * from iteration 0, gradient-seeded).
+   *
+   * @return The number of leading warmup iterations to buffer (0 = off).
+   */
+  std::size_t mass_init_buffer() const { return mass_init_buffer_; }
+
+  /**
+   * @brief Return the soft gradient-clipping scale for the adapter's
+   * score stream (W-54 arm B).
+   *
+   * When positive, the gradient fed to the mass estimator's score
+   * moments during warmup iterations below `grad_clip_iters()` is
+   * replaced elementwise by the soft clip g' = c * asinh(g / c)
+   * (identity below ~c/100, logarithmic beyond; smooth and
+   * sign-preserving). This bounds the score-variance scale tail
+   * gradients can imprint on the metric WITHOUT touching the
+   * trajectory integrator's gradient (which would change the
+   * Hamiltonian being sampled — a different target). The step adapter
+   * consumes only the scalar acceptance statistic and is unaffected
+   * by construction. 0.0 (the DEFAULT) = current behavior (raw
+   * scores).
+   *
+   * @return The clipping scale c in gradient units (0 = off).
+   */
+  double grad_clip_scale() const { return grad_clip_scale_; }
+
+  /**
+   * @brief Return the number of leading warmup iterations during which
+   * the soft gradient clip is applied (W-54 arm B; only meaningful
+   * when `grad_clip_scale()` is positive).
+   *
+   * @return The clipping window length in warmup iterations.
+   */
+  std::size_t grad_clip_iters() const { return grad_clip_iters_; }
+
+  /**
    * @brief Basis-extraction rule for the low-rank metric factors.
    *
    * 0 = windowed thin SVD of the standardized stacked draw/score matrix
@@ -785,9 +854,60 @@ class WarmupConfig {
   }
 
   /**
+   * @brief Return the temporal step-size drift tolerance for early exit.
+   *
+   * When positive, the multi-chain controller additionally requires every
+   * chain's step size to be temporally stable — relative drift below this
+   * tolerance across the last full `temporal_window()` iterations ending
+   * at or after `temporal_min_iter()` — before stopping warmup early on
+   * the cross-chain criteria. This guards against the failure mode where
+   * all chains agree with each other while their step sizes are still
+   * marching toward equilibrium (W-22: +170% late-warmup step growth with
+   * stable mass degraded post-warmup quality on the marginal model class).
+   *
+   * @return The temporal step drift tolerance (0 = gate off).
+   */
+  double temporal_step_drift_tol() const { return temporal_step_drift_tol_; }
+
+  /**
+   * @brief Return the window length for the temporal step-drift gate.
+   *
+   * @return The temporal window in warmup iterations.
+   */
+  std::size_t temporal_window() const { return temporal_window_; }
+
+  /**
+   * @brief Return the minimum iteration for the temporal step-drift gate.
+   *
+   * @return The minimum warmup iterations before temporal early exit.
+   */
+  std::size_t temporal_min_iter() const { return temporal_min_iter_; }
+
+  /**
+   * @brief Return whether the multi-chain controller may stop warmup
+   * before the budget (W-31).
+   *
+   * When false (the DEFAULT), the controller never stops warmup early:
+   * the only stop is the `max_iter` budget, and `AdaptResult` reports
+   * `exit_iter == max_iter`, `early_exit == false`. This is the safe
+   * default: the cross-chain criteria with their default tolerances
+   * (mass 1.0 / step 0.1, temporal gate off) can hold at iteration
+   * 50-80 with good inits while warmup would still materially improve
+   * the frozen sampler (measured: hier_2pl bulk-ESS-min 519 -> 61, and
+   * even the temporal 2-window gate at tol 0.05 degraded it 519 -> 126;
+   * no cheap tolerance-based gate preserved quality in the W-25/W-28
+   * grids). Embedders who want the controller's convergence-based early
+   * exit must opt in explicitly via `WarmupConfigBuilder::allow_early_exit`,
+   * taking responsibility for the tolerances they set.
+   *
+   * @return Whether convergence-based early exit is enabled.
+   */
+  bool allow_early_exit() const { return allow_early_exit_; }
+
+  /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
-   * @return The stride for publishing updates for convergence monitoring.
+   * @return The stride for publishing updates.
    */
   std::size_t publish_stride() const { return publish_stride_; }
 
@@ -831,6 +951,9 @@ class WarmupConfig {
   double metric_stall_reset_ = 0.0;
   std::size_t metric_stall_window_ = 100;
   double mass_init_clamp_ = 0.0;
+  std::size_t mass_init_buffer_ = 0;  // W-54 arm A: 0 = off
+  double grad_clip_scale_ = 0.0;      // W-54 arm B: 0 = off
+  std::size_t grad_clip_iters_ = 200;
   std::size_t metric_basis_ = 0;  // 0=svd 1=power 2=muon 3=muoneq
   std::size_t anti_windup_pass_rate_ = 0;
   std::size_t drift_iters_ = 0;
@@ -842,6 +965,10 @@ class WarmupConfig {
   std::size_t max_error_schedule_iters_ = 0;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
+  double temporal_step_drift_tol_ = 0.0;  // 0 = temporal gate off
+  std::size_t temporal_window_ = 50;
+  std::size_t temporal_min_iter_ = 200;
+  bool allow_early_exit_ = false;  // W-31: early exit is opt-in
 };
 
 /**
@@ -1106,6 +1233,47 @@ class WarmupConfigBuilder {
     return *this;
   }
 
+  /**
+   * Set the init-buffer length for mass adaptation (W-54 arm A).
+   *
+   * @param[in] v Number of leading warmup iterations to hold the mass
+   * at identity and skip estimator feeding (0 = off, the default).
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& mass_init_buffer(std::size_t v) {
+    cfg_.mass_init_buffer_ = v;
+    return *this;
+  }
+
+  /**
+   * Set the soft gradient-clipping scale for the adapter's score
+   * stream (W-54 arm B). The clip is g' = c * asinh(g / c), applied to
+   * the mass estimator's score observations only.
+   *
+   * @param[in] v The clipping scale c in gradient units (0 = off, the
+   * default; thread values 1e10 / 1e8).
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& grad_clip_scale(double v) {
+    if (!(v >= 0.0)) {
+      throw std::invalid_argument("grad_clip_scale must be >= 0");
+    }
+    cfg_.grad_clip_scale_ = v;
+    return *this;
+  }
+
+  /**
+   * Set the warmup-only window length for the soft gradient clip
+   * (W-54 arm B; default 200).
+   *
+   * @param[in] v The clipping window in warmup iterations.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& grad_clip_iters(std::size_t v) {
+    cfg_.grad_clip_iters_ = v;
+    return *this;
+  }
+
   WarmupConfigBuilder& metric_stall_reset(double v,
                                           std::size_t window = 100) {
     if (v < 0) {
@@ -1192,6 +1360,67 @@ class WarmupConfigBuilder {
   WarmupConfigBuilder& yield_period(std::size_t v) {
     detail::validate_positive(v, "yield_period");
     cfg_.yield_period_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the temporal step-size drift tolerance for early exit.
+   *
+   * @param[in] v The tolerance (0 = gate off; e.g. 0.05).
+   * @return This builder for chaining.
+   * @throw std::invalid_argument If the tolerance is negative.
+   */
+  WarmupConfigBuilder& temporal_step_drift_tol(double v) {
+    if (v < 0) {
+      throw std::invalid_argument(
+          "temporal_step_drift_tol must be >= 0 (0 = off)");
+    }
+    cfg_.temporal_step_drift_tol_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the window length for the temporal step-drift gate.
+   *
+   * @param[in] v The window in warmup iterations.
+   * @return This builder for chaining.
+   * @throw std::invalid_argument If the window is not positive.
+   */
+  WarmupConfigBuilder& temporal_window(std::size_t v) {
+    detail::validate_positive(v, "temporal_window");
+    cfg_.temporal_window_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the minimum iteration for the temporal step-drift gate.
+   *
+   * @param[in] v The minimum warmup iterations before temporal early exit.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& temporal_min_iter(std::size_t v) {
+    cfg_.temporal_min_iter_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Allow the multi-chain controller to stop warmup before the
+   * budget on its cross-chain criteria (W-31; opt-in).
+   *
+   * OFF by default: the default cross-chain tolerances (mass 1.0 /
+   * step 0.1, temporal gate off) stop warmup at iteration 50-80 with
+   * good initializations and destroy post-warmup quality on the
+   * marginal model class, and no tolerance-based gate tested preserved
+   * quality (W-25/W-28). With this flag false the controller runs
+   * warmup to the full `max_iter` budget; the convergence criteria
+   * (and the temporal gate) are only consulted — and may only stop
+   * warmup — when it is true. See `WarmupConfig::allow_early_exit`.
+   *
+   * @param[in] v Whether convergence-based early exit is allowed.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& allow_early_exit(bool v) {
+    cfg_.allow_early_exit_ = v;
     return *this;
   }
 

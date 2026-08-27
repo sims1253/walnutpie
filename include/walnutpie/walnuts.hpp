@@ -18,6 +18,7 @@
 #include "walnutpie/util.hpp"
 #include "walnutpie/validate.hpp"
 #include "walnutpie/low_rank_mass.hpp"
+#include "walnutpie/pin_trace.hpp"
 
 namespace walnutpie::detail {
 
@@ -272,8 +273,11 @@ static bool reversible(const F& logp_grad, const Eigen::VectorXd& inv_mass,
     grad_next = grad;
     num_steps /= 2;
     step *= 2;
-    if (within_tolerance(logp_grad, inv_mass, step, num_steps, max_error,
-                         logp_next, theta_next, rho_next, grad_next)) {
+    bool within_tol = within_tolerance(logp_grad, inv_mass, step, num_steps,
+                                       max_error, logp_next, theta_next,
+                                       rho_next, grad_next);
+    pin_trace::observe_ladder(within_tol, num_steps);  // W-43: no-op off
+    if (within_tol) {
       return false;
     }
   }
@@ -321,6 +325,7 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
       is_forward ? span.grad_theta_fw_ : span.grad_theta_bk_;
   double logp = is_forward ? span.logp_fw_ : span.logp_bk_;
   step = is_forward ? step : -step;
+  pin_trace::observe_macro_step();                  // W-43: env-gated, no-op off
   for (std::size_t num_steps = min_micro_steps, halvings = 0;
        halvings < max_step_halvings; ++halvings, num_steps *= 2, step *= 0.5) {
     theta_next = theta;
@@ -334,6 +339,8 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
       rho_next += half_step * grad_next;
     }
     logp_next = logp_pos_next + logp_momentum(rho_next, inv_mass);
+    pin_trace::observe_attempt(std::fabs(logp - logp_next),
+                               num_steps);  // W-43: env-gated, no-op off
     if (num_steps == min_micro_steps) {
       double min_accept = std::exp(-std::fabs(logp - logp_next));
       if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_ALPHA")) {
@@ -345,13 +352,19 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
                     << " macro_step=" << std::fabs(step) << std::endl;
         }
       }
+      pin_trace::observe_min_attempt(min_accept, logp - logp_next,
+                                     std::fabs(step));  // W-43: no-op off
       adapt_handler(min_accept);
     }
     if (std::fabs(logp - logp_next) <= max_error) {
-      return reversible(logp_grad, inv_mass, step, num_steps, min_micro_steps,
-                        max_error, logp_next, theta_next, rho_next, grad_next);
+      bool reversible_ok =
+          reversible(logp_grad, inv_mass, step, num_steps, min_micro_steps,
+                     max_error, logp_next, theta_next, rho_next, grad_next);
+      pin_trace::observe_outcome(reversible_ok, halvings);  // W-43
+      return reversible_ok;
     }
   }
+  pin_trace::observe_exhausted();  // W-43: env-gated, no-op off
   return false;
 }
 
@@ -526,6 +539,11 @@ static std::optional<SpanW> build_span(Random<RNG>& rng, const F& logp_grad,
  * @param[out] theta_grad The gradient of the log density at the previous state.
  * @param[out] logp_pos_select The log density of the selected position.
  * @param[in,out] step_size_adapter The step-size adaptation handler.
+ * @param[in] grad_cached If non-empty and the same size as `theta`, the
+ * gradient of the log density at `theta` computed by the previous
+ * transition (endpoint reuse); the start-position re-evaluation is skipped.
+ * @param[in] logp_cached The log density at `theta` corresponding to
+ * `grad_cached` (only used when the cache is valid).
  * @return The next position in the Markov chain.
  */
 template <LogpGrad F, class Rand, StepSizeAdapter A>
@@ -535,12 +553,25 @@ inline Eigen::VectorXd transition_w(
     std::size_t max_step_halvings, std::size_t min_micro_steps,
     double max_error, Eigen::VectorXd&& theta, std::size_t& depth,
     Eigen::VectorXd& theta_grad, double& logp_pos_select,
-    A& step_size_adapter) {
+    A& step_size_adapter, const Eigen::VectorXd& grad_cached = Eigen::VectorXd(),
+    double logp_cached = -std::numeric_limits<double>::infinity()) {
+  pin_trace::begin_transition();     // W-43: env-gated, no-op off
   auto z = rand.standard_normal(chol_mass.size());
   Eigen::VectorXd rho = (chol_mass.array() * z.array()).matrix();
-  Eigen::VectorXd grad(theta.size());
+  pin_trace::observe_step(step);  // W-43: env-gated, no-op off (macro step used)
+  pin_trace::observe_z(z.norm());  // W-43: env-gated, no-op off (momentum draw)
+  Eigen::VectorXd grad;
   double logp_pos;
-  logp_grad(theta, logp_pos, grad);
+  if (grad_cached.size() == theta.size()) {
+    // W-23 endpoint-gradient threading: the previous transition ended at this
+    // exact position and already computed its (logp, grad); reusing the
+    // identical doubles changes no downstream arithmetic.
+    grad = grad_cached;
+    logp_pos = logp_cached;
+  } else {
+    grad.resize(theta.size());
+    logp_grad(theta, logp_pos, grad);
+  }
   double logp_joint = logp_pos + logp_momentum(rho, inv_mass);
   auto span_accum = SpanW::from_initial_point(
       std::move(theta), std::move(rho), std::move(grad), logp_pos, logp_joint);
@@ -641,8 +672,11 @@ static bool reversible_lr(const F& logp_grad, const detail::LowRankMass& lrm,
     grad_next = grad;
     num_steps /= 2;
     step *= 2;
-    if (within_tolerance_lr(logp_grad, lrm, step, num_steps, max_error,
-                            logp_next, theta_next, rho_next, grad_next)) {
+    bool within_tol = within_tolerance_lr(logp_grad, lrm, step, num_steps,
+                                          max_error, logp_next, theta_next,
+                                          rho_next, grad_next);
+    pin_trace::observe_ladder(within_tol, num_steps);  // W-43: no-op off
+    if (within_tol) {
       return false;
     }
   }
@@ -673,6 +707,7 @@ static bool macro_step_lr(const F& logp_grad, const detail::LowRankMass& lrm,
       is_forward ? span.grad_theta_fw_ : span.grad_theta_bk_;
   double logp = is_forward ? span.logp_fw_ : span.logp_bk_;
   step = is_forward ? step : -step;
+  pin_trace::observe_macro_step();                  // W-43: env-gated, no-op off
   for (std::size_t num_steps = min_micro_steps, halvings = 0;
        halvings < max_step_halvings; ++halvings, num_steps *= 2, step *= 0.5) {
     theta_next = theta;
@@ -686,16 +721,24 @@ static bool macro_step_lr(const F& logp_grad, const detail::LowRankMass& lrm,
       rho_next += half_step * grad_next;
     }
     logp_next = logp_pos_next + lrm.logp_momentum(rho_next);
+    pin_trace::observe_attempt(std::fabs(logp - logp_next),
+                               num_steps);  // W-43: env-gated, no-op off
     if (num_steps == min_micro_steps) {
       double min_accept = std::exp(-std::fabs(logp - logp_next));
+      pin_trace::observe_min_attempt(min_accept, logp - logp_next,
+                                     std::fabs(step));  // W-43: no-op off
       adapt_handler(min_accept);
     }
     if (std::fabs(logp - logp_next) <= max_error) {
-      return reversible_lr(logp_grad, lrm, step, num_steps, min_micro_steps,
-                           max_error, logp_next, theta_next, rho_next,
-                           grad_next);
+      bool reversible_ok = reversible_lr(logp_grad, lrm, step, num_steps,
+                                         min_micro_steps, max_error,
+                                         logp_next, theta_next, rho_next,
+                                         grad_next);
+      pin_trace::observe_outcome(reversible_ok, halvings);  // W-43
+      return reversible_ok;
     }
   }
+  pin_trace::observe_exhausted();  // W-43: env-gated, no-op off
   return false;
 }
 
@@ -757,14 +800,24 @@ inline Eigen::VectorXd transition_w_lr(
     std::size_t max_depth, std::size_t max_step_halvings,
     std::size_t min_micro_steps, double max_error, Eigen::VectorXd&& theta,
     std::size_t& depth, Eigen::VectorXd& theta_grad, double& logp_pos_select,
-    A& step_size_adapter) {
+    A& step_size_adapter, const Eigen::VectorXd& grad_cached = Eigen::VectorXd(),
+    double logp_cached = -std::numeric_limits<double>::infinity()) {
+  pin_trace::begin_transition();     // W-43: env-gated, no-op off
   // Momentum refresh via the exact low-rank Cholesky identity, using the
   // shared normal stream (z) for reproducibility with the diagonal path.
   Eigen::VectorXd z = rand.standard_normal(lrm.D.size()).matrix();
   Eigen::VectorXd rho = lrm.sample_momentum_from(z);
-  Eigen::VectorXd grad(theta.size());
+  pin_trace::observe_step(step);   // W-43: env-gated, no-op off
+  pin_trace::observe_z(z.norm());  // W-43: env-gated, no-op off
+  Eigen::VectorXd grad;
   double logp_pos;
-  logp_grad(theta, logp_pos, grad);
+  if (grad_cached.size() == theta.size()) {
+    grad = grad_cached;
+    logp_pos = logp_cached;
+  } else {
+    grad.resize(theta.size());
+    logp_grad(theta, logp_pos, grad);
+  }
   double logp_joint = logp_pos + lrm.logp_momentum(rho);
   auto span_accum = SpanW::from_initial_point(
       std::move(theta), std::move(rho), std::move(grad), logp_pos, logp_joint);
@@ -913,16 +966,31 @@ class WalnutsSampler {
           rand_, logp_grad_.logp_grad_, lrm_, macro_time_, max_nuts_depth_,
           max_step_halvings_, min_micro_steps_, max_error_,
           std::move(theta_), depth, grad_next, logp_pos,
-          no_op_step_size_adapter_);
+          no_op_step_size_adapter_, cached_grad_, cached_logp_);
     } else {
       theta_ = transition_w(rand_, logp_grad_, inv_mass_, cholesky_mass_,
                             macro_time_, max_nuts_depth_, max_step_halvings_,
                             min_micro_steps_, max_error_, std::move(theta_),
                             depth, grad_next, logp_pos,
-                            no_op_step_size_adapter_);
+                            no_op_step_size_adapter_, cached_grad_,
+                            cached_logp_);
     }
+    // Cache the endpoint (grad, logp) so the next transition's start-position
+    // evaluation reuses them (W-23 endpoint-gradient threading).
+    cached_grad_ = std::move(grad_next);
+    cached_logp_ = logp_pos;
     sample_handler_.get().on_sample(theta_, logp_pos);
     return logp_pos;
+  }
+
+  /**
+   * @brief Seed the endpoint cache (e.g. from the final warmup transition at
+   * the freeze boundary) so the first sampling transition skips its
+   * start-position re-evaluation.
+   */
+  void seed_endpoint_cache(Eigen::VectorXd grad, double logp) {
+    cached_grad_ = std::move(grad);
+    cached_logp_ = logp;
   }
 
   /**
@@ -1019,6 +1087,12 @@ class WalnutsSampler {
 
   /** Optional low-rank mass operator (empty U => pure diagonal). */
   detail::LowRankMass lrm_{};
+
+  /** Cached endpoint gradient at `theta_` from the last transition (W-23). */
+  Eigen::VectorXd cached_grad_;
+
+  /** Cached endpoint log density at `theta_` from the last transition. */
+  double cached_logp_ = -std::numeric_limits<double>::infinity();
 };
 
 }  // namespace walnutpie

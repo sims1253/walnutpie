@@ -3,7 +3,10 @@
 #include <walnutpie/warmup_heuristics.hpp>
 
 #include <CLI/CLI.hpp>
+#include <algorithm>
 #include <fstream>
+#include <memory>
+#include <utility>
 #include <vector>
 #include <Eigen/Dense>
 
@@ -19,6 +22,81 @@
 
 using walnutpie::DynamicStanModel;
 using walnutpie::unique_bs_rng;
+
+// W-77: env-gated init screen (WALNUTPIE_INIT_SCREEN=1). At chain start,
+// evaluate logp_grad at the initial position; on a thrown exception OR a
+// non-finite logp, retry up to 10 fresh random inits (the same
+// DynamicStanModel::initialize mechanism used without --init-file); if all
+// fail, exit loudly naming model, init source, and last error.
+//
+// Observable-behavior note (load_stan.hpp): BridgeStan evaluation errors
+// are NOT propagated as C++ exceptions by DynamicStanModel::logp_grad —
+// they are mapped to logp = -inf with grad zeroed, after printing
+//   "Error in logp_grad: <bridge stan error>" to stderr.
+// Only a missing error message (ret != 0, err == nullptr) throws. So at
+// this CLI layer "model threw" is observable as (a) those stderr lines
+// plus (b) non-finite logp; both cases funnel into the same screen below,
+// which triggers on either condition. The synthetic throw-at-init check
+// (gate d) therefore exercises the error-mapped path and asserts the loud
+// exit plus the stderr error lines.
+
+static bool init_screen_enabled() {
+  const char* v = std::getenv("WALNUTPIE_INIT_SCREEN");
+  return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+}
+
+// Returns true when logp at x is finite; fills err_detail on failure.
+static bool finite_logp_at(const DynamicStanModel& model,
+                           const Eigen::VectorXd& x, std::string& err_detail) {
+  double logp = 0.0;
+  Eigen::VectorXd grad;
+  try {
+    model.logp_grad(x, logp, grad);
+  } catch (const std::exception& e) {
+    err_detail = std::string("logp_grad threw: ") + e.what();
+    return false;
+  }
+  if (!std::isfinite(logp)) {
+    err_detail = "non-finite logp = " + std::to_string(logp);
+    return false;
+  }
+  return true;
+}
+
+// Screen one chain's initial position; on failure retry up to n_retries
+// fresh random inits drawn from rng (must be the chain's own stream so a
+// passing run consumes identical RNG draws as an unscreened run).
+static Eigen::VectorXd screened_init(DynamicStanModel& model,
+                                     unique_bs_rng& rng, double init_radius,
+                                     Eigen::VectorXd first_pos,
+                                     const std::string& source_desc,
+                                     bool screen_on) {
+  if (!screen_on) {
+    return first_pos;
+  }
+  constexpr std::size_t kMaxRetries = 10;
+  std::string last_err;
+  if (finite_logp_at(model, first_pos, last_err)) {
+    return first_pos;
+  }
+  std::cerr << "[init-screen] initial point failed: " << source_desc << " ("
+            << last_err << "); retrying with up to " << kMaxRetries
+            << " random inits" << std::endl;
+  for (std::size_t attempt = 1; attempt <= kMaxRetries; ++attempt) {
+    Eigen::VectorXd pos = model.initialize(nullptr, rng, init_radius);
+    if (finite_logp_at(model, pos, last_err)) {
+      std::cerr << "[init-screen] random init attempt " << attempt
+                << " produced a finite-logp start" << std::endl;
+      return pos;
+    }
+  }
+  std::cerr << "INIT SCREEN FAILURE: model could not be initialized.\n"
+            << "  init source: " << source_desc << "\n"
+            << "  attempts: initial + " << kMaxRetries << " random retries\n"
+            << "  last error: " << last_err << "\n"
+            << "Refusing to run a dead chain; exiting." << std::endl;
+  std::exit(EXIT_FAILURE);
+}
 
 static void summarize(const std::vector<std::string>& names,
                       const Eigen::MatrixXd& draws) {
@@ -220,10 +298,9 @@ class StanHandler {
 
   void on_warmup(const Eigen::VectorXd& position, double lp, double step_size,
                  const Eigen::VectorXd& diag_inv_mass) {
-    static std::size_t it = 0;
     if (const char* dbg = std::getenv("WALNUTPIE_DEBUG_WARMUP")) {
-      if (it % std::max(1, atoi(dbg)) == 0) {
-        std::cout << "[warmup it " << it << "] lp=" << lp
+      if (warmup_dbg_it_ % std::max(1, atoi(dbg)) == 0) {
+        std::cout << "[warmup it " << warmup_dbg_it_ << "] lp=" << lp
                   << " step=" << step_size
                   << " invm[0]=" << (diag_inv_mass.size() ? diag_inv_mass[0] : -1)
                   << " pos[0]=" << (position.size() ? position[0] : 0)
@@ -231,7 +308,47 @@ class StanHandler {
                   << std::endl;
       }
     }
-    ++it;
+    // W-43: per-iteration pin-diagnosis trace (env-gated, zero behavior).
+    // Reads this iteration's pin_trace scratch (filled by the transition
+    // that just ran) and prints one record per warmup iteration.
+    if (walnutpie::detail::pin_trace::on()) {
+      if (trace_init_.size() == 0) {
+        trace_init_ = position;
+      }
+      const double invm_geo =
+          diag_inv_mass.size()
+              ? std::exp(diag_inv_mass.array().log().mean())
+              : -1.0;
+      const double invm_min =
+          diag_inv_mass.size() ? diag_inv_mass.minCoeff() : -1.0;
+      const double invm_max =
+          diag_inv_mass.size() ? diag_inv_mass.maxCoeff() : -1.0;
+      const Eigen::VectorXd drift = position - trace_init_;
+      const bool moved =
+          trace_prev_.size() == position.size() &&
+          (trace_prev_.array() != position.array()).any();
+      std::cout << "[pin-trace] it=" << warmup_dbg_it_ << " lp=" << lp
+                << " step=" << step_size << " invm_geo=" << invm_geo
+                << " invm_min=" << invm_min << " invm_max=" << invm_max
+                << " pos_l2=" << drift.norm()
+                << " pos_max=" << drift.cwiseAbs().maxCoeff()
+                << " moved=" << (moved ? 1 : 0)
+                << " macro=" << walnutpie::detail::pin_trace::macro_steps
+                << " attempts=" << walnutpie::detail::pin_trace::attempts
+                << " evals=" << walnutpie::detail::pin_trace::evals
+                << " znorm=" << walnutpie::detail::pin_trace::z_norm
+                << " alpha=" << walnutpie::detail::pin_trace::alpha
+                << " dlogp=" << walnutpie::detail::pin_trace::dlogp
+                << " mindh=" << walnutpie::detail::pin_trace::min_abs_dh
+                << " tolpass="
+                << (walnutpie::detail::pin_trace::tol_pass_any ? 1 : 0)
+                << " hacc=" << walnutpie::detail::pin_trace::h_accept
+                << " ladrej=" << walnutpie::detail::pin_trace::ladder_rejects
+                << " exhaust=" << walnutpie::detail::pin_trace::exhausted
+                << std::endl;
+      trace_prev_ = position;
+    }
+    ++warmup_dbg_it_;
     if (!save_warmup_) {
       return;
     }
@@ -264,6 +381,9 @@ class StanHandler {
   Eigen::MatrixXd draws_;
   bool save_warmup_;
   Eigen::Index n_ = 0;
+  std::size_t warmup_dbg_it_ = 0;
+  Eigen::VectorXd trace_init_;  // W-43: first traced warmup position
+  Eigen::VectorXd trace_prev_;  // W-43: previous traced warmup position
 };
 
 template <typename Opt>
@@ -291,6 +411,16 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
     std::cout << "logp_grad fraction: " << logp_time / global_total_time
               << std::endl;
     std::cout << "        logp_grad calls: " << logp_count << std::endl;
+    // W-61: forward vs backward-ladder gradient split (pin-trace totals).
+    if (walnutpie::detail::pin_trace::on()) {
+      const auto fwd = walnutpie::detail::pin_trace::total_evals_forward;
+      const auto lad = walnutpie::detail::pin_trace::total_evals_ladder;
+      std::cout << "        w61 forward evals: " << fwd
+                << " ladder evals: " << lad << " ladder fraction: "
+                << (fwd + lad > 0 ? static_cast<double>(lad) / (fwd + lad)
+                                  : 0.0)
+                << std::endl;
+    }
     std::cout << "        time per call: " << logp_time / logp_count << "s"
               << std::endl;
     std::cout << std::endl;
@@ -438,6 +568,381 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   return storage;
 }
 
+// W-25: multi-chain mode driving the LIBRARY warmup controller
+// (walnutpie::detail::adapt_with_stats), which supports cross-chain early
+// exit plus the temporal step-drift gate. One BridgeStan model instance,
+// one mt19937_64 stream, and one StanHandler per chain (BridgeStan model
+// instances are not thread-safe; a shared std::normal_distribution across
+// streams is not reproducible). Seeding replicates the single-chain CLI
+// invoked once per chain with --seed (seed + c), so a full-warmup
+// multi-chain run consumes the same per-chain RNG streams.
+struct NullInterrupt {
+  void throw_if_interrupted() const {}
+};
+
+// W-28: recording-only handler for pilot-burst draws. Pilot draws are
+// diagnostics only — they never reach the output draws (the real handlers
+// are untouched, so their GQ rng streams stay bit-identical to a no-pilot
+// run at the same exit point).
+struct PilotSampleHandler {
+  std::vector<double> lp;
+  void on_sample(const Eigen::VectorXd& /*position*/, double logp) {
+    lp.push_back(logp);
+  }
+  void on_logp_exception(const Eigen::VectorXd& position,
+                         const std::exception& exn) const noexcept {
+    std::cout << "Pilot logp failed with exception " << exn.what() << " at "
+              << position.transpose() << "\n";
+  }
+};
+
+// W-28 pre-registered gate statistics on the per-chain pilot lp draws:
+// 1) per-chain lag-1 autocorrelation with the biased (ML) autocovariance
+//    estimator: mean = (1/P) sum lp; c0 = (1/P) sum (lp-mean)^2;
+//    c1 = (1/P) sum_{n=0..P-2} (lp_n-mean)(lp_{n+1}-mean); rho1 = c1/c0
+//    (c0 <= 0 -> rho1 := 1, i.e. a frozen chain fails).
+// 2) split-half cross-chain R-hat proxy (NOT rank-normalized; 50 draws is
+//    too few): each chain's P draws split into first/last P/2 -> J = 2M
+//    half-chains of n_h = P/2; W = mean half-chain sample variance (ddof=1);
+//    B = n_h/(J-1) * sum (mean_j - grand)^2;
+//    var_plus = (n_h-1)/n_h * W + B/n_h; Rhat = sqrt(var_plus/W)
+//    (W <= 0 -> Rhat := +inf, fail).
+struct PilotStats {
+  double rho1_max;
+  double rhat_lp;
+  bool pass;
+};
+
+static PilotStats pilot_gate_stats(
+    const std::vector<std::vector<double>>& chain_lps, double rho1_tol,
+    double rhat_tol) {
+  double rho1_max = -std::numeric_limits<double>::infinity();
+  for (const auto& lp : chain_lps) {
+    const std::size_t p = lp.size();
+    if (p < 2) {
+      rho1_max = std::numeric_limits<double>::infinity();
+      continue;
+    }
+    double mean = 0.0;
+    for (double x : lp) {
+      mean += x;
+    }
+    mean /= static_cast<double>(p);
+    double c0 = 0.0;
+    double c1 = 0.0;
+    for (std::size_t n = 0; n < p; ++n) {
+      c0 += (lp[n] - mean) * (lp[n] - mean);
+      if (n + 1 < p) {
+        c1 += (lp[n] - mean) * (lp[n + 1] - mean);
+      }
+    }
+    c0 /= static_cast<double>(p);
+    c1 /= static_cast<double>(p);
+    const double rho1 = c0 > 0.0 ? c1 / c0 : 1.0;
+    rho1_max = std::max(rho1_max, rho1);
+  }
+  // Split-half R-hat over J half-chains of length n_h.
+  const std::size_t n_h = chain_lps[0].size() / 2;
+  double w_sum = 0.0;
+  double mean_sum = 0.0;
+  std::size_t j = 0;
+  for (const auto& lp : chain_lps) {
+    for (std::size_t half = 0; half < 2; ++half) {
+      double m = 0.0;
+      for (std::size_t n = 0; n < n_h; ++n) {
+        m += lp[half * n_h + n];
+      }
+      m /= static_cast<double>(n_h);
+      double s2 = 0.0;
+      for (std::size_t n = 0; n < n_h; ++n) {
+        s2 += (lp[half * n_h + n] - m) * (lp[half * n_h + n] - m);
+      }
+      s2 /= static_cast<double>(n_h - 1);
+      w_sum += s2;
+      mean_sum += m;
+      ++j;
+    }
+  }
+  const double w = w_sum / static_cast<double>(j);
+  const double grand = mean_sum / static_cast<double>(j);
+  double b_sum = 0.0;
+  for (const auto& lp : chain_lps) {
+    for (std::size_t half = 0; half < 2; ++half) {
+      double m = 0.0;
+      for (std::size_t n = 0; n < n_h; ++n) {
+        m += lp[half * n_h + n];
+      }
+      m /= static_cast<double>(n_h);
+      b_sum += (m - grand) * (m - grand);
+    }
+  }
+  const double b =
+      static_cast<double>(n_h) / static_cast<double>(j - 1) * b_sum;
+  const double var_plus =
+      static_cast<double>(n_h - 1) / static_cast<double>(n_h) * w +
+      b / static_cast<double>(n_h);
+  const double rhat =
+      w > 0.0 ? std::sqrt(var_plus / w)
+              : std::numeric_limits<double>::infinity();
+  return {rho1_max, rhat, rho1_max <= rho1_tol && rhat < rhat_tol};
+}
+
+struct ChainTiming {
+  double logp_time = 0.0;
+  std::size_t logp_count = 0;
+};
+
+static auto make_timed_logp(DynamicStanModel& model, ChainTiming& t) {
+  using Clock = std::chrono::high_resolution_clock;
+  return [&model, &t](auto&&... args) {
+    auto start = Clock::now();
+    model.logp_grad(args...);
+    t.logp_time +=
+        std::chrono::duration<double>(Clock::now() - start).count();
+    ++t.logp_count;
+  };
+}
+
+template <typename Opt>
+void run_walnuts_multi(
+    const std::string& lib, const std::string& data, unsigned int seed,
+    std::size_t chains, std::size_t num_warmup, std::size_t num_draws,
+    bool save_warmup, const walnutpie::WarmupConfig& warmup_cfg,
+    const walnutpie::SamplingConfig& sample_cfg, double init_radius,
+    double step_size_init, const std::string& init_pattern,
+    const std::string& out_pattern, std::size_t pilot_burst,
+    double pilot_rho1_max, double pilot_rhat_max, bool serial_exec,
+    bool init_screen) {
+  using Clock = std::chrono::high_resolution_clock;
+  using LogpT = decltype(make_timed_logp(std::declval<DynamicStanModel&>(),
+                                         std::declval<ChainTiming&>()));
+  using RNG = std::mt19937_64;
+  using Adapter =
+      walnutpie::AdaptiveWalnuts<LogpT, RNG, StanHandler, Opt>;
+  using Sampler = walnutpie::WalnutsSampler<LogpT, RNG, StanHandler>;
+
+  auto elapsed = [](auto t) {
+    return std::chrono::duration<double>(Clock::now() - t).count();
+  };
+  auto print_stanza = [&](std::size_t c, double total, ChainTiming& t) {
+    std::cout << "chain " << c << "    total time: " << total << "s"
+              << std::endl;
+    std::cout << "chain " << c << " logp_grad time: " << t.logp_time << "s"
+              << std::endl;
+    std::cout << "chain " << c << " logp_grad fraction: "
+              << t.logp_time / total << std::endl;
+    std::cout << "chain " << c << "     logp_grad calls: " << t.logp_count
+              << std::endl;
+    std::cout << "chain " << c << "     time per call: "
+              << t.logp_time / t.logp_count << "s" << std::endl;
+    std::cout << std::endl;
+  };
+
+  auto global_start = Clock::now();
+
+  // One model + timing + timed logp per chain (models are heap-stable).
+  std::vector<std::unique_ptr<DynamicStanModel>> models;
+  std::vector<ChainTiming> timing;
+  std::vector<LogpT> logps;
+  models.reserve(chains);
+  timing.reserve(chains);
+  logps.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    models.emplace_back(
+        std::make_unique<DynamicStanModel>(lib.c_str(), data.c_str(),
+                                           seed + static_cast<unsigned>(c)));
+    timing.emplace_back();
+    logps.push_back(
+        make_timed_logp(*models.back(), timing.back()));
+  }
+
+  // Initial positions per chain, replicating the single-chain CLI
+  // (--init-file wins; else model.initialize with the model's rng).
+  std::vector<Eigen::VectorXd> positions;
+  positions.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    // W-77: keep the chain's init rng alive so the init screen's random
+    // retries draw from the same stream as an unscreened no-init-file run.
+    auto mrng = models[c]->make_rng(seed + static_cast<unsigned>(c));
+    if (!init_pattern.empty()) {
+      std::string f = init_pattern;
+      f.replace(f.find("{c}"), 3, std::to_string(c));
+      std::ifstream in(f);
+      if (!in) {
+        throw std::invalid_argument("cannot open init file: " + f);
+      }
+      std::vector<double> vals;
+      double v;
+      while (in >> v) {
+        vals.push_back(v);
+      }
+      if (vals.size() !=
+          static_cast<std::size_t>(models[c]->unconstrained_dimensions())) {
+        throw std::invalid_argument("init file dimension mismatch: " + f);
+      }
+      positions.emplace_back(screened_init(
+          *models[c], mrng, init_radius,
+          Eigen::VectorXd::Map(vals.data(), vals.size()),
+          "model " + lib + ", chain " + std::to_string(c)
+              + " (--init-file " + f + ")",
+          init_screen));
+    } else {
+      positions.push_back(
+          screened_init(*models[c], mrng, init_radius,
+                        models[c]->initialize(nullptr, mrng, init_radius),
+                        "model " + lib + ", chain "
+                            + std::to_string(c) + " (random --init "
+                            + std::to_string(init_radius) + ")",
+                        init_screen));
+    }
+  }
+
+  // Mass seeding via any chain's logp (deterministic; identical values).
+  auto init_cfg =
+      walnutpie::InitConfigBuilder{
+          chains, static_cast<std::size_t>(positions[0].size())}
+          .step_sizes(step_size_init)
+          .positions(std::move(positions))
+          .masses(logps[0], warmup_cfg.mass_additive_smoothing(), false, 0.0)
+          .build();
+
+  std::vector<RNG> rngs;
+  rngs.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    rngs.emplace_back(seed + static_cast<unsigned>(c));
+  }
+  std::vector<StanHandler> handlers;
+  handlers.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    handlers.emplace_back(*models[c], seed + static_cast<unsigned>(c),
+                          num_warmup, num_draws, save_warmup);
+  }
+  std::vector<Adapter> adapters;
+  adapters.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    adapters.emplace_back(rngs[c], handlers[c], logps[c],
+                          init_cfg.init_chain_config(c), warmup_cfg,
+                          sample_cfg);
+  }
+
+  NullInterrupt interrupt;
+  const walnutpie::detail::ChainExec exec =
+      serial_exec ? walnutpie::detail::ChainExec::Serial
+                  : walnutpie::detail::ChainExec::Threads;
+  std::cout << "chain exec: " << (serial_exec ? "serial" : "threads")
+            << std::endl;
+  // W-28 pilot-burst gate: at each candidate early exit, run pilot_burst
+  // draws per chain on the would-be-frozen sampler (separate RNG streams,
+  // recording-only handlers — saved draws and the chains' sampling RNG
+  // streams are untouched) and approve the exit only when the pilot's lp
+  // mixing statistics pass. A veto resumes warmup from the preserved
+  // adapter state (adapt_with_pilot).
+  std::size_t pilot_checks = 0;
+  auto pilot_gate_fn = [&](std::vector<Adapter>& adapters,
+                           std::size_t cand_iter) -> bool {
+    std::vector<std::vector<double>> pilot_lps(chains);
+    auto run_pilot_chain = [&](std::size_t c) {
+      walnutpie::detail::interactive_qos();
+      // Read-only snapshot of the frozen tuning + position (sampler()
+      // does not mutate the adapter or advance any rng). The pilot runs
+      // on its own rng stream: 7919*(c+1) offsets cannot collide with
+      // the warmup streams (seed + c, c < chains << 7919). Diagonal
+      // metric only (the CLI study path; --metric-rank --metric-full is
+      // not piloted).
+      auto src = adapters[c].sampler();
+      RNG prng(seed + 7919u * static_cast<unsigned int>(c + 1));
+      PilotSampleHandler ph;
+      walnutpie::WalnutsSampler<LogpT, RNG, PilotSampleHandler> pilot(
+          prng, ph, logps[c], src.position(), src.inv_mass(),
+          src.macro_time(), sample_cfg.max_trajectory_doublings(),
+          sample_cfg.max_step_halvings(), adapters[c].min_micro_steps(),
+          src.max_error());
+      for (std::size_t n = 0; n < pilot_burst; ++n) {
+        pilot();
+      }
+      pilot_lps[c] = std::move(ph.lp);
+    };
+    if (serial_exec) {
+      for (std::size_t c = 0; c < chains; ++c) {
+        run_pilot_chain(c);
+      }
+    } else {
+      std::vector<std::jthread> ts;
+      ts.reserve(chains);
+      for (std::size_t c = 0; c < chains; ++c) {
+        ts.emplace_back([&, c]() { run_pilot_chain(c); });
+      }
+    }
+    ++pilot_checks;
+    const PilotStats st =
+        pilot_gate_stats(pilot_lps, pilot_rho1_max, pilot_rhat_max);
+    std::cout << "pilot check " << pilot_checks << " at iter " << cand_iter
+              << ": rho1_max=" << st.rho1_max << " rhat_lp=" << st.rhat_lp
+              << " -> " << (st.pass ? "approve" : "resume") << std::endl;
+    return st.pass;
+  };
+  walnutpie::detail::AdaptResult ar =
+      pilot_burst > 0
+          ? walnutpie::detail::adapt_with_pilot(init_cfg, warmup_cfg,
+                                                adapters, interrupt,
+                                                pilot_gate_fn, exec)
+          : walnutpie::detail::adapt_with_stats(init_cfg, warmup_cfg,
+                                                adapters, interrupt, exec);
+  if (pilot_burst > 0) {
+    std::cout << "pilot checks total=" << pilot_checks << std::endl;
+  }
+  double warm_wall = elapsed(global_start);
+  std::cout << "controller exit_iter=" << ar.exit_iter
+            << " early_exit=" << (ar.early_exit ? 1 : 0)
+            << " (max_iter=" << warmup_cfg.max_iter() << ")" << std::endl;
+  for (std::size_t c = 0; c < chains; ++c) {
+    print_stanza(c, warm_wall, timing[c]);
+  }
+
+  std::vector<Sampler> samplers;
+  samplers.reserve(chains);
+  for (std::size_t c = 0; c < chains; ++c) {
+    samplers.emplace_back(adapters[c].sampler());
+  }
+
+  for (auto& t : timing) {
+    t = ChainTiming{};
+  }
+  global_start = Clock::now();
+  if (serial_exec) {
+    // W-30 serial topology: chains run one at a time on the calling
+    // thread (identical draws to the threaded sampling below).
+    for (std::size_t c = 0; c < chains; ++c) {
+      for (std::size_t n = 0; n < num_draws; ++n) {
+        samplers[c]();
+      }
+    }
+  } else {
+    std::vector<std::jthread> ts;
+    ts.reserve(chains);
+    for (std::size_t c = 0; c < chains; ++c) {
+      ts.emplace_back([&samplers, c, num_draws]() {
+        walnutpie::detail::interactive_qos();
+        for (std::size_t n = 0; n < num_draws; ++n) {
+          samplers[c]();
+        }
+      });
+    }
+  }
+  double sample_wall = elapsed(global_start);
+  for (std::size_t c = 0; c < chains; ++c) {
+    print_stanza(c, sample_wall, timing[c]);
+  }
+
+  if (!out_pattern.empty()) {
+    for (std::size_t c = 0; c < chains; ++c) {
+      std::string f = out_pattern;
+      f.replace(f.find("{c}"), 3, std::to_string(c));
+      handlers[c].write_csv(f);
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   auto clock_count =
       std::chrono::system_clock::now().time_since_epoch().count();
@@ -471,6 +976,9 @@ int main(int argc, char** argv) {
   double mass_shrink_kappa = 0.0;
   double mass_var_floor = 0.0;
   double mass_init_clamp = 0.0;
+  std::size_t mass_init_buffer = 0;
+  double grad_clip_scale = 0.0;
+  std::size_t grad_clip_iters = 200;
   bool step_init_heuristic = false;
   bool metric_drift_guard = false;
   double mass_combine_power = 0.0;
@@ -482,6 +990,17 @@ int main(int argc, char** argv) {
   std::size_t metric_rank = 0;
   std::size_t metric_basis = 0;
   double early_exit_tol = 0.0;  // 0 = fixed warmup (default)
+  std::size_t chains = 1;  // 1 = legacy single-chain loop; >1 = library
+                           // multi-chain controller (adapt_with_stats)
+  std::string chain_exec = "threads";  // W-30: multi-chain topology
+  bool fixed_warmup = false;  // W-30: pin controller min_iter to budget
+  bool early_exit = false;  // W-31: opt in to controller early exit
+  double temporal_step_tol = 0.0;  // 0 = temporal gate off (multi-chain)
+  std::size_t temporal_window = 50;
+  std::size_t temporal_min_iter = 200;
+  std::size_t pilot_burst = 0;  // W-28: 0 = pilot gate off (multi-chain)
+  double pilot_rho1_max = 0.5;
+  double pilot_rhat_max = 1.1;
   bool metric_full = false;
   double metric_auto = 0.0;
   double max_error_start = 0.0;
@@ -631,6 +1150,26 @@ int main(int argc, char** argv) {
                    "(e.g. 100; 0 = off)")
         ->default_val(mass_init_clamp);
 
+    app.add_option("--mass-init-buffer", mass_init_buffer,
+                   "W-54 arm A: hold the mass at IDENTITY and skip mass-"
+                   "estimator observations for the first N warmup "
+                   "iterations (Stan-style init buffer; 0 = off; e.g. 75)")
+        ->default_val(mass_init_buffer);
+
+    app.add_option("--grad-clip-scale", grad_clip_scale,
+                   "W-54 arm B: soft-clip the gradient fed to the mass "
+                   "estimator during early warmup, g' = c*asinh(g/c) "
+                   "(identity below ~c/100, logarithmic beyond; adapter-"
+                   "only, the integrator gradient is never clipped; "
+                   "0 = off; thread value 1e10)")
+        ->default_val(grad_clip_scale);
+
+    app.add_option("--grad-clip-iters", grad_clip_iters,
+                   "W-54 arm B: apply the soft gradient clip only during "
+                   "the first M warmup iterations (requires --grad-clip-"
+                   "scale > 0)")
+        ->default_val(grad_clip_iters);
+
     app.add_option("--metric-auto", metric_auto,
                    "Auto-select the rank-corrected metric per window: apply "
                    "when the singular-excess concentration in the top "
@@ -662,6 +1201,82 @@ int main(int argc, char** argv) {
                    "within 0.3), after 200 iters; 0 = fixed warmup")
         ->default_val(early_exit_tol)
         ->check(CLI::NonNegativeNumber);
+
+    app.add_option("--chains", chains,
+                   "Number of chains; >1 runs the library multi-chain "
+                   "warmup controller (fixed-budget warmup by default; "
+                   "cross-chain convergence early exit only with "
+                   "--early-exit or --temporal-step-tol > 0) in one "
+                   "process")
+        ->default_val(chains)
+        ->check(CLI::PositiveNumber);
+
+    app.add_option("--chain-exec", chain_exec,
+                   "Multi-chain execution topology (W-30): threads = one "
+                   "worker thread per chain with the event-driven "
+                   "controller; serial = all chains round-robin on the "
+                   "calling thread (deterministic observation points, "
+                   "identical per-chain draws)")
+        ->default_val(chain_exec)
+        ->check(CLI::IsMember({"threads", "serial"}));
+
+    app.add_flag(
+        "--fixed-warmup", fixed_warmup,
+        "Multi-chain: pin the controller's minimum warmup to the full "
+        "--warmup budget, so the cross-chain criteria can only stop at the "
+        "budget (deterministic warmup length; redundant while early exit "
+        "is off — the W-31 default — but still meaningful with "
+        "--early-exit)");
+
+    app.add_flag(
+        "--early-exit", early_exit,
+        "Multi-chain: re-enable the controller's cross-chain convergence "
+        "early exit (the pre-W-31 default). UNSAFE with the default "
+        "tolerances (mass 1.0 / step 0.1): with good inits warmup stops "
+        "at iteration 50-80 and post-warmup quality collapses on hard "
+        "models (W-25: hier_2pl bulk-ESS 519 -> 61). Pass only for "
+        "reproducing those experiments or with tolerances you have "
+        "validated. Passing --temporal-step-tol > 0 also opts in.");
+
+    app.add_option("--temporal-step-tol", temporal_step_tol,
+                   "Multi-chain controller temporal step-drift gate: require "
+                   "every chain's step size to drift less than this relative "
+                   "amount across the last --temporal-window iters before "
+                   "early exit (W-22; 0 = off; e.g. 0.05)")
+        ->default_val(temporal_step_tol)
+        ->check(CLI::NonNegativeNumber);
+
+    app.add_option("--temporal-window", temporal_window,
+                   "Window length (warmup iters) for the temporal step-drift "
+                   "gate")
+        ->default_val(temporal_window)
+        ->check(CLI::PositiveNumber);
+
+    app.add_option("--temporal-min-iter", temporal_min_iter,
+                   "Minimum warmup iters before the temporal step-drift gate "
+                   "may trigger early exit")
+        ->default_val(temporal_min_iter);
+
+    app.add_option("--pilot-burst", pilot_burst,
+                   "W-28 pilot sampling-burst gate (multi-chain only): at "
+                   "each candidate early exit, draw N pilot draws per chain "
+                   "on the would-be-frozen sampler (separate rng streams, "
+                   "discarded) and approve the exit only if the pilot's lp "
+                   "lag-1 autocorrelation and split-half R-hat pass "
+                   "--pilot-rho1-max / --pilot-rhat-max; otherwise warmup "
+                   "resumes (0 = off; N must be even, e.g. 50)")
+        ->default_val(pilot_burst)
+        ->check(CLI::NonNegativeNumber);
+
+    app.add_option("--pilot-rho1-max", pilot_rho1_max,
+                   "Pilot gate: max per-chain lag-1 autocorrelation of lp "
+                   "to approve an early exit")
+        ->default_val(pilot_rho1_max);
+
+    app.add_option("--pilot-rhat-max", pilot_rhat_max,
+                   "Pilot gate: split-half cross-chain R-hat of lp below "
+                   "this to approve an early exit")
+        ->default_val(pilot_rhat_max);
 
     app.add_option("--metric-window", metric_window,
                    "Memoryless metric windows: reset the draw/score moment "
@@ -765,7 +1380,7 @@ int main(int argc, char** argv) {
 
   DynamicStanModel model(lib.c_str(), data.c_str(), seed);
 
-  walnutpie::WarmupConfig warmup_cfg =
+  walnutpie::WarmupConfigBuilder warmup_builder =
       walnutpie::WarmupConfigBuilder()
           .mass_init_count(mass_init_count)
           .mass_additive_smoothing(mass_additive_smoothing)
@@ -785,6 +1400,9 @@ int main(int argc, char** argv) {
           .mass_shrink_kappa(mass_shrink_kappa)
           .mass_var_floor(mass_var_floor)
           .mass_init_clamp(mass_init_clamp)
+          .mass_init_buffer(mass_init_buffer)
+          .grad_clip_scale(grad_clip_scale)
+          .grad_clip_iters(grad_clip_iters)
           .metric_drift_guard(metric_drift_guard)
           .mass_combine_power(mass_combine_power)
           .metric_collapse_reset(metric_collapse_reset)
@@ -796,7 +1414,24 @@ int main(int argc, char** argv) {
           .metric_rank(metric_rank)
           .metric_basis(metric_basis)
           .metric_full(metric_full)
-          .metric_auto(metric_auto)
+          .metric_auto(metric_auto);
+  if (chains > 1) {
+    // Multi-chain: the controller bounds warmup (min 50, max num_warmup).
+    // --fixed-warmup pins min to the budget so the cross-chain criteria
+    // can only stop at max_iter (deterministic length for the W-30 gates).
+    warmup_builder.min_max_iter(
+        fixed_warmup ? num_warmup : std::min<std::size_t>(50, num_warmup),
+        num_warmup);
+    // W-31: convergence-based early exit is opt-in — an explicit
+    // --early-exit, or a positive temporal tolerance (which is itself an
+    // explicit request for gated early exit; keeps the W-25/W-28 arm
+    // command lines reproducible verbatim).
+    warmup_builder.allow_early_exit(early_exit || temporal_step_tol > 0.0);
+  }
+  walnutpie::WarmupConfig warmup_cfg =
+      warmup_builder.temporal_step_drift_tol(temporal_step_tol)
+          .temporal_window(temporal_window)
+          .temporal_min_iter(temporal_min_iter)
           .build();
 
   walnutpie::SamplingConfig sample_cfg =
@@ -808,6 +1443,66 @@ int main(int argc, char** argv) {
           .build();
 
   unique_bs_rng rng = model.make_rng(seed);
+
+  if (pilot_burst > 0 && chains <= 1) {
+    throw std::invalid_argument("--pilot-burst requires --chains > 1");
+  }
+  if (chains <= 1 && (fixed_warmup || chain_exec != "threads")) {
+    // Fail loudly rather than silently no-op (the CLI dispatch lesson).
+    throw std::invalid_argument(
+        "--chain-exec and --fixed-warmup require --chains > 1");
+  }
+
+  if (chains > 1) {
+    // W-25 multi-chain path: library controller, per-chain models.
+    if (early_exit_tol > 0.0 || step_init_heuristic || mass_init_clamp > 0.0) {
+      throw std::invalid_argument(
+          "--early-exit-warmup, --step-init-heuristic and --mass-init-clamp "
+          "are single-chain-only flags");
+    }
+    if (pilot_burst > 0 && (pilot_burst < 2 || pilot_burst % 2 != 0)) {
+      throw std::invalid_argument(
+          "--pilot-burst must be 0 (off) or an even number >= 2 (the gate "
+          "splits each chain's pilot draws in half for the R-hat proxy)");
+    }
+    if (pilot_burst > 0 && !(early_exit || temporal_step_tol > 0.0)) {
+      // Fail loudly rather than silently no-op (the CLI dispatch
+      // lesson): with the W-31 safe default there are no candidate
+      // early exits for the pilot gate to inspect.
+      throw std::invalid_argument(
+          "--pilot-burst requires an early-exit enabler: --early-exit or "
+          "--temporal-step-tol > 0 (with early exit off, warmup always "
+          "runs to the --warmup budget and pilots can never fire)");
+    }
+    if (!init_file.empty() && init_file.find("{c}") == std::string::npos) {
+      throw std::invalid_argument(
+          "--init-file in multi-chain mode must contain {c}");
+    }
+    if (!output_file.empty() && output_file.find("{c}") ==
+                                    std::string::npos) {
+      throw std::invalid_argument(
+          "--output in multi-chain mode must contain {c}");
+    }
+    auto run_multi = [&](auto opt_tag) {
+      using Opt = typename decltype(opt_tag)::type;
+      run_walnuts_multi<Opt>(
+          lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
+          num_draws, save_warmup, warmup_cfg, sample_cfg, init,
+          step_size_init, init_file, output_file, pilot_burst,
+          pilot_rho1_max, pilot_rhat_max, chain_exec == "serial",
+          init_screen_enabled());
+    };
+    if (step_optimizer == "adam") {
+      run_multi(std::type_identity<walnutpie::detail::Adam>{});
+    } else if (step_optimizer == "da") {
+      run_multi(std::type_identity<walnutpie::detail::DualAveraging>{});
+    } else if (step_optimizer == "dem") {
+      run_multi(std::type_identity<walnutpie::detail::AdEMAMix>{});
+    } else {
+      run_multi(std::type_identity<walnutpie::detail::AdaBelief>{});
+    }
+    return 0;
+  }
 
   auto init_positions = [&]() {
     if (!init_file.empty()) {
@@ -833,6 +1528,16 @@ int main(int argc, char** argv) {
     return initialize_finite(model, rng, init, static_cast<unsigned int>(seed),
                              0, init_tries);
   }();
+
+  // W-77: screen the chain-start position (env WALNUTPIE_INIT_SCREEN=1).
+  // The retry rng is the same stream the no-init-file path already uses.
+  const std::string w77_source =
+      !init_file.empty()
+          ? "model " + lib + ", chain 0 (--init-file " + init_file + ")"
+          : "model " + lib + ", chain 0 (random --init "
+                + std::to_string(init) + ")";
+  init_positions = screened_init(model, rng, init, init_positions,
+                                 w77_source, init_screen_enabled());
 
   auto init_cfg =
       walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
