@@ -759,8 +759,10 @@ void run_walnuts_multi(
     try { ridge_thresh = std::stod(rg); } catch (...) {}
     if (ridge_thresh <= 0) ridge_thresh = 5.0;
     std::size_t ridge_min_micro = 128;
+    bool graduated = true;
     if (const char* bm = std::getenv("WALNUTPIE_RIDGE_MINMICRO")) {
       try { ridge_min_micro = std::stoul(bm); } catch (...) {}
+      graduated = false;  // explicit value disables graduation
     }
     const std::size_t d =
         static_cast<std::size_t>(samplers[0].position().size());
@@ -786,6 +788,16 @@ void run_walnuts_multi(
       if (f > worst_f) { worst_f = f; worst_j = j; }
     }
     if (worst_f > ridge_thresh) {
+      // W-102: graduate the budget with the observed misfit so marginal
+      // locks (F near threshold) do not pay the full 128-micro cost:
+      // F≈5 → 16, F≈20 → 64, F≥40 → the full cap.
+      if (graduated) {
+        const double scale = worst_f / ridge_thresh;
+        const std::size_t budget = static_cast<std::size_t>(
+            std::min(16.0 * std::max(scale, 1.0),
+                     static_cast<double>(ridge_min_micro)));
+        ridge_min_micro = std::max<std::size_t>(budget, 16);
+      }
       std::cerr << "ridge guard: cross-chain position F=" << worst_f
                 << " at coord " << worst_j << " > " << ridge_thresh
                 << " -> raising min micro steps to " << ridge_min_micro
