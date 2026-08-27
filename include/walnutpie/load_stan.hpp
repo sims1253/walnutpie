@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <cstring>
 #include <vector>
 
 // TODO: consider using something like https://github.com/martin-olivier/dylib/
@@ -122,6 +123,27 @@ class DynamicStanModel {
   }
   std::size_t constrained_dimensions() const {
     return static_cast<std::size_t>(param_num_(model_ptr_.get(), true, true));
+  }
+
+  /**
+   * @brief Whether the loaded model .so was built with STAN_THREADS=true.
+   *
+   * With STAN_THREADS=false the stan-math autodiff arena and vari stack
+   * are process-global: calling logp_grad from several chain threads
+   * races (TSan-verified corruption + SEGVs). Callers running
+   * multi-chain threaded execution must refuse such models.
+   * Returns true when the flag cannot be determined (older .so).
+   */
+  bool stan_threads() const {
+    // dlsym only reads the library handle; library_ is not modified.
+    auto model_info = dlsym_cast(
+        const_cast<internal::dynamic_library&>(library_), bs_model_info);
+    const char* info = model_info(model_ptr_.get());
+    if (info == nullptr) {
+      return true;
+    }
+    // model_info is a plain-text report containing "STAN_THREADS=true|false".
+    return std::strstr(info, "STAN_THREADS=false") == nullptr;
   }
 
   template <typename M>
