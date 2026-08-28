@@ -1080,6 +1080,15 @@ int main(int argc, char** argv) {
         "--chain-exec and --fixed-warmup require --chains > 1");
   }
 
+  if (chains <= 1 && (early_exit || temporal_step_tol > 0.0)) {
+    // Fail loudly rather than silently no-op: --early-exit and
+    // --temporal-step-tol configure the multi-chain controller only (the
+    // single-chain analogue is --early-exit-warmup).
+    throw std::invalid_argument(
+        "--early-exit, --temporal-step-tol, --temporal-window and "
+        "--temporal-min-iter require --chains > 1");
+  }
+
   if (chains > 1) {
     // W-25 multi-chain path: library controller, per-chain models.
     if (early_exit_tol > 0.0 || step_init_heuristic || mass_init_clamp > 0.0) {
