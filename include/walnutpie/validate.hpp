@@ -216,6 +216,23 @@ inline void validate_positive(T x, const std::string& name) {
 }
 
 /**
+ * @brief Throw an exception if the value is negative or not finite.
+ *
+ * @tparam T Type of value.
+ * @param[in] x The variable's value.
+ * @param[in] name The variable's name.
+ * @throw std::invalid_argument If the value is negative or not finite.
+ */
+template <std::floating_point T>
+inline void validate_nonnegative(T x, const std::string& name) {
+  if (x >= 0 && std::isfinite(x)) {
+    return;
+  }
+  std::string msg = name + " must be in [0, inf).";
+  throw std::invalid_argument(msg);
+}
+
+/**
  * @brief Throw an exception if the value is not positive.
  *
  * @tparam T Type of integral value.

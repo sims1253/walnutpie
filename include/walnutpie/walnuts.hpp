@@ -705,6 +705,13 @@ class WalnutsSampler {
   }
 
   /**
+   * @brief Return the current position.
+   *
+   * @return The position vector.
+   */
+  const Eigen::VectorXd& position() const noexcept { return theta_; }
+
+  /**
    * @brief Return the macro time discretization interval for Nuts.
    *
    * @return The time discretization interval for Nuts.

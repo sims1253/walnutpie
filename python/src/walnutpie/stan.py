@@ -214,6 +214,8 @@ def walnuts_stan(
     step_sq_gradient_decay: float = 0.9,
     step_stabilization: float = 1e-4,
     step_learn_rate_decay: float = 0.5,
+    ridge_guard: float = 0.0,
+    ridge_min_micro: int = 128,
     save_warmup: bool = False,
     refresh: int = 0,
 ) -> list[StanOutput]:
@@ -378,6 +380,8 @@ def walnuts_stan(
         step_sq_gradient_decay,
         step_stabilization,
         step_learn_rate_decay,
+        ridge_guard,
+        ridge_min_micro,
         save_warmup,
         out,
         out.size,

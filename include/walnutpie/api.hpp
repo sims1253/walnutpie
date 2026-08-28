@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <random>
 #include <stdexcept>
@@ -62,6 +64,57 @@ inline void walnuts(std::size_t seed, std::vector<H>& chain_handlers,
   samplers.reserve(adapters.size());
   for (std::size_t n = 0; n < adapters.size(); ++n) {
     samplers.emplace_back(std::move(adapters[n].sampler()));
+  }
+
+  // Ridge guard (opt-in; sampling().ridge_guard() == 0 disables it):
+  // chains that locked onto different points of a likelihood-null ridge
+  // disperse far more across chains than the adapted within-chain scale
+  // sqrt(inv_mass). The log density is invariant along such ridges, so
+  // no log-mass statistic can detect the lock; positions can. On
+  // detection, raise the frozen trajectory budget, scaled to the misfit:
+  // longer trajectories traverse the ridge (the lock is trajectory-
+  // length binding, not metric binding).
+  const double ridge_threshold = config.sampling().ridge_guard();
+  if (ridge_threshold > 0.0 && samplers.size() > 1) {
+    const std::size_t chains = samplers.size();
+    const std::size_t dim =
+        static_cast<std::size_t>(samplers[0].position().size());
+    double worst_f = 0.0;
+    for (std::size_t j = 0; j < dim; ++j) {
+      double mean_of_means = 0.0;
+      double mean_scale = 0.0;
+      for (std::size_t c = 0; c < chains; ++c) {
+        mean_of_means += samplers[c].position()[j];
+        mean_scale += std::sqrt(samplers[c].inverse_mass_matrix_diagonal()[j]);
+      }
+      mean_of_means /= static_cast<double>(chains);
+      mean_scale /= static_cast<double>(chains);
+      if (!(mean_scale > 0.0)) {
+        continue;
+      }
+      double ss = 0.0;
+      for (std::size_t c = 0; c < chains; ++c) {
+        const double dev = samplers[c].position()[j] - mean_of_means;
+        ss += dev * dev;
+      }
+      const double f = std::sqrt(ss / static_cast<double>(chains - 1))
+                       / mean_scale;
+      worst_f = std::max(worst_f, f);
+    }
+    if (worst_f > ridge_threshold) {
+      const double scale = worst_f / ridge_threshold;
+      const std::size_t cap = config.sampling().ridge_min_micro();
+      const std::size_t budget = std::max<std::size_t>(
+          std::min(static_cast<std::size_t>(16.0 * std::max(scale, 1.0)),
+                   cap),
+          16);
+      std::vector<Sampler> replaced;
+      replaced.reserve(chains);
+      for (std::size_t c = 0; c < chains; ++c) {
+        replaced.emplace_back(adapters[c].sampler_min_micro(budget));
+      }
+      samplers = std::move(replaced);
+    }
   }
 
   detail::sample(config.sampling(), samplers, global_handler,

@@ -939,6 +939,21 @@ class SamplingConfig {
    */
   double rhat_converge_tol() const noexcept { return rhat_converge_tol_; }
 
+  /**
+   * @brief Return the ridge-guard threshold (0 disables the guard).
+   *
+   * @return The threshold on the cross-chain position dispersion ratio.
+   */
+  double ridge_guard() const noexcept { return ridge_guard_; }
+
+  /**
+   * @brief Return the trajectory-budget cap applied when the ridge guard
+   * fires.
+   *
+   * @return The maximum min micro steps per macro step after a fire.
+   */
+  std::size_t ridge_min_micro() const noexcept { return ridge_min_micro_; }
+
  private:
   friend class SamplingConfigBuilder;
 
@@ -951,6 +966,8 @@ class SamplingConfig {
   double max_hamiltonian_error_ = 0.5;
   std::size_t min_micro_steps_ = 1;
   double rhat_converge_tol_ = 1.01;
+  double ridge_guard_ = 0.0;
+  std::size_t ridge_min_micro_ = 128;
 };
 
 /**
@@ -1031,6 +1048,18 @@ class SamplingConfigBuilder {
   SamplingConfigBuilder& min_micro_steps(std::size_t v) {
     detail::validate_positive(v, "min_micro_steps");
     cfg_.min_micro_steps_ = v;
+    return *this;
+  }
+
+  SamplingConfigBuilder& ridge_guard(double v) {
+    detail::validate_nonnegative(v, "ridge_guard");
+    cfg_.ridge_guard_ = v;
+    return *this;
+  }
+
+  SamplingConfigBuilder& ridge_min_micro(std::size_t v) {
+    detail::validate_positive(v, "ridge_min_micro");
+    cfg_.ridge_min_micro_ = v;
     return *this;
   }
 
