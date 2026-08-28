@@ -1010,6 +1010,15 @@ int main(int argc, char** argv) {
 
   DynamicStanModel model(lib.c_str(), data.c_str(), seed);
 
+  if (chains > 1 && chain_exec == "threads" && !model.stan_threads()) {
+    // TSan-verified: a STAN_THREADS=false .so shares the autodiff arena
+    // across threads — racing logp_grad calls corrupt state and crash.
+    throw std::invalid_argument(
+        "model '" + lib + "' was not built with STAN_THREADS=true; "
+        "--chain-exec threads would race in the autodiff arena. Rebuild "
+        "the model with STAN_THREADS=1 or use --chain-exec serial.");
+  }
+
   walnutpie::WarmupConfigBuilder warmup_builder =
       walnutpie::WarmupConfigBuilder()
           .mass_init_count(mass_init_count)
