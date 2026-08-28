@@ -22,6 +22,81 @@
 using walnutpie::DynamicStanModel;
 using walnutpie::unique_bs_rng;
 
+// W-77: env-gated init screen (WALNUTPIE_INIT_SCREEN=1). At chain start,
+// evaluate logp_grad at the initial position; on a thrown exception OR a
+// non-finite logp, retry up to 10 fresh random inits (the same
+// DynamicStanModel::initialize mechanism used without --init-file); if all
+// fail, exit loudly naming model, init source, and last error.
+//
+// Observable-behavior note (load_stan.hpp): BridgeStan evaluation errors
+// are NOT propagated as C++ exceptions by DynamicStanModel::logp_grad —
+// they are mapped to logp = -inf with grad zeroed, after printing
+//   "Error in logp_grad: <bridge stan error>" to stderr.
+// Only a missing error message (ret != 0, err == nullptr) throws. So at
+// this CLI layer "model threw" is observable as (a) those stderr lines
+// plus (b) non-finite logp; both cases funnel into the same screen below,
+// which triggers on either condition. The synthetic throw-at-init check
+// (gate d) therefore exercises the error-mapped path and asserts the loud
+// exit plus the stderr error lines.
+
+static bool init_screen_enabled() {
+  const char* v = std::getenv("WALNUTPIE_INIT_SCREEN");
+  return v != nullptr && v[0] != '\0' && std::string(v) != "0";
+}
+
+// Returns true when logp at x is finite; fills err_detail on failure.
+static bool finite_logp_at(const DynamicStanModel& model,
+                           const Eigen::VectorXd& x, std::string& err_detail) {
+  double logp = 0.0;
+  Eigen::VectorXd grad;
+  try {
+    model.logp_grad(x, logp, grad);
+  } catch (const std::exception& e) {
+    err_detail = std::string("logp_grad threw: ") + e.what();
+    return false;
+  }
+  if (!std::isfinite(logp)) {
+    err_detail = "non-finite logp = " + std::to_string(logp);
+    return false;
+  }
+  return true;
+}
+
+// Screen one chain's initial position; on failure retry up to n_retries
+// fresh random inits drawn from rng (must be the chain's own stream so a
+// passing run consumes identical RNG draws as an unscreened run).
+static Eigen::VectorXd screened_init(DynamicStanModel& model,
+                                     unique_bs_rng& rng, double init_radius,
+                                     Eigen::VectorXd first_pos,
+                                     const std::string& source_desc,
+                                     bool screen_on) {
+  if (!screen_on) {
+    return first_pos;
+  }
+  constexpr std::size_t kMaxRetries = 10;
+  std::string last_err;
+  if (finite_logp_at(model, first_pos, last_err)) {
+    return first_pos;
+  }
+  std::cerr << "[init-screen] initial point failed: " << source_desc << " ("
+            << last_err << "); retrying with up to " << kMaxRetries
+            << " random inits" << std::endl;
+  for (std::size_t attempt = 1; attempt <= kMaxRetries; ++attempt) {
+    Eigen::VectorXd pos = model.initialize(nullptr, rng, init_radius);
+    if (finite_logp_at(model, pos, last_err)) {
+      std::cerr << "[init-screen] random init attempt " << attempt
+                << " produced a finite-logp start" << std::endl;
+      return pos;
+    }
+  }
+  std::cerr << "INIT SCREEN FAILURE: model could not be initialized.\n"
+            << "  init source: " << source_desc << "\n"
+            << "  attempts: initial + " << kMaxRetries << " random retries\n"
+            << "  last error: " << last_err << "\n"
+            << "Refusing to run a dead chain; exiting." << std::endl;
+  std::exit(EXIT_FAILURE);
+}
+
 static void summarize(const std::vector<std::string>& names,
                       const Eigen::MatrixXd& draws) {
   auto N = draws.cols();
@@ -389,7 +464,8 @@ void run_walnuts_multi(
     const walnutpie::SamplingConfig& sample_cfg, double init_radius,
     double step_size_init, const std::string& init_pattern,
     const std::string& out_pattern, std::size_t pilot_burst,
-    double pilot_rho1_max, double pilot_rhat_max, bool serial_exec) {
+    double pilot_rho1_max, double pilot_rhat_max, bool serial_exec,
+    bool init_screen) {
   using Clock = std::chrono::high_resolution_clock;
   using LogpT = decltype(make_timed_logp(std::declval<DynamicStanModel&>(),
                                          std::declval<ChainTiming&>()));
@@ -438,6 +514,9 @@ void run_walnuts_multi(
   std::vector<Eigen::VectorXd> positions;
   positions.reserve(chains);
   for (std::size_t c = 0; c < chains; ++c) {
+    // W-77: keep the chain's init rng alive so the init screen's random
+    // retries draw from the same stream as an unscreened no-init-file run.
+    auto mrng = models[c]->make_rng(seed + static_cast<unsigned>(c));
     if (!init_pattern.empty()) {
       std::string f = init_pattern;
       f.replace(f.find("{c}"), 3, std::to_string(c));
@@ -454,12 +533,20 @@ void run_walnuts_multi(
           static_cast<std::size_t>(models[c]->unconstrained_dimensions())) {
         throw std::invalid_argument("init file dimension mismatch: " + f);
       }
-      positions.emplace_back(
-          Eigen::VectorXd::Map(vals.data(), vals.size()));
+      positions.emplace_back(screened_init(
+          *models[c], mrng, init_radius,
+          Eigen::VectorXd::Map(vals.data(), vals.size()),
+          "model " + lib + ", chain " + std::to_string(c)
+              + " (--init-file " + f + ")",
+          init_screen));
     } else {
-      auto mrng = models[c]->make_rng(seed + static_cast<unsigned>(c));
       positions.push_back(
-          models[c]->initialize(nullptr, mrng, init_radius));
+          screened_init(*models[c], mrng, init_radius,
+                        models[c]->initialize(nullptr, mrng, init_radius),
+                        "model " + lib + ", chain "
+                            + std::to_string(c) + " (random --init "
+                            + std::to_string(init_radius) + ")",
+                        init_screen));
     }
   }
 
@@ -1116,7 +1203,8 @@ int main(int argc, char** argv) {
           lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
           num_draws, save_warmup, warmup_cfg, sample_cfg, init,
           step_size_init, init_file, output_file, pilot_burst,
-          pilot_rho1_max, pilot_rhat_max, chain_exec == "serial");
+          pilot_rho1_max, pilot_rhat_max, chain_exec == "serial",
+          init_screen_enabled());
     };
     if (step_optimizer == "adam") {
       run_multi(std::type_identity<walnutpie::detail::Adam>{});
@@ -1152,6 +1240,16 @@ int main(int argc, char** argv) {
     }
     return model.initialize(nullptr, rng, init);
   }();
+
+  // W-77: screen the chain-start position (env WALNUTPIE_INIT_SCREEN=1).
+  // The retry rng is the same stream the no-init-file path already uses.
+  const std::string w77_source =
+      !init_file.empty()
+          ? "model " + lib + ", chain 0 (--init-file " + init_file + ")"
+          : "model " + lib + ", chain 0 (random --init "
+                + std::to_string(init) + ")";
+  init_positions = screened_init(model, rng, init, init_positions,
+                                 w77_source, init_screen_enabled());
 
   auto init_cfg =
       walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
