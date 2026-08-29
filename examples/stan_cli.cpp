@@ -1660,6 +1660,75 @@ int main(int argc, char** argv) {
           .min_micro_steps(min_micro_steps)
           .build();
 
+  // W-114: restore the multi-chain dispatch that the W-96 assembly
+  // dropped (run_walnuts_multi was defined but never called, so --chains
+  // fell through to the single-chain path and died on the literal {c}
+  // init pattern, leaving the ridge guard unreachable). Block ported
+  // verbatim from exp/ridge-guard 7dd0f71 (its stan_cli.cpp lines
+  // 1331-1389) with ONE adaptation: this assembly's run_walnuts_multi
+  // carries the W-77 init screen, so the call passes
+  // init_screen_enabled() ahead of init_tries. Everything below the
+  // block — the W-82 run_chain single-chain path — is untouched.
+  if (pilot_burst > 0 && chains <= 1) {
+    throw std::invalid_argument("--pilot-burst requires --chains > 1");
+  }
+  if (chains <= 1 && (fixed_warmup || chain_exec != "threads")) {
+    // Fail loudly rather than silently no-op (the CLI dispatch lesson).
+    throw std::invalid_argument(
+        "--chain-exec and --fixed-warmup require --chains > 1");
+  }
+
+  if (chains > 1) {
+    // W-25 multi-chain path: library controller, per-chain models.
+    if (early_exit_tol > 0.0 || step_init_heuristic || mass_init_clamp > 0.0) {
+      throw std::invalid_argument(
+          "--early-exit-warmup, --step-init-heuristic and --mass-init-clamp "
+          "are single-chain-only flags");
+    }
+    if (pilot_burst > 0 && (pilot_burst < 2 || pilot_burst % 2 != 0)) {
+      throw std::invalid_argument(
+          "--pilot-burst must be 0 (off) or an even number >= 2 (the gate "
+          "splits each chain's pilot draws in half for the R-hat proxy)");
+    }
+    if (pilot_burst > 0 && !(early_exit || temporal_step_tol > 0.0)) {
+      // Fail loudly rather than silently no-op (the CLI dispatch
+      // lesson): with the W-31 safe default there are no candidate
+      // early exits for the pilot gate to inspect.
+      throw std::invalid_argument(
+          "--pilot-burst requires an early-exit enabler: --early-exit or "
+          "--temporal-step-tol > 0 (with early exit off, warmup always "
+          "runs to the --warmup budget and pilots can never fire)");
+    }
+    if (!init_file.empty() && init_file.find("{c}") == std::string::npos) {
+      throw std::invalid_argument(
+          "--init-file in multi-chain mode must contain {c}");
+    }
+    if (!output_file.empty() &&
+        output_file.find("{c}") == std::string::npos) {
+      throw std::invalid_argument(
+          "--output in multi-chain mode must contain {c}");
+    }
+    auto run_multi = [&](auto opt_tag) {
+      using Opt = typename decltype(opt_tag)::type;
+      run_walnuts_multi<Opt>(
+          lib, data, static_cast<unsigned int>(seed), chains, num_warmup,
+          num_draws, save_warmup, warmup_cfg, sample_cfg, init,
+          step_size_init, init_file, output_file, pilot_burst,
+          pilot_rho1_max, pilot_rhat_max, chain_exec == "serial",
+          init_screen_enabled(), init_tries);
+    };
+    if (step_optimizer == "adam") {
+      run_multi(std::type_identity<walnutpie::detail::Adam>{});
+    } else if (step_optimizer == "da") {
+      run_multi(std::type_identity<walnutpie::detail::DualAveraging>{});
+    } else if (step_optimizer == "dem") {
+      run_multi(std::type_identity<walnutpie::detail::AdEMAMix>{});
+    } else {
+      run_multi(std::type_identity<walnutpie::detail::AdaBelief>{});
+    }
+    return 0;
+  }
+
   // W-82 (min-micro guard): armed only when explicitly requested AND
   // min-micro-steps > 1 — otherwise the run must be semantically
   // identical to the unguarded CLI (W-54 draw-neutrality).
