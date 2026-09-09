@@ -1,4 +1,9 @@
 // Thread-safe test double, not a Stan model or a race detector.
+// Rename (rather than leave undefined) the optional export in the
+// missing-symbol variant. Keep declared exports defined for DLL linkers.
+#ifdef OMIT_MODEL_INFO
+#define bs_model_info stub_omitted_model_info
+#endif
 #include <bridgestan.h>
 #include <atomic>
 #include <cstdlib>
@@ -19,16 +24,40 @@ BS_PUBLIC void stub_reset() {
 BS_PUBLIC int stub_gradient_calls() { return grad_calls.load(); }
 BS_PUBLIC int stub_init_calls() { return init_calls.load(); }
 BS_PUBLIC int stub_constrain_calls() { return constrain_calls.load(); }
+const int bs_major_version = 2;
+const int bs_minor_version = 9;
+const int bs_patch_version = 0;
+const char* bs_name(const bs_model*) { return "thread_stub"; }
+const char* bs_param_unc_names(const bs_model*) { return "x"; }
+// Supply the other declared exports for DLL linkers; the loader does not use
+// these operations in this test double.
+int bs_param_unconstrain(const bs_model*, const double*, double*, char**) {
+  return -1;
+}
+int bs_param_unconstrain_json(const bs_model*, const char*, double*, char**) {
+  return -1;
+}
+int bs_log_density(const bs_model*, bool, bool, const double*, double*,
+                   char**) {
+  return -1;
+}
+int bs_log_density_hessian(const bs_model*, bool, bool, const double*, double*,
+                           double*, double*, char**) {
+  return -1;
+}
+int bs_log_density_hessian_vector_product(const bs_model*, bool, bool,
+                                          const double*, const double*, double*,
+                                          double*, char**) {
+  return -1;
+}
 bs_model* bs_model_construct(const char* data, unsigned int, char**) {
   return new bs_model{data ? data : ""};
 }
 void bs_model_destruct(bs_model* m) { delete m; }
 void bs_free_error_msg(char* p) { std::free(p); }
-#ifndef OMIT_MODEL_INFO
 const char* bs_model_info(const bs_model* m) {
   return m->info == "<null>" ? nullptr : m->info.c_str();
 }
-#endif
 int bs_param_unc_num(const bs_model*) { return 1; }
 int bs_param_num(const bs_model*, bool, bool) { return 1; }
 const char* bs_param_names(const bs_model*, bool, bool) { return "x"; }

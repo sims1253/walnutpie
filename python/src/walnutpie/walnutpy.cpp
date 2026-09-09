@@ -11,7 +11,7 @@
 #include <walnutpie/load_stan.hpp>
 
 #include "errors.hpp"
-#include "export.h"
+#include "walnutpy_export.h"
 #include "handlers.hpp"
 #include "interrupts.hpp"
 

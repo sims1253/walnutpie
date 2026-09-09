@@ -54,12 +54,26 @@ target_compile_definitions(stan_threads_test PRIVATE
   THREAD_MISSING_PATH="$<TARGET_FILE:stan_thread_missing>")
 add_dependencies(stan_threads_test stan_thread_stub stan_thread_missing)
 
-# The binding has no Python-runtime dependency, but is only built in SKBUILD mode.
+# Exercise the native boundary in ordinary C++ CI, without a Python runtime.
 if(TARGET walnutpy)
-  add_test(stan_binding_threads)
-  target_link_libraries(stan_binding_threads_test PRIVATE walnutpy BridgeStan::BridgeStan ${CMAKE_DL_LIBS})
-  target_compile_definitions(stan_binding_threads_test PRIVATE
-    THREAD_STUB_PATH="$<TARGET_FILE:stan_thread_stub>"
-    THREAD_MISSING_PATH="$<TARGET_FILE:stan_thread_missing>")
-  add_dependencies(stan_binding_threads_test stan_thread_stub stan_thread_missing)
+  set(thread_binding_target walnutpy)
+else()
+  add_library(walnutpy_thread_test_binding SHARED
+    "${PROJECT_SOURCE_DIR}/python/src/walnutpie/walnutpy.cpp")
+  target_link_libraries(walnutpy_thread_test_binding PRIVATE
+    walnutpie BridgeStan::BridgeStan Eigen3::Eigen)
+  include(GenerateExportHeader)
+  generate_export_header(walnutpy_thread_test_binding
+    BASE_NAME walnutpy
+    EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/walnutpy_export.h")
+  target_include_directories(walnutpy_thread_test_binding PRIVATE
+    "${CMAKE_CURRENT_BINARY_DIR}")
+  set(thread_binding_target walnutpy_thread_test_binding)
 endif()
+add_test(stan_binding_threads)
+target_link_libraries(stan_binding_threads_test PRIVATE
+  ${thread_binding_target} BridgeStan::BridgeStan ${CMAKE_DL_LIBS})
+target_compile_definitions(stan_binding_threads_test PRIVATE
+  THREAD_STUB_PATH="$<TARGET_FILE:stan_thread_stub>"
+  THREAD_MISSING_PATH="$<TARGET_FILE:stan_thread_missing>")
+add_dependencies(stan_binding_threads_test stan_thread_stub stan_thread_missing)
