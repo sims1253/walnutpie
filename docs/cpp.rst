@@ -54,3 +54,20 @@ The following concepts describe the types expected by `walnutpie`.
 .. doxygenconcept:: walnutpie::ChainHandler
 .. doxygenconcept:: walnutpie::GlobalHandler
 .. doxygenconcept:: walnutpie::InterruptCallback
+
+Experimental ridge-budget cap
+-----------------------------
+
+The opt-in ``ridge_guard`` compares final chain positions, not chain means.
+A large dispersion ratio does not establish a likelihood-null ridge or
+convergence failure. The default threshold of zero disables the guard.
+
+``ridge_min_micro`` is the positive cap on the replacement minimum micro
+steps per macro step when the guard fires (default 128). Zero is invalid.
+The nominal floor of 16 is clipped to the cap, so caps from 1 through 15
+remain valid. Very large demands saturate before conversion to an integer.
+The replacement can lower the adapted budget; it does not always raise it.
+This cap is not a global limit on adaptation or total trajectory cost.
+
+The cap correction does not establish improved ESS/s or ridge recovery.
+The detector remains experimental.

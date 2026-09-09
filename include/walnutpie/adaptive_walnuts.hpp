@@ -274,9 +274,9 @@ class AdaptiveWalnuts {
    * @brief Return a frozen sampler with an overridden micro-step budget.
    *
    * Identical to sampler() except for the minimum micro steps per macro
-   * step. Used by the multi-chain ridge guard to raise the trajectory
-   * budget when chains have locked onto different points of a
-   * likelihood-null ridge.
+   * step. Used by the experimental multi-chain ridge guard to replace the
+   * trajectory budget. The capped replacement can be lower than the
+   * adapted budget; the detector does not establish a likelihood-null ridge.
    *
    * @param[in] min_micro_steps The minimum number of micro steps.
    * @return The Walnuts sampler with the given trajectory budget.

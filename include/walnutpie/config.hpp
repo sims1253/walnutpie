@@ -950,7 +950,11 @@ class SamplingConfig {
    * @brief Return the trajectory-budget cap applied when the ridge guard
    * fires.
    *
-   * @return The maximum min micro steps per macro step after a fire.
+   * All positive caps are supported. The nominal floor of 16 is clipped to
+   * this cap. Replacement can lower the previously adapted budget.
+   *
+   * @return The maximum replacement min micro steps per macro step after a
+   * fire.
    */
   std::size_t ridge_min_micro() const noexcept { return ridge_min_micro_; }
 
@@ -1057,6 +1061,10 @@ class SamplingConfigBuilder {
     return *this;
   }
 
+  /**
+   * Set the positive cap on a fired ridge guard's replacement budget.
+   * Caps below 16 clip the nominal floor; zero is invalid.
+   */
   SamplingConfigBuilder& ridge_min_micro(std::size_t v) {
     detail::validate_positive(v, "ridge_min_micro");
     cfg_.ridge_min_micro_ = v;

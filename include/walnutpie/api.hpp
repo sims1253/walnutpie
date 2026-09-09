@@ -15,6 +15,33 @@
 #include "walnutpie/sampler.hpp"
 #include "walnutpie/walnuts.hpp"
 
+namespace walnutpie::detail {
+
+/**
+ * @brief Bound the ridge guard's replacement minimum-micro-step budget.
+ *
+ * The nominal floor of 16 is clipped to the positive cap. Saturate before
+ * converting to size_t so very large demands, including +infinity, are safe.
+ * This does not decide whether a ridge guard should fire.
+ *
+ * @throw std::invalid_argument If cap is zero, or scale is NaN or below one.
+ */
+inline std::size_t ridge_micro_budget(double scale, std::size_t cap) {
+  if (cap == 0 || !(scale >= 1.0)) {
+    throw std::invalid_argument("ridge budget needs cap > 0 and scale >= 1");
+  }
+  if (cap <= 16) {
+    return cap;
+  }
+  const double requested = 16.0 * scale;
+  if (!(requested < static_cast<double>(cap))) {
+    return cap;
+  }
+  return std::max<std::size_t>(16, static_cast<std::size_t>(requested));
+}
+
+}  // namespace walnutpie::detail
+
 namespace walnutpie {
 
 /**
@@ -66,14 +93,12 @@ inline void walnuts(std::size_t seed, std::vector<H>& chain_handlers,
     samplers.emplace_back(std::move(adapters[n].sampler()));
   }
 
-  // Ridge guard (opt-in; sampling().ridge_guard() == 0 disables it):
-  // chains that locked onto different points of a likelihood-null ridge
-  // disperse far more across chains than the adapted within-chain scale
-  // sqrt(inv_mass). The log density is invariant along such ridges, so
-  // no log-mass statistic can detect the lock; positions can. On
-  // detection, raise the frozen trajectory budget, scaled to the misfit:
-  // longer trajectories traverse the ridge (the lock is trajectory-
-  // length binding, not metric binding).
+  // Opt-in experimental detector: compare final chain positions (not chain
+  // means) with the adapted within-chain scale sqrt(inv_mass). A large ratio
+  // is not proof of a null ridge or a convergence failure. On a fire, rebuild
+  // the samplers with a scaled replacement budget bounded by ridge_min_micro.
+  // The nominal floor 16 is clipped to that cap, including caps below 16.
+  // Replacement can lower the adapted budget; this is not always an increase.
   const double ridge_threshold = config.sampling().ridge_guard();
   if (ridge_threshold > 0.0 && samplers.size() > 1) {
     const std::size_t chains = samplers.size();
@@ -104,10 +129,7 @@ inline void walnuts(std::size_t seed, std::vector<H>& chain_handlers,
     if (worst_f > ridge_threshold) {
       const double scale = worst_f / ridge_threshold;
       const std::size_t cap = config.sampling().ridge_min_micro();
-      const std::size_t budget = std::max<std::size_t>(
-          std::min(static_cast<std::size_t>(16.0 * std::max(scale, 1.0)),
-                   cap),
-          16);
+      const std::size_t budget = detail::ridge_micro_budget(scale, cap);
       std::vector<Sampler> replaced;
       replaced.reserve(chains);
       for (std::size_t c = 0; c < chains; ++c) {
