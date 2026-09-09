@@ -164,6 +164,10 @@ struct AdaptResult {
  * @brief The implementation of the control monitor with the adaptation
  * state of each chain and configuration.
  *
+ * Warmup stops when the chains reach `max_iter()` iterations, or earlier
+ * only if `warmup_cfg.allow_early_exit()` is set and the cross-chain
+ * convergence criteria hold.
+ *
  * @param[inout] buffers The adaptation state of all the chains.
  * @param[in] init_cfg The initialization configuration.
  * @param[in] warmup_cfg The warmup configuration.
@@ -216,7 +220,8 @@ inline AdaptResult controller_loop(
         max_rel_diff_step = std::fmax(max_rel_diff_step, rel_diff_step);
       }
 
-      bool converged = max_rel_diff_mass <= warmup_cfg.mass_converge_tol() &&
+      bool converged = warmup_cfg.allow_early_exit() &&
+                       max_rel_diff_mass <= warmup_cfg.mass_converge_tol() &&
                        max_rel_diff_step <= warmup_cfg.step_size_converge_tol();
       bool hit_max_iter = num_draws == max_draws;
       if (converged || hit_max_iter) {

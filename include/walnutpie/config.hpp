@@ -618,6 +618,17 @@ class WarmupConfig {
    */
   std::size_t yield_period() const { return yield_period_; }
 
+  /**
+   * @brief Return `true` if the convergence criteria may stop warmup
+   * before `max_iter()`.
+   *
+   * Defaults to `false`: warmup runs to the iteration budget and the
+   * cross-chain criteria remain diagnostic.
+   *
+   * @return Whether convergence-based early exit is enabled.
+   */
+  bool allow_early_exit() const { return allow_early_exit_; }
+
  private:
   friend class WarmupConfigBuilder;
 
@@ -638,6 +649,9 @@ class WarmupConfig {
   double step_learn_rate_decay_ = 0.5;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
+
+  /** Whether the convergence criteria may stop warmup early. */
+  bool allow_early_exit_ = false;
 };
 
 /**
@@ -835,6 +849,18 @@ class WarmupConfigBuilder {
   WarmupConfigBuilder& yield_period(std::size_t v) {
     detail::validate_positive(v, "yield_period");
     cfg_.yield_period_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set whether the convergence criteria may stop warmup before
+   * `max_iter()`.
+   *
+   * @param[in] v Whether convergence-based early exit is enabled.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& allow_early_exit(bool v) {
+    cfg_.allow_early_exit_ = v;
     return *this;
   }
 
