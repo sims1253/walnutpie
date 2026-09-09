@@ -173,6 +173,12 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
     sampler();
   }
   end_timing();
+  // Trajectory diagnostics (counters only; the draw path is unchanged).
+  std::cout << "Trajectory depth: mean " << sampler.mean_trajectory_depth()
+            << " max " << sampler.max_trajectory_depth()
+            << "; mean states/draw " << sampler.mean_states_per_draw()
+            << "; depth-cap rate " << sampler.depth_cap_rate() << std::endl;
+  std::cout << "Min micro steps: " << sampler.min_micro_steps() << std::endl;
 
   return storage;
 }
