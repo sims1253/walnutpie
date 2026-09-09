@@ -39,3 +39,8 @@ endfunction()
 add_test(summary)
 add_test(config)
 add_test(util)
+
+if(WALNUTPIE_BUILD_EXAMPLES)
+  add_test(micro_guard)
+  target_link_libraries(micro_guard_test PRIVATE CLI11::CLI11 BridgeStan::BridgeStan)
+endif()
