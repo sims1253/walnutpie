@@ -15,7 +15,7 @@ authors = [
     { name = "Bob Carpenter", email = "bcarpenter@flatironinstitute.org" },
 ]
 requires-python = ">=3.9"
-dependencies = ["numpy"]
+dependencies = ["numpy>=2"]
 dynamic = ["version"]
 
 [project.urls]

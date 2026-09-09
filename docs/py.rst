@@ -23,17 +23,17 @@ will turn off adaptive stopping and result in reproducible runs.
 Output Classes
 ______________
 
-.. autoclass:: walnutpie.pyfunc::WalnutsOutputArray
+.. autoclass:: walnutpie.pyfunc.WalnutsOutputArray
    :members:
    :show-inheritance:
 
-.. autoclass:: walnutpie.stan::StanOutput
+.. autoclass:: walnutpie.stan.StanOutput
    :members:
    :inherited-members:
    :show-inheritance:
    :special-members: __getitem__
 
-.. autoclass:: walnutpie.stan::StanOutputBase
+.. autoclass:: walnutpie.stan.StanOutputBase
 
 .. autoclass:: walnutpie.util::WarmupInfo
    :members:

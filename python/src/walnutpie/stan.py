@@ -180,6 +180,7 @@ def bs_print_callback(msg, size, is_error):
     print(
         ctypes.string_at(msg, size).decode("utf-8"),
         file=sys.stderr if is_error else sys.stdout,
+        end="",
     )
 
 
