@@ -25,47 +25,50 @@ examples/stan_cli [OPTIONS] model [data]
 
 
 POSITIONALS:
-  model TEXT:FILE REQUIRED    Path to the Stan model library (.so from CmdStan{,Py,R})
+  model TEXT:FILE REQUIRED    Path to the Stan model library (.so from BridgeStan)
   data TEXT:FILE              Path to the Stan model data (.json, optional)
 
 OPTIONS:
-  --help              Print this help message and exit
-  --seed UINT [29294659]
-                      Random seed (default randomize with clock)
-  --warmup UINT:NONNEGATIVE [128]
-                      Number of warmup iterations
-  --samples UINT:POSITIVE [128]
-                      Number of samples to draw
-  --max-depth UINT:POSITIVE [10]
-                      Maximum depth for Nuts trajectory doublings
-  --max-step-depth UINT:POSITIVE [8]
-                      Maximum depth for the step size adaptation
-  --min-micro-steps UINT:POSITIVE [1]
-                      Minimum micro steps per macro step
-  --max-error FLOAT:POSITIVE [0.5]
-                      Maximum error allowed in joint densities
-  --init FLOAT:NONNEGATIVE [2]
-                      Range [-init,init] for uniform parameter initial values
-  --mass-init-count FLOAT:FLOAT in [1 - 1.79769e+308] [1.1]
-                      Initial count for the mass matrix adaptation
-  --mass-iteration-offset FLOAT:FLOAT in [1 - 1.79769e+308] [1.1]
-                      Offset for the mass matrix adaptation iterations
-  --mass-additive-smoothing FLOAT:POSITIVE [1e-05]
-                      Additive smoothing for the mass matrix adaptation
-  --step-size-init FLOAT:POSITIVE [1]
-                      Initial step size for the step size adaptation
-  --step-accept-rate-target FLOAT:FLOAT in [2.22507e-308 - 1] [0.8]
-                      Target acceptance rate for the step size adaptation
-  --step-learning-rate FLOAT:POSITIVE [0.2]
-                      Learning rates for step adaptation
-  --step-beta1 FLOAT:FLOAT in [2.22507e-308 - 1] [0.3]
-                      Decay rate of gradient moving average for step adaptation
-  --step-beta2 FLOAT:FLOAT in [2.22507e-308 - 1] [0.99]
-                      Decay rate of squared gradient moving average for step adaptation
-  --step-epsilon FLOAT:POSITIVE [0.0001]
-                      Update stabilization term for step size adaptation
-  --output TEXT:PATH(non-existing)
-                      Output file for the draws
+  -h,     --help              Print this help message and exit
+          --seed UINT [1257236658]
+                              Random seed (default randomize with clock)
+          --warmup UINT:NONNEGATIVE [128]
+                              Number of warmup iterations
+          --samples UINT:POSITIVE [128]
+                              Number of samples to draw
+          --save-warmup [0]   Pass this flag to save the warmup iterations as well.
+          --max-trajectory-doublings UINT:POSITIVE [5]
+                              Maximum depth for Nuts trajectory doublings
+          --max-step-halvings UINT:POSITIVE [5]
+                              Maximum depth for the step size adaptation
+          --min-micro-steps UINT:POSITIVE [1]
+                              Minimum micro steps per macro step
+          --max-hamiltonian-error FLOAT:POSITIVE [0.5]
+                              Maximum error allowed in joint densities
+          --init FLOAT:NONNEGATIVE [2]
+                              Range [-init,init] for uniform parameter initial values
+          --mass-init-count FLOAT:FLOAT in [1 - 1.79769e+308] [4]
+                              Initial count for the mass matrix adaptation
+          --mass-additive-smoothing FLOAT:POSITIVE [1e-05]
+                              Additive smoothing for the mass matrix adaptation
+          --max-macro-steps-target FLOAT:POSITIVE [15]
+                              Target number of macro steps
+          --step-size-init FLOAT:POSITIVE [1]
+                              Initial step size for the step size adaptation
+          --step-accept-rate-target FLOAT:FLOAT in [2.22507e-308 - 1] [0.8]
+                              Target acceptance rate for the step size adaptation
+          --step-learning-rate FLOAT:POSITIVE [0.05]
+                              Learning rates for step adaptation
+          --step-gradient-decay FLOAT:FLOAT in [2.22507e-308 - 1] [0.8]
+                              Decay rate of gradient moving average for step adaptation
+          --step-sq-gradient-decay FLOAT:FLOAT in [2.22507e-308 - 1] [0.9]
+                              Decay rate of squared gradient moving average for step adaptation
+          --step-stabilization FLOAT:POSITIVE [0.0001]
+                              Update stabilization term for step size adaptation
+          --step-learn-rate-decay FLOAT:FLOAT in [2.22507e-308 - 1] [0.5]
+                              Decay rate of exponent for step adaptation
+          --output TEXT:PATH(non-existing)
+                              Output file for the draws
 ```
 
 The documentation automatically generated by `CLI11` library we use to

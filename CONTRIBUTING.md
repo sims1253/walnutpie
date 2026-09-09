@@ -75,7 +75,7 @@ Some common options are:
 - `-B <build_dir>` - Specify the build directory where the build files will be generated. If omitted, the directory you run the command from will be used.
 - `-DCMAKE_BUILD_TYPE=Debug` - Set the build type to Debug.
 - `-DCMAKE_BUILD_TYPE=Release` - Set the build type to Release.
-- `-DWALNUTPIE_BUILD_TESTS=ON` - Enable building of the tests (currently on by default).
+- `-DWALNUTPIE_BUILD_TESTS=ON` - Enable building of the tests (off by default).
 - `-DWALNUTPIE_BUILD_EXAMPLES=ON` - Enable building of the examples (currently on by default).
 - `-DWALNUTPIE_USE_MIMALLOC=ON` - Link against the [mimalloc](https://github.com/microsoft/mimalloc), a MIT licensed custom memory allocator which can improve performance.
 - `-DWALNUTPIE_USE_TSAN=ON` - Turn on the [thread sanitizer](https://clang.llvm.org/docs/ThreadSanitizer.html)---only available if building with Clang.
@@ -86,7 +86,7 @@ For example, a basic configuration which creates a `./build` directory in the re
 root can be done with
 
 ```sh
-cmake -S . -B ./build -DCMAKE_BUILD_TYPE=RelWithDebug
+cmake -S . -B ./build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ```
 
 
