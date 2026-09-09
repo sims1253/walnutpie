@@ -39,3 +39,27 @@ endfunction()
 add_test(summary)
 add_test(config)
 add_test(util)
+
+foreach(name IN ITEMS stan_thread_stub stan_thread_missing)
+  add_library(${name} SHARED stan_thread_stub.cpp)
+  target_link_libraries(${name} PRIVATE BridgeStan::BridgeStan)
+  target_compile_definitions(${name} PRIVATE BRIDGESTAN_EXPORT)
+endforeach()
+target_compile_definitions(stan_thread_missing PRIVATE OMIT_MODEL_INFO)
+
+add_test(stan_threads)
+target_link_libraries(stan_threads_test PRIVATE BridgeStan::BridgeStan ${CMAKE_DL_LIBS})
+target_compile_definitions(stan_threads_test PRIVATE
+  THREAD_STUB_PATH="$<TARGET_FILE:stan_thread_stub>"
+  THREAD_MISSING_PATH="$<TARGET_FILE:stan_thread_missing>")
+add_dependencies(stan_threads_test stan_thread_stub stan_thread_missing)
+
+# The binding has no Python-runtime dependency, but is only built in SKBUILD mode.
+if(TARGET walnutpy)
+  add_test(stan_binding_threads)
+  target_link_libraries(stan_binding_threads_test PRIVATE walnutpy BridgeStan::BridgeStan ${CMAKE_DL_LIBS})
+  target_compile_definitions(stan_binding_threads_test PRIVATE
+    THREAD_STUB_PATH="$<TARGET_FILE:stan_thread_stub>"
+    THREAD_MISSING_PATH="$<TARGET_FILE:stan_thread_missing>")
+  add_dependencies(stan_binding_threads_test stan_thread_stub stan_thread_missing)
+endif()

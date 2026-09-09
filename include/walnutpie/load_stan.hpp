@@ -7,11 +7,14 @@
 #include <bridgestan.h>
 #include <Eigen/Dense>
 
+#include <cctype>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 // TODO: consider using something like https://github.com/martin-olivier/dylib/
@@ -37,6 +40,52 @@ static char* dlerror() {
 #endif
 
 namespace walnutpie::internal {
+
+/** Read the complete STAN_THREADS define; absent or ambiguous data is unknown.
+ */
+inline std::optional<bool> stan_threads_from_model_info(const char* info) {
+  if (!info) {
+    return std::nullopt;
+  }
+  std::optional<bool> result;
+  std::string_view remaining(info);
+  while (!remaining.empty()) {
+    auto end = remaining.find('\n');
+    auto line = remaining.substr(0, end);
+    if (end == std::string_view::npos) {
+      remaining = {};
+    } else {
+      remaining.remove_prefix(end + 1);
+    }
+    while (!line.empty() &&
+           std::isspace(static_cast<unsigned char>(line.front()))) {
+      line.remove_prefix(1);
+    }
+    while (!line.empty() &&
+           std::isspace(static_cast<unsigned char>(line.back()))) {
+      line.remove_suffix(1);
+    }
+    constexpr std::string_view key = "STAN_THREADS";
+    if (!line.starts_with(key)) {
+      continue;
+    }
+    if (line.size() > key.size() && line[key.size()] != '=' &&
+        !std::isspace(static_cast<unsigned char>(line[key.size()]))) {
+      continue;
+    }
+    if (result.has_value()) {
+      return std::nullopt;
+    }
+    if (line == "STAN_THREADS=true") {
+      result = true;
+    } else if (line == "STAN_THREADS=false") {
+      result = false;
+    } else {
+      return std::nullopt;
+    }
+  }
+  return result;
+}
 
 struct dlclose_deleter {
   void operator()(void*) const {
@@ -122,6 +171,21 @@ class DynamicStanModel {
   }
   std::size_t constrained_dimensions() const {
     return static_cast<std::size_t>(param_num_(model_ptr_.get(), true, true));
+  }
+
+  /**
+   * Return the model's STAN_THREADS setting, or nullopt if it is unavailable
+   * or ambiguous. This build flag is not a guarantee that custom functions,
+   * callbacks, or callers' shared state support concurrent use.
+   * Querying the flag does not restrict serial use of the loader.
+   */
+  std::optional<bool> stan_threads() const {
+    auto model_info = reinterpret_cast<decltype(&bs_model_info)>(
+        dlsym(library_.get(), "bs_model_info"));
+    if (!model_info) {
+      return std::nullopt;
+    }
+    return internal::stan_threads_from_model_info(model_info(model_ptr_.get()));
   }
 
   template <typename M>

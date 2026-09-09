@@ -26,6 +26,9 @@ namespace walnutpie {
  * @param[in] global_handler The handler for global cross-chain events.
  * @param[in] interrupt_callback The callback for stopping.
  * @param[in] log_p_grad The log density and gradient function, called back.
+ * This function is shared across chain threads and must support concurrent
+ * calls. The caller is responsible for thread safety of captured state and
+ * handlers. The callable concept cannot check this requirement.
  * @param[in] config The configuration for Walnutpie.
  * @throws std::invalid_argument If the number of handlers doesn't match
  * the initialization configuration's number of chains.

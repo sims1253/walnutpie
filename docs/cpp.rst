@@ -7,7 +7,13 @@ Sampling functionality
 Top-level call
 ______________
 
-This function will spawn threads to perform end-to-end sampling
+This function will spawn threads to perform end-to-end sampling.
+The target is shared across chain threads and must support concurrent calls.
+The generic callable API cannot inspect captured model state or prove thread safety.
+For Stan targets, ``STAN_THREADS=true`` is a build prerequisite, not a guarantee
+that custom functions, callbacks or other shared state are safe.
+``DynamicStanModel::stan_threads()`` returns an optional boolean; check for
+known true explicitly, not just whether metadata is present.
 
 .. doxygenfunction:: walnutpie::walnuts
 
