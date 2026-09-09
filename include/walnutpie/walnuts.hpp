@@ -5,6 +5,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <ostream>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -18,6 +19,85 @@
 #include "walnutpie/validate.hpp"
 
 namespace walnutpie::detail {
+
+// W-97 cap-census instrumentation (opt-in, counters only, zero behavior
+// change when disabled): measures how hard the max_error cap binds in
+// macro_step, per SAMPLING-phase macro attempt. The CLI enables this
+// around its post-warmup sampling loop only (warmup is never counted).
+// File-scope instead of a transition parameter so no call site changes.
+struct CapCensus {
+  bool enabled = false;
+
+  // (a) total accepted macro attempts (macro_step returned true)
+  std::size_t accepted = 0;
+  // (b) accepted attempts whose checked |logp_next - logp| at the macro_step
+  // tolerance test landed within 10% of max_error (>= 0.9 * max_error)
+  std::size_t pressure_hits = 0;
+  // macro_step false returns: tolerance never met after all halvings
+  // (the divergence analog) vs met-but-irreversible
+  std::size_t rejected_exhausted = 0;
+  std::size_t rejected_irreversible = 0;
+  // (c) halvings used per accepted attempt, histogram over halvings = 0..
+  static constexpr std::size_t kMaxHalvings = 64;
+  std::size_t halvings_hist[kMaxHalvings] = {};
+
+  // in-flight tolerant attempt awaiting its reversibility verdict
+  double pend_dlogp = 0.0;
+  double pend_max_error = 0.0;
+  std::size_t pend_halvings = 0;
+
+  void on_tolerant(double dlogp, double max_error,
+                   std::size_t halvings) noexcept {
+    pend_dlogp = dlogp;
+    pend_max_error = max_error;
+    pend_halvings = halvings;
+  }
+  void on_verdict(bool rev) noexcept {
+    if (rev) {
+      ++accepted;
+      if (pend_halvings < kMaxHalvings) {
+        ++halvings_hist[pend_halvings];
+      }
+      if (pend_max_error > 0.0 && pend_dlogp >= 0.9 * pend_max_error) {
+        ++pressure_hits;
+      }
+    } else {
+      ++rejected_irreversible;
+    }
+  }
+  void on_exhausted() noexcept { ++rejected_exhausted; }
+  std::size_t rejected() const noexcept {
+    return rejected_exhausted + rejected_irreversible;
+  }
+};
+inline CapCensus g_cap_census;
+
+// End-of-run aggregate summary (stderr line the CLI emits with
+// --cap-census): halvings_hist is ':'-separated counts for halvings
+// buckets 0..last-nonempty.
+inline void cap_census_report(std::ostream& os) {
+  const CapCensus& cc = g_cap_census;
+  os << "[census] attempts=" << cc.accepted
+     << " pressure_hits=" << cc.pressure_hits
+     << " rejected=" << cc.rejected()
+     << " halvings_hist=";
+  std::size_t last = 0;
+  for (std::size_t k = 0; k < CapCensus::kMaxHalvings; ++k) {
+    if (cc.halvings_hist[k] > 0) {
+      last = k;
+    }
+  }
+  for (std::size_t k = 0; k <= last; ++k) {
+    if (k > 0) {
+      os << ":";
+    }
+    os << cc.halvings_hist[k];
+  }
+  // sub-counts of rejected= (exhausted halvings vs irreversible) for the
+  // divergence-analog interpretation
+  os << " rejected_exhausted=" << cc.rejected_exhausted
+     << " rejected_irreversible=" << cc.rejected_irreversible << std::endl;
+}
 
 /**
  * @brief A class for holding the minimal information in a Hamiltonian
@@ -337,9 +417,22 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
       adapt_handler(min_accept);
     }
     if (std::fabs(logp - logp_next) <= max_error) {
-      return reversible(logp_grad, inv_mass, step, num_steps, min_micro_steps,
-                        max_error, logp_next, theta_next, rho_next, grad_next);
+      // W-97 cap census (counters only; no RNG or arithmetic touched).
+      if (g_cap_census.enabled) {
+        g_cap_census.on_tolerant(std::fabs(logp - logp_next), max_error,
+                                 halvings);
+      }
+      const bool rev =
+          reversible(logp_grad, inv_mass, step, num_steps, min_micro_steps,
+                     max_error, logp_next, theta_next, rho_next, grad_next);
+      if (g_cap_census.enabled) {
+        g_cap_census.on_verdict(rev);
+      }
+      return rev;
     }
+  }
+  if (g_cap_census.enabled) {
+    g_cap_census.on_exhausted();
   }
   return false;
 }
