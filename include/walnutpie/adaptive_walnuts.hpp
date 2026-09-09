@@ -10,6 +10,7 @@
 #include <Eigen/Dense>
 
 #include "walnutpie/adam.hpp"
+#include "walnutpie/step_optimizers.hpp"
 #include "walnutpie/concepts.hpp"
 #include "walnutpie/config.hpp"
 #include "walnutpie/online_moments.hpp"
@@ -165,6 +166,82 @@ class MinMicroStepsAdaptHandler {
 
 }  // namespace walnutpie::detail
 
+
+namespace walnutpie::detail {
+
+/**
+ * @brief Traits-based factory for step size adapters.
+ *
+ * Specializations construct each adapter shipped with this library from the
+ * chain initialization and warmup configuration. User code may add
+ * specializations for custom adapters.
+ */
+template <class Opt>
+struct StepAdapterFactory;  // primary: intentionally undefined
+
+template <>
+struct StepAdapterFactory<Adam> {
+  static Adam make(const InitChainConfig& init_cfg,
+                   const WarmupConfig& warmup_cfg) {
+    return Adam(init_cfg.step_size(), warmup_cfg.step_accept_rate_target(),
+                warmup_cfg.step_learning_rate(),
+                warmup_cfg.step_gradient_decay(),
+                warmup_cfg.step_sq_gradient_decay(),
+                warmup_cfg.step_stabilization(),
+                warmup_cfg.step_learn_rate_decay());
+  }
+};
+
+template <>
+struct StepAdapterFactory<DualAveraging> {
+  static DualAveraging make(const InitChainConfig& init_cfg,
+                            const WarmupConfig& warmup_cfg) {
+    return DualAveraging(init_cfg.step_size(),
+                         warmup_cfg.step_accept_rate_target(),
+                         warmup_cfg.da_gamma(), warmup_cfg.da_t0(),
+                         warmup_cfg.da_kappa());
+  }
+};
+
+template <>
+struct StepAdapterFactory<AdEMAMix> {
+  static AdEMAMix make(const InitChainConfig& init_cfg,
+                       const WarmupConfig& warmup_cfg) {
+    return AdEMAMix(init_cfg.step_size(), warmup_cfg.step_accept_rate_target(),
+                    warmup_cfg.step_learning_rate(),
+                    warmup_cfg.step_gradient_decay(),
+                    warmup_cfg.step_sq_gradient_decay(), 0.9999,
+                    warmup_cfg.step_stabilization(),
+                    warmup_cfg.step_learn_rate_decay(),
+                    warmup_cfg.slow_ema_warmup());
+  }
+};
+
+template <>
+struct StepAdapterFactory<AdaBelief> {
+  static AdaBelief make(const InitChainConfig& init_cfg,
+                        const WarmupConfig& warmup_cfg) {
+    return AdaBelief(init_cfg.step_size(), warmup_cfg.step_accept_rate_target(),
+                     warmup_cfg.step_learning_rate(),
+                     warmup_cfg.step_gradient_decay(),
+                     warmup_cfg.step_sq_gradient_decay(),
+                     warmup_cfg.step_stabilization(),
+                     warmup_cfg.step_learn_rate_decay());
+  }
+};
+
+template <StepSizeAdapter Inner>
+struct StepAdapterFactory<BatchedAdapter<Inner>> {
+  static BatchedAdapter<Inner> make(const InitChainConfig& init_cfg,
+                                    const WarmupConfig& warmup_cfg) {
+    return BatchedAdapter<Inner>(
+        StepAdapterFactory<Inner>::make(init_cfg, warmup_cfg),
+        warmup_cfg.step_opt_batch_stride());
+  }
+};
+
+}  // namespace walnutpie::detail
+
 namespace walnutpie {
 
 /**
@@ -179,7 +256,8 @@ namespace walnutpie {
  * @tparam RNG Type of base random number generator.
  * @tparam Handler Type of adaptation and sampling event handler.
  */
-template <LogpGrad F, std::uniform_random_bit_generator RNG, ChainHandler H>
+template <LogpGrad F, std::uniform_random_bit_generator RNG, ChainHandler H,
+          detail::StepSizeAdapter Opt = detail::Adam>
 class AdaptiveWalnuts {
  public:
   /**
@@ -213,11 +291,8 @@ class AdaptiveWalnuts {
         logp_grad_(logp_grad, handler),
         theta_(init_chain_cfg.position()),
         iteration_(0),
-        adam_(init_chain_cfg.step_size(), warmup_cfg.step_accept_rate_target(),
-              warmup_cfg.step_learning_rate(), warmup_cfg.step_gradient_decay(),
-              warmup_cfg.step_sq_gradient_decay(),
-              warmup_cfg.step_stabilization(),
-              warmup_cfg.step_learn_rate_decay()),
+        opt_(detail::StepAdapterFactory<Opt>::make(init_chain_cfg,
+                              warmup_cfg)),
         mass_estimator_(warmup_cfg, init_chain_cfg),
         min_micro_estimator_(warmup_cfg.max_macro_steps_target(),
                              sampling_cfg.min_micro_steps()) {}
@@ -238,12 +313,12 @@ class AdaptiveWalnuts {
     double logp_select;
     std::size_t depth;
     theta_ =
-        transition_w(rand_, logp_grad_, inv_mass, chol_mass, adam_.step_size(),
+        transition_w(rand_, logp_grad_, inv_mass, chol_mass, opt_.step_size(),
                      sampling_cfg_.get().max_trajectory_doublings(),
                      sampling_cfg_.get().max_step_halvings(),
                      min_micro_estimator_.min_micro_steps(),
                      sampling_cfg_.get().max_hamiltonian_error(),
-                     std::move(theta_), depth, grad_select, logp_select, adam_);
+                     std::move(theta_), depth, grad_select, logp_select, opt_);
     mass_estimator_.observe(theta_, grad_select, iteration_);
     min_micro_estimator_.observe(1 << depth);
     handler_.get().on_warmup(theta_, logp_select, step_size(), inv_mass);
@@ -284,7 +359,7 @@ class AdaptiveWalnuts {
    *
    * @return The step size.
    */
-  double step_size() const { return adam_.step_size(); }
+  double step_size() const { return opt_.step_size(); }
 
   /**
    * @brief Return the minimum number of micro steps per macro step.
@@ -351,9 +426,9 @@ class AdaptiveWalnuts {
   /** The current iteration. */
   std::size_t iteration_;
 
-  /** The Adam optimizer for step size adaptation.
+  /** The optimizer for step size adaptation.
    */
-  detail::Adam adam_;
+  Opt opt_;
 
   /** The estimator for the mass matrix. */
   detail::MassEstimator mass_estimator_;

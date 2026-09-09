@@ -604,6 +604,16 @@ class WarmupConfig {
    */
   double step_learn_rate_decay() const { return step_learn_rate_decay_; }
 
+  double da_gamma() const { return da_gamma_; }
+
+  double da_t0() const { return da_t0_; }
+
+  double da_kappa() const { return da_kappa_; }
+
+  std::size_t slow_ema_warmup() const { return slow_ema_warmup_; }
+
+  std::size_t step_opt_batch_stride() const { return step_opt_batch_stride_; }
+
   /**
    * @brief Return the stride for publishing updates for convergence monitoring.
    *
@@ -636,6 +646,11 @@ class WarmupConfig {
   double step_sq_gradient_decay_ = 0.9;
   double step_stabilization_ = 1e-4;
   double step_learn_rate_decay_ = 0.5;
+  double da_gamma_ = 0.05;
+  double da_t0_ = 10.0;
+  double da_kappa_ = 0.75;
+  std::size_t slow_ema_warmup_ = 100;
+  std::size_t step_opt_batch_stride_ = 1;
   std::size_t publish_stride_ = 5;
   std::size_t yield_period_ = 32;
 };
@@ -804,6 +819,37 @@ class WarmupConfigBuilder {
    * @return This builder for chaining.
    * @throw std::invalid_argument If the decay exponent is not in (0, 1).
    */
+  WarmupConfigBuilder& da_gamma(double v) {
+    detail::validate_finite_positive(v, "da_gamma");
+    cfg_.da_gamma_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& da_t0(double v) {
+    detail::validate_finite_positive(v, "da_t0");
+    cfg_.da_t0_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& da_kappa(double v) {
+    detail::validate_probability(v, "da_kappa");
+    cfg_.da_kappa_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& slow_ema_warmup(std::size_t v) {
+    cfg_.slow_ema_warmup_ = v;
+    return *this;
+  }
+
+  WarmupConfigBuilder& step_opt_batch_stride(std::size_t v) {
+    if (v == 0) {
+      throw std::invalid_argument("step_opt_batch_stride must be >= 1");
+    }
+    cfg_.step_opt_batch_stride_ = v;
+    return *this;
+  }
+
   WarmupConfigBuilder& step_learn_rate_decay(double v) {
     detail::validate_probability(v, "step_learn_rate_decay");
     cfg_.step_learn_rate_decay_ = v;
