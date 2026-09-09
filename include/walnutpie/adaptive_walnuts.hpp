@@ -271,6 +271,26 @@ class AdaptiveWalnuts {
   }
 
   /**
+   * @brief Return a frozen sampler with an overridden micro-step budget.
+   *
+   * Identical to sampler() except for the minimum micro steps per macro
+   * step. Used by the experimental multi-chain ridge guard to replace the
+   * trajectory budget. The capped replacement can be lower than the
+   * adapted budget; the detector does not establish a likelihood-null ridge.
+   *
+   * @param[in] min_micro_steps The minimum number of micro steps.
+   * @return The Walnuts sampler with the given trajectory budget.
+   */
+  WalnutsSampler<F, RNG, H> sampler_min_micro(std::size_t min_micro_steps) {
+    handler_.get().on_warmup_complete(step_size(), inv_mass());
+    return WalnutsSampler<F, RNG, H>(
+        rand_.rng(), handler_, logp_grad_.logp_grad_, theta_, inv_mass(),
+        step_size(), sampling_cfg_.get().max_trajectory_doublings(),
+        sampling_cfg_.get().max_step_halvings(), min_micro_steps,
+        sampling_cfg_.get().max_hamiltonian_error());
+  }
+
+  /**
    * @brief Return the diagonal of the diagonal inverse mass matrix.
    *
    * @return The diagonal of the inverse mass matrix.

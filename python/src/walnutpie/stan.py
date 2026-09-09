@@ -214,6 +214,8 @@ def walnuts_stan(
     step_sq_gradient_decay: float = 0.9,
     step_stabilization: float = 1e-4,
     step_learn_rate_decay: float = 0.5,
+    ridge_guard: float = 0.0,
+    ridge_min_micro: int = 128,
     save_warmup: bool = False,
     refresh: int = 0,
 ) -> list[StanOutput]:
@@ -287,6 +289,13 @@ def walnuts_stan(
         The additive step stabilization factor for Adam, non-negative, by default ``1e-4``.
     step_learn_rate_decay : float, optional
         The learning rate decay for Adam, non-negative, by default ``0.5``.
+    ridge_guard : float, optional
+        Experimental threshold on final chain-position dispersion (not chain
+        means). Zero disables the guard. This is not a convergence test.
+    ridge_min_micro : int, optional
+        Positive cap on the guard's replacement micro-step budget, default 128.
+        Caps below 16 clip the nominal floor; zero is invalid. Replacement can
+        lower the adapted budget and does not guarantee improved sampling.
     save_warmup : bool, optional
         Set to ``True`` to save warmup iterations, by default ``False``.
     refresh : int, optional
@@ -378,6 +387,8 @@ def walnuts_stan(
         step_sq_gradient_decay,
         step_stabilization,
         step_learn_rate_decay,
+        ridge_guard,
+        ridge_min_micro,
         save_warmup,
         out,
         out.size,

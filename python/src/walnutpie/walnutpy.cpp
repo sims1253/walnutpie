@@ -30,7 +30,8 @@ void run_sampler(const walnutpie::LogpGrad auto& logp, int num_params,
                  double mass_additive_smoothing, double max_macro_steps_target,
                  double step_accept_rate_target, double step_learning_rate,
                  double step_gradient_decay, double step_sq_gradient_decay,
-                 double step_stabilization, double step_learn_rate_decay) {
+                 double step_stabilization, double step_learn_rate_decay,
+                 double ridge_guard, size_t ridge_min_micro) {
   interrupt::walnutpy_interrupt_handler interrupt;
 
   walnutpie::WarmupConfig warmup_cfg =
@@ -58,6 +59,8 @@ void run_sampler(const walnutpie::LogpGrad auto& logp, int num_params,
           .max_trajectory_doublings(max_trajectory_doublings)
           .max_step_halvings(max_step_halvings)
           .max_hamiltonian_error(max_hamiltonian_error)
+          .ridge_guard(ridge_guard)
+          .ridge_min_micro(ridge_min_micro)
           .min_micro_steps(min_micro_steps)
           .build();
 
@@ -143,10 +146,10 @@ WALNUTPY_EXPORT int walnutpie_sample_cfunc(
     double step_size_init, double step_accept_rate_target,
     double step_learning_rate, double step_gradient_decay,
     double step_sq_gradient_decay, double step_stabilization,
-    double step_learn_rate_decay, bool save_warmup, double* out,
-    size_t out_size, int* final_lengths, double* stepsize_out,
-    double* inv_metric_out, int refresh, PRINT_CALLBACK print,
-    WalnutpyError** err) {
+    double step_learn_rate_decay, double ridge_guard, size_t ridge_min_micro,
+    bool save_warmup, double* out, size_t out_size, int* final_lengths,
+    double* stepsize_out, double* inv_metric_out, int refresh,
+    PRINT_CALLBACK print, WalnutpyError** err) {
   return error::catch_exceptions(err, [&]() {
     error::check_nonnegative("refresh", refresh);
 
@@ -202,15 +205,16 @@ WALNUTPY_EXPORT int walnutpie_sample_cfunc(
           save_warmup, printers[i]);
     }
     GlobalHandler global(printers[0]);
-    run_sampler(
-        logp, num_params, init_cfg_builder, handlers, global, num_chains, seed,
-        id, init_inv_metric, min_warmup_iter, max_warmup_iter,
-        min_sampling_iter, max_sampling_iter, max_trajectory_doublings,
-        max_step_halvings, min_micro_steps, max_hamiltonian_error,
-        step_size_converge_tol, mass_converge_tol, rhat_converge_tol,
-        mass_init_count, mass_additive_smoothing, max_macro_steps_target,
-        step_accept_rate_target, step_learning_rate, step_gradient_decay,
-        step_sq_gradient_decay, step_stabilization, step_learn_rate_decay);
+    run_sampler(logp, num_params, init_cfg_builder, handlers, global,
+                num_chains, seed, id, init_inv_metric, min_warmup_iter,
+                max_warmup_iter, min_sampling_iter, max_sampling_iter,
+                max_trajectory_doublings, max_step_halvings, min_micro_steps,
+                max_hamiltonian_error, step_size_converge_tol,
+                mass_converge_tol, rhat_converge_tol, mass_init_count,
+                mass_additive_smoothing, max_macro_steps_target,
+                step_accept_rate_target, step_learning_rate,
+                step_gradient_decay, step_sq_gradient_decay, step_stabilization,
+                step_learn_rate_decay, ridge_guard, ridge_min_micro);
 
     for (size_t i = 0; i < num_chains; ++i) {
       final_lengths[i] = handlers[i].written_warmup();
@@ -237,10 +241,10 @@ WALNUTPY_EXPORT int walnutpie_sample_bridgestan(
     double step_size_init, double step_accept_rate_target,
     double step_learning_rate, double step_gradient_decay,
     double step_sq_gradient_decay, double step_stabilization,
-    double step_learn_rate_decay, bool save_warmup, double* out,
-    size_t out_size, int* final_lengths, double* stepsize_out,
-    double* inv_metric_out, int refresh, PRINT_CALLBACK print,
-    WalnutpyError** err) {
+    double step_learn_rate_decay, double ridge_guard, size_t ridge_min_micro,
+    bool save_warmup, double* out, size_t out_size, int* final_lengths,
+    double* stepsize_out, double* inv_metric_out, int refresh,
+    PRINT_CALLBACK print, WalnutpyError** err) {
   using walnutpie::DynamicStanModel;
   using walnutpie::unique_bs_rng;
 
@@ -319,7 +323,7 @@ WALNUTPY_EXPORT int walnutpie_sample_bridgestan(
                 mass_additive_smoothing, max_macro_steps_target,
                 step_accept_rate_target, step_learning_rate,
                 step_gradient_decay, step_sq_gradient_decay, step_stabilization,
-                step_learn_rate_decay);
+                step_learn_rate_decay, ridge_guard, ridge_min_micro);
 
     for (size_t i = 0; i < num_chains; ++i) {
       final_lengths[i] = handlers[i].written_warmup();

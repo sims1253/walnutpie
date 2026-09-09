@@ -122,6 +122,8 @@ _common_sampling_argtypes = [
     ctypes.c_double,  # step_sq_gradient_decay
     ctypes.c_double,  # step_stabilization
     ctypes.c_double,  # step_learn_rate_decay
+    ctypes.c_double,  # ridge_guard
+    ctypes.c_size_t,  # ridge_min_micro
     ctypes.c_bool,  # save_warmup
     double_array,
     ctypes.c_size_t,  # buffer size
