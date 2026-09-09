@@ -244,13 +244,26 @@ class AdaptiveWalnuts {
                      min_micro_estimator_.min_micro_steps(),
                      sampling_cfg_.get().max_hamiltonian_error(),
                      std::move(theta_), depth, grad_select, logp_select, adam_);
-    // Warmup-trace introspection: last transition's selected gradient and
-    // depth (see last_grad()/last_depth()).
-    last_grad_ = grad_select;
-    last_depth_ = depth;
     mass_estimator_.observe(theta_, grad_select, iteration_);
     min_micro_estimator_.observe(1 << depth);
-    handler_.get().on_warmup(theta_, logp_select, step_size(), inv_mass);
+    const double adapted_step = step_size();
+    handler_.get().on_warmup(theta_, logp_select, adapted_step, inv_mass);
+    // Optional synchronous observer: references remain valid only during the
+    // call.
+    if constexpr (requires(H& h, const Eigen::VectorXd& position,
+                           const Eigen::VectorXd& gradient,
+                           const Eigen::VectorXd& mass, const double& lp,
+                           const double& step, const std::size_t& tree_depth) {
+                    {
+                      h.on_warmup_trace(position, gradient, lp, step, mass,
+                                        tree_depth)
+                    } -> std::same_as<void>;
+                  }) {
+      handler_.get().on_warmup_trace(
+          std::as_const(theta_), std::as_const(grad_select),
+          std::as_const(logp_select), std::as_const(adapted_step),
+          std::as_const(inv_mass), std::as_const(depth));
+    }
     ++iteration_;
   }
 
@@ -333,21 +346,6 @@ class AdaptiveWalnuts {
    */
   std::size_t iter() const noexcept { return iteration_; }
 
-  /**
-   * @brief Return the gradient selected by the most recent warmup
-   * transition (offline warmup-trace introspection).
-   *
-   * @return The selected endpoint gradient.
-   */
-  const Eigen::VectorXd& last_grad() const noexcept { return last_grad_; }
-
-  /**
-   * @brief Return the Nuts tree depth of the most recent warmup transition.
-   *
-   * @return The selected trajectory depth.
-   */
-  std::size_t last_depth() const noexcept { return last_depth_; }
-
  private:
   /** The warmup configuration. */
   std::reference_wrapper<const WarmupConfig> warmup_cfg_;
@@ -369,12 +367,6 @@ class AdaptiveWalnuts {
 
   /** The current iteration. */
   std::size_t iteration_;
-
-  /** Last transition's selected gradient (warmup-trace introspection). */
-  Eigen::VectorXd last_grad_;
-
-  /** Last transition's selected tree depth (warmup-trace introspection). */
-  std::size_t last_depth_ = 0;
 
   /** The Adam optimizer for step size adaptation.
    */

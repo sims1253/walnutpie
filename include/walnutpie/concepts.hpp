@@ -232,6 +232,14 @@ concept SampleHandler =
  *    mass matrix.
  *  - `on_sample(const Eigen::VectorXd&, double)` called once per
  *    post-warmup draw with the position and log density.
+ *
+ * An optional `void on_warmup_trace(const Eigen::VectorXd& theta,
+ * const Eigen::VectorXd& grad, double lp, double step,
+ * const Eigen::VectorXd& inv_mass, std::size_t depth)` notification runs
+ * synchronously after `on_warmup`. Its references expire when it returns.
+ * The position/gradient/log density are selected values, inverse mass is
+ * the pre-transition value, and step is the post-adaptation value.
+ * This optional notification is not required by the concept.
  */
 template <typename C>
 concept ChainHandler =

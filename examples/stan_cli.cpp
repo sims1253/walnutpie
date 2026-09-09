@@ -1,5 +1,8 @@
+#include <memory>
+#include <optional>
 #include <walnutpie.hpp>
 #include <walnutpie/load_stan.hpp>
+#include "warmup_trace.hpp"
 
 #include <CLI/CLI.hpp>
 #include <Eigen/Dense>
@@ -7,30 +10,14 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <cstdint>
-#include <filesystem>
-#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <random>
-#include <sstream>
 #include <string>
 #include <vector>
 
 using walnutpie::DynamicStanModel;
 using walnutpie::unique_bs_rng;
-
-// --warmup-trace-dir plumbing: file-scope so run_walnuts can record the
-// warmup without threading a new parameter through its signature. Set
-// once in main(); an empty dir disables tracing. model_name/meta_extras
-// carry main()-side values (library basename, flag values as a JSON
-// fragment) that run_walnuts cannot see.
-struct WarmupTraceSettings {
-  std::string dir;
-  std::string model_name;
-  std::string meta_extras;
-};
-static WarmupTraceSettings g_warmup_trace;
 
 static void summarize(const std::vector<std::string>& names,
                       const Eigen::MatrixXd& draws) {
@@ -95,11 +82,6 @@ class StanHandler {
 
   void on_warmup(const Eigen::VectorXd& position, double lp, double step_size,
                  const Eigen::VectorXd& diag_inv_mass) {
-    // Warmup-tracer capture (read back after each iteration by run_walnuts).
-    warmup_pos_ = position;
-    warmup_lp_ = lp;
-    warmup_step_ = step_size;
-    warmup_invmass_ = diag_inv_mass;
     if (!save_warmup_) {
       return;
     }
@@ -107,19 +89,18 @@ class StanHandler {
     n_++;
   }
 
+  void set_trace(warmup_trace::Writer* writer) noexcept {
+    trace_.writer = writer;
+  }
+
+  void on_warmup_trace(const Eigen::VectorXd& theta,
+                       const Eigen::VectorXd& grad, double lp, double step,
+                       const Eigen::VectorXd& invmass, std::size_t depth) {
+    trace_.record(theta, grad, lp, step, invmass, depth);
+  }
+
   void on_warmup_complete(double step_size,
                           const Eigen::VectorXd& diag_inv_mass) {}
-
-  // Last on_warmup arguments, for the --warmup-trace-dir driver-loop
-  // tracer (read right after each iteration).
-  const Eigen::VectorXd& last_warmup_position() const {
-    return warmup_pos_;
-  }
-  const Eigen::VectorXd& last_warmup_inv_mass() const {
-    return warmup_invmass_;
-  }
-  double last_warmup_lp() const { return warmup_lp_; }
-  double last_warmup_step() const { return warmup_step_; }
 
   void on_logp_exception(const Eigen::VectorXd& position,
                          const std::exception& exn) const noexcept {
@@ -142,135 +123,16 @@ class StanHandler {
   unique_bs_rng rng_;
   Eigen::MatrixXd draws_;
   bool save_warmup_;
+  warmup_trace::Sink trace_;
   Eigen::Index n_ = 0;
-
-  // Last on_warmup arguments (warmup tracer capture).
-  Eigen::VectorXd warmup_pos_;
-  Eigen::VectorXd warmup_invmass_;
-  double warmup_lp_ = 0.0;
-  double warmup_step_ = 0.0;
 };
 
-// Opt-in binary warmup tracer backing --warmup-trace-dir: one row per
-// warmup iteration so an offline analysis can replay mass-matrix
-// adaptation exactly. theta/grad/invmass are little-endian float64 in
-// C-order [iteration x D]; step/lp are float64 columns and depth a u64
-// column. Rows accumulate in memory and flush once at the end of warmup
-// (simple over performant). grad/depth come from AdaptiveWalnuts'
-// last_grad()/last_depth(); position/lp/step/invmass mirror the arguments
-// StanHandler::on_warmup just received.
-class WarmupTracer {
- public:
-  WarmupTracer(const Eigen::VectorXd& initial_position,
-               const Eigen::VectorXd& initial_mass)
-      : initial_position_(initial_position),
-        initial_mass_(initial_mass) {}
-
-  bool enabled() const { return !g_warmup_trace.dir.empty(); }
-
-  void record(const Eigen::VectorXd& theta, const Eigen::VectorXd& grad,
-              const Eigen::VectorXd& inv_mass, double step, double lp,
-              std::size_t depth) {
-    append_row(theta_, theta);
-    append_row(grads_, grad);
-    append_row(invmass_, inv_mass);
-    steps_.push_back(step);
-    lps_.push_back(lp);
-    depths_.push_back(static_cast<std::uint64_t>(depth));
-  }
-
-  // Write the accumulated columns and the meta.json manifest. num_warmup
-  // is the requested budget; one row is recorded per completed warmup
-  // iteration.
-  void flush(std::size_t dim, std::size_t num_warmup,
-             unsigned long int seed) {
-    const std::string& dir = g_warmup_trace.dir;
-    write_f64(dir + "/theta.f64", theta_);
-    write_f64(dir + "/grad.f64", grads_);
-    write_f64(dir + "/invmass.f64", invmass_);
-    write_f64(dir + "/step.f64", steps_);
-    write_f64(dir + "/lp.f64", lps_);
-    write_u64(dir + "/depth.u64", depths_);
-    std::ofstream meta(dir + "/meta.json");
-    if (!meta) {
-      std::cerr << "Failed to open warmup trace file: " << dir
-                << "/meta.json" << std::endl;
-      return;
-    }
-    meta << std::setprecision(17);
-    meta << "{\n";
-    meta << "  \"model\": \"" << g_warmup_trace.model_name << "\",\n";
-    meta << "  \"dim\": " << dim << ",\n";
-    meta << "  \"num_warmup\": " << num_warmup << ",\n";
-    meta << "  \"seed\": " << seed << ",\n";
-    meta << "  \"warmup_iters_recorded\": " << depths_.size() << ",\n";
-    meta << "  \"flags\": " << g_warmup_trace.meta_extras << ",\n";
-    write_vector_json(meta, "initial_position", initial_position_);
-    meta << ",\n";
-    write_vector_json(meta, "initial_mass", initial_mass_);
-    meta << "\n}\n";
-  }
-
- private:
-  static void append_row(std::vector<double>& out,
-                         const Eigen::VectorXd& v) {
-    out.insert(out.end(), v.data(), v.data() + v.size());
-  }
-
-  static void write_f64(const std::string& path,
-                        const std::vector<double>& v) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-      std::cerr << "Failed to open warmup trace file: " << path << std::endl;
-      return;
-    }
-    if (!v.empty()) {
-      out.write(reinterpret_cast<const char*>(v.data()),
-                static_cast<std::streamsize>(v.size() * sizeof(double)));
-    }
-  }
-
-  static void write_u64(const std::string& path,
-                        const std::vector<std::uint64_t>& v) {
-    std::ofstream out(path, std::ios::binary);
-    if (!out) {
-      std::cerr << "Failed to open warmup trace file: " << path << std::endl;
-      return;
-    }
-    if (!v.empty()) {
-      out.write(reinterpret_cast<const char*>(v.data()),
-                static_cast<std::streamsize>(v.size() *
-                                             sizeof(std::uint64_t)));
-    }
-  }
-
-  static void write_vector_json(std::ostream& os, const char* key,
-                                const Eigen::VectorXd& v) {
-    os << "  \"" << key << "\": [";
-    for (Eigen::Index i = 0; i < v.size(); ++i) {
-      if (i > 0) {
-        os << ", ";
-      }
-      os << v[i];
-    }
-    os << "]";
-  }
-
-  std::vector<double> theta_;
-  std::vector<double> grads_;
-  std::vector<double> invmass_;
-  std::vector<double> steps_;
-  std::vector<double> lps_;
-  std::vector<std::uint64_t> depths_;
-  Eigen::VectorXd initial_position_;
-  Eigen::VectorXd initial_mass_;
-};
-
-StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
-                        walnutpie::InitConfigBuilder& init_builder,
-                        std::size_t num_warmup, std::size_t num_draws,
-                        bool save_warmup, walnutpie::WarmupConfig& warmup_cfg,
-                        walnutpie::SamplingConfig& sample_cfg) {
+StanHandler run_walnuts(
+    DynamicStanModel& model, unsigned int seed,
+    walnutpie::InitConfigBuilder& init_builder, std::size_t num_warmup,
+    std::size_t num_draws, bool save_warmup,
+    walnutpie::WarmupConfig& warmup_cfg, walnutpie::SamplingConfig& sample_cfg,
+    const warmup_trace::Settings* trace_settings = nullptr) {
   using Clock = std::chrono::high_resolution_clock;
   auto elapsed_seconds = [](auto t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
@@ -303,29 +165,22 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   auto init_cfg =
       init_builder.masses(logp, warmup_cfg.mass_additive_smoothing()).build();
   auto inits = init_cfg.init_chain_config(0);
+  std::unique_ptr<warmup_trace::Writer> trace;
+  if (trace_settings) {
+    trace = std::make_unique<warmup_trace::Writer>(
+        *trace_settings, inits.position(), inits.mass(), num_warmup, seed);
+    storage.set_trace(trace.get());
+  }
 
   std::mt19937_64 rng{seed};
   walnutpie::AdaptiveWalnuts walnuts(rng, storage, logp, inits, warmup_cfg,
                                      sample_cfg);
-  // --warmup-trace-dir: record every warmup transition; the sampler
-  // advances iteration-by-iteration on the calling thread. inits carries
-  // the position and the mass seed InitChainConfig actually built
-  // (masses() output).
-  WarmupTracer trace(inits.position(), inits.mass());
-  auto trace_record = [&]() {
-    if (!trace.enabled()) {
-      return;
-    }
-    trace.record(storage.last_warmup_position(), walnuts.last_grad(),
-                 storage.last_warmup_inv_mass(), storage.last_warmup_step(),
-                 storage.last_warmup_lp(), walnuts.last_depth());
-  };
   for (std::size_t w = 0; w < num_warmup; ++w) {
     walnuts();
-    trace_record();
   }
-  if (trace.enabled()) {
-    trace.flush(model.unconstrained_dimensions(), num_warmup, seed);
+  if (trace) {
+    trace->finish();
+    storage.set_trace(nullptr);
   }
   end_timing();
 
@@ -385,7 +240,7 @@ int main(int argc, char** argv) {
   std::string lib;
   std::string data;
   std::string output_file;
-  std::string warmup_trace_dir;  // empty = warmup tracing off
+  std::string warmup_trace_dir;
 
   // parse from command line with CLI11
   {
@@ -494,13 +349,9 @@ int main(int argc, char** argv) {
     app.add_option("--output", output_file, "Output file for the draws")
         ->check(CLI::NonexistentPath);
 
-    app.add_option("--warmup-trace-dir", warmup_trace_dir,
-                   "Opt-in warmup tracer directory: per-iteration "
-                   "theta/grad/invmass as little-endian f64, step/lp as f64, "
-                   "depth as u64, plus meta.json, for offline replay of "
-                   "mass-matrix adaptation (empty = off)")
-        ->default_val(warmup_trace_dir);
-
+    app.add_option(
+        "--warmup-trace-dir", warmup_trace_dir,
+        "Write warmup trace into a new directory (parent must exist)");
     CLI11_PARSE(app, argc, argv);
   }
 
@@ -534,59 +385,36 @@ int main(int argc, char** argv) {
           .step_sizes(step_size_init)
           .positions(model.initialize(nullptr, rng, init));
 
+  std::optional<warmup_trace::Settings> trace_settings;
   if (!warmup_trace_dir.empty()) {
-    std::filesystem::create_directories(warmup_trace_dir);
-    g_warmup_trace.dir = warmup_trace_dir;
-    const auto slash = lib.find_last_of('/');
-    g_warmup_trace.model_name =
-        slash == std::string::npos ? lib : lib.substr(slash + 1);
-    // Flag values in effect, rendered once here (main scope; run_walnuts
-    // cannot see them) and spliced into meta.json by the tracer.
-    std::string flags = "{";
-    auto jkv = [&](const std::string& k, const std::string& v) {
-      if (flags.size() > 1) {
-        flags += ", ";
-      }
-      flags += "\"" + k + "\": " + v;
-    };
-    auto jstr = [&](const char* k, const std::string& v) {
-      jkv(k, "\"" + v + "\"");
-    };
-    auto jbool = [&](const char* k, bool v) {
-      jkv(k, v ? "true" : "false");
-    };
-    auto jint = [&](const char* k, std::size_t v) {
-      jkv(k, std::to_string(v));
-    };
-    auto jdouble = [&](const char* k, double v) {
-      std::ostringstream vs;
-      vs << std::setprecision(17) << v;
-      jkv(k, vs.str());
-    };
-    jint("warmup", num_warmup);
-    jint("samples", num_draws);
-    jbool("save-warmup", save_warmup);
-    jint("max-trajectory-doublings", max_trajectory_doublings);
-    jint("max-step-halvings", max_step_halvings);
-    jint("min-micro-steps", min_micro_steps);
-    jdouble("max-hamiltonian-error", max_hamiltonian_error);
-    jdouble("init", init);
-    jdouble("step-size-init", step_size_init);
-    jdouble("mass-init-count", mass_init_count);
-    jdouble("mass-additive-smoothing", mass_additive_smoothing);
-    jdouble("max-macro-steps-target", max_macro_steps_target);
-    jdouble("step-accept-rate-target", step_accept_rate_target);
-    jdouble("step-learning-rate", step_learning_rate);
-    jdouble("step-gradient-decay", step_gradient_decay);
-    jdouble("step-sq-gradient-decay", step_sq_gradient_decay);
-    jdouble("step-stabilization", step_stabilization);
-    jdouble("step-learn-rate-decay", step_learn_rate_decay);
-    flags += "}";
-    g_warmup_trace.meta_extras = std::move(flags);
+    trace_settings.emplace();
+    trace_settings->directory = warmup_trace_dir;
+    trace_settings->model = std::filesystem::path(lib).filename().string();
+    auto& flags = trace_settings->flags;
+    flags["warmup"] = static_cast<std::uint64_t>(num_warmup);
+    flags["samples"] = static_cast<std::uint64_t>(num_draws);
+    flags["save-warmup"] = save_warmup;
+    flags["max-trajectory-doublings"] =
+        static_cast<std::uint64_t>(max_trajectory_doublings);
+    flags["max-step-halvings"] = static_cast<std::uint64_t>(max_step_halvings);
+    flags["min-micro-steps"] = static_cast<std::uint64_t>(min_micro_steps);
+    flags["max-hamiltonian-error"] = max_hamiltonian_error;
+    flags["init"] = init;
+    flags["step-size-init"] = step_size_init;
+    flags["mass-init-count"] = mass_init_count;
+    flags["mass-additive-smoothing"] = mass_additive_smoothing;
+    flags["max-macro-steps-target"] = max_macro_steps_target;
+    flags["step-accept-rate-target"] = step_accept_rate_target;
+    flags["step-learning-rate"] = step_learning_rate;
+    flags["step-gradient-decay"] = step_gradient_decay;
+    flags["step-sq-gradient-decay"] = step_sq_gradient_decay;
+    flags["step-stabilization"] = step_stabilization;
+    flags["step-learn-rate-decay"] = step_learn_rate_decay;
   }
 
   auto res = run_walnuts(model, seed, init_cfg, num_warmup, num_draws,
-                         save_warmup, warmup_cfg, sample_cfg);
+                         save_warmup, warmup_cfg, sample_cfg,
+                         trace_settings ? &*trace_settings : nullptr);
 
   res.summarize();
   res.write_csv(output_file);

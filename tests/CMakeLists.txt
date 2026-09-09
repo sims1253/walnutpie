@@ -39,3 +39,12 @@ endfunction()
 add_test(summary)
 add_test(config)
 add_test(util)
+
+add_test(warmup_trace)
+target_compile_definitions(warmup_trace_test PRIVATE EIGEN_RUNTIME_NO_MALLOC)
+# Keep the disabled-path allocation canary effective in Release builds.
+if(MSVC)
+  target_compile_options(warmup_trace_test PRIVATE /UNDEBUG /UEIGEN_NO_DEBUG)
+else()
+  target_compile_options(warmup_trace_test PRIVATE -UNDEBUG -UEIGEN_NO_DEBUG)
+endif()
