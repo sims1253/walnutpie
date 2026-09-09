@@ -56,7 +56,14 @@ struct LowRankMass {
     return sample_momentum_from(z);
   }
 
-  /** @brief Momentum draw from a provided standard-normal vector. */
+  /** @brief Momentum draw from a provided standard-normal vector.
+   *
+   * Correct draw is rho = D^{-1/2} (I + U W U^T) z; the factors do not
+   * commute, so the diagonal scaling must act AFTER the low-rank
+   * correction (scaling z first yields Cov != A^{-1} whenever U is not
+   * coordinate-aligned — see the sample_momentum_from covariance
+   * property test).
+   */
   Eigen::VectorXd sample_momentum_from(const Eigen::VectorXd& z) const {
     Eigen::VectorXd invsq = D.cwiseInverse().cwiseSqrt();
     Eigen::VectorXd out = invsq.cwiseProduct(z);
@@ -66,8 +73,8 @@ struct LowRankMass {
     Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> es(IC);
     Eigen::MatrixXd W =
         es.operatorInverseSqrt() - Eigen::MatrixXd::Identity(U.cols(), U.cols());
-    Eigen::VectorXd inner = U.transpose() * invsq.cwiseProduct(z);
-    return out + U * (W * inner);
+    Eigen::VectorXd inner = U.transpose() * z;
+    return out + invsq.cwiseProduct(U * (W * inner));
   }
 
   double log_det() const {
