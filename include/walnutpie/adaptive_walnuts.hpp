@@ -246,7 +246,24 @@ class AdaptiveWalnuts {
                      std::move(theta_), depth, grad_select, logp_select, adam_);
     mass_estimator_.observe(theta_, grad_select, iteration_);
     min_micro_estimator_.observe(1 << depth);
-    handler_.get().on_warmup(theta_, logp_select, step_size(), inv_mass);
+    const double adapted_step = step_size();
+    handler_.get().on_warmup(theta_, logp_select, adapted_step, inv_mass);
+    // Optional synchronous observer: references remain valid only during the
+    // call.
+    if constexpr (requires(H& h, const Eigen::VectorXd& position,
+                           const Eigen::VectorXd& gradient,
+                           const Eigen::VectorXd& mass, const double& lp,
+                           const double& step, const std::size_t& tree_depth) {
+                    {
+                      h.on_warmup_trace(position, gradient, lp, step, mass,
+                                        tree_depth)
+                    } -> std::same_as<void>;
+                  }) {
+      handler_.get().on_warmup_trace(
+          std::as_const(theta_), std::as_const(grad_select),
+          std::as_const(logp_select), std::as_const(adapted_step),
+          std::as_const(inv_mass), std::as_const(depth));
+    }
     ++iteration_;
   }
 

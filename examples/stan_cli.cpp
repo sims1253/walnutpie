@@ -1,5 +1,8 @@
+#include <memory>
+#include <optional>
 #include <walnutpie.hpp>
 #include <walnutpie/load_stan.hpp>
+#include "warmup_trace.hpp"
 
 #include <CLI/CLI.hpp>
 #include <Eigen/Dense>
@@ -86,6 +89,16 @@ class StanHandler {
     n_++;
   }
 
+  void set_trace(warmup_trace::Writer* writer) noexcept {
+    trace_.writer = writer;
+  }
+
+  void on_warmup_trace(const Eigen::VectorXd& theta,
+                       const Eigen::VectorXd& grad, double lp, double step,
+                       const Eigen::VectorXd& invmass, std::size_t depth) {
+    trace_.record(theta, grad, lp, step, invmass, depth);
+  }
+
   void on_warmup_complete(double step_size,
                           const Eigen::VectorXd& diag_inv_mass) {}
 
@@ -110,14 +123,16 @@ class StanHandler {
   unique_bs_rng rng_;
   Eigen::MatrixXd draws_;
   bool save_warmup_;
+  warmup_trace::Sink trace_;
   Eigen::Index n_ = 0;
 };
 
-StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
-                        walnutpie::InitConfigBuilder& init_builder,
-                        std::size_t num_warmup, std::size_t num_draws,
-                        bool save_warmup, walnutpie::WarmupConfig& warmup_cfg,
-                        walnutpie::SamplingConfig& sample_cfg) {
+StanHandler run_walnuts(
+    DynamicStanModel& model, unsigned int seed,
+    walnutpie::InitConfigBuilder& init_builder, std::size_t num_warmup,
+    std::size_t num_draws, bool save_warmup,
+    walnutpie::WarmupConfig& warmup_cfg, walnutpie::SamplingConfig& sample_cfg,
+    const warmup_trace::Settings* trace_settings = nullptr) {
   using Clock = std::chrono::high_resolution_clock;
   auto elapsed_seconds = [](auto t) {
     return std::chrono::duration<double>(Clock::now() - t).count();
@@ -150,12 +165,22 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   auto init_cfg =
       init_builder.masses(logp, warmup_cfg.mass_additive_smoothing()).build();
   auto inits = init_cfg.init_chain_config(0);
+  std::unique_ptr<warmup_trace::Writer> trace;
+  if (trace_settings) {
+    trace = std::make_unique<warmup_trace::Writer>(
+        *trace_settings, inits.position(), inits.mass(), num_warmup, seed);
+    storage.set_trace(trace.get());
+  }
 
   std::mt19937_64 rng{seed};
   walnutpie::AdaptiveWalnuts walnuts(rng, storage, logp, inits, warmup_cfg,
                                      sample_cfg);
   for (std::size_t w = 0; w < num_warmup; ++w) {
     walnuts();
+  }
+  if (trace) {
+    trace->finish();
+    storage.set_trace(nullptr);
   }
   end_timing();
 
@@ -215,6 +240,7 @@ int main(int argc, char** argv) {
   std::string lib;
   std::string data;
   std::string output_file;
+  std::string warmup_trace_dir;
 
   // parse from command line with CLI11
   {
@@ -323,6 +349,9 @@ int main(int argc, char** argv) {
     app.add_option("--output", output_file, "Output file for the draws")
         ->check(CLI::NonexistentPath);
 
+    app.add_option(
+        "--warmup-trace-dir", warmup_trace_dir,
+        "Write warmup trace into a new directory (parent must exist)");
     CLI11_PARSE(app, argc, argv);
   }
 
@@ -356,8 +385,36 @@ int main(int argc, char** argv) {
           .step_sizes(step_size_init)
           .positions(model.initialize(nullptr, rng, init));
 
+  std::optional<warmup_trace::Settings> trace_settings;
+  if (!warmup_trace_dir.empty()) {
+    trace_settings.emplace();
+    trace_settings->directory = warmup_trace_dir;
+    trace_settings->model = std::filesystem::path(lib).filename().string();
+    auto& flags = trace_settings->flags;
+    flags["warmup"] = static_cast<std::uint64_t>(num_warmup);
+    flags["samples"] = static_cast<std::uint64_t>(num_draws);
+    flags["save-warmup"] = save_warmup;
+    flags["max-trajectory-doublings"] =
+        static_cast<std::uint64_t>(max_trajectory_doublings);
+    flags["max-step-halvings"] = static_cast<std::uint64_t>(max_step_halvings);
+    flags["min-micro-steps"] = static_cast<std::uint64_t>(min_micro_steps);
+    flags["max-hamiltonian-error"] = max_hamiltonian_error;
+    flags["init"] = init;
+    flags["step-size-init"] = step_size_init;
+    flags["mass-init-count"] = mass_init_count;
+    flags["mass-additive-smoothing"] = mass_additive_smoothing;
+    flags["max-macro-steps-target"] = max_macro_steps_target;
+    flags["step-accept-rate-target"] = step_accept_rate_target;
+    flags["step-learning-rate"] = step_learning_rate;
+    flags["step-gradient-decay"] = step_gradient_decay;
+    flags["step-sq-gradient-decay"] = step_sq_gradient_decay;
+    flags["step-stabilization"] = step_stabilization;
+    flags["step-learn-rate-decay"] = step_learn_rate_decay;
+  }
+
   auto res = run_walnuts(model, seed, init_cfg, num_warmup, num_draws,
-                         save_warmup, warmup_cfg, sample_cfg);
+                         save_warmup, warmup_cfg, sample_cfg,
+                         trace_settings ? &*trace_settings : nullptr);
 
   res.summarize();
   res.write_csv(output_file);
