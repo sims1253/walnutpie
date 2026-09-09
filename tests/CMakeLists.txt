@@ -3,10 +3,11 @@ if(MSVC)
 endif()
 
 set(BUILD_GMOCK OFF CACHE BOOL "Disable building Google Mock" FORCE)
+# Pin a tested revision for reproducible builds.
 FetchContent_Declare(googletest
         DOWNLOAD_EXTRACT_TIMESTAMP ON
         GIT_REPOSITORY https://github.com/google/googletest.git
-        GIT_TAG main)
+        GIT_TAG 283c17563fe7a1111cd7f581aa5d541e8baeff2f)
 FetchContent_MakeAvailable(googletest)
 
 include(GoogleTest)
