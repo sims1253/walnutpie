@@ -978,3 +978,19 @@ TEST(WalnutsConfig, MembersAreIndependent) {
   EXPECT_DOUBLE_EQ(cfg.init().step_size(0), 0.25);
   EXPECT_DOUBLE_EQ(cfg.init().step_size(1), 0.25);
 }
+
+// class WarmupConfigBuilder ********************************************
+
+TEST(WarmupConfigBuilder, MassInitCountMustExceedOne) {
+  EXPECT_THROW(walnutpie::WarmupConfigBuilder().mass_init_count(0.5).build(),
+               std::invalid_argument);
+  EXPECT_THROW(walnutpie::WarmupConfigBuilder().mass_init_count(1.0).build(),
+               std::invalid_argument);
+  EXPECT_NO_THROW(
+      walnutpie::WarmupConfigBuilder().mass_init_count(1.5).build());
+  EXPECT_DOUBLE_EQ(walnutpie::WarmupConfigBuilder()
+                       .mass_init_count(4.0)
+                       .build()
+                       .mass_init_count(),
+                   4.0);
+}
