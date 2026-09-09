@@ -11,7 +11,7 @@
 #include <walnutpie/load_stan.hpp>
 
 #include "errors.hpp"
-#include "export.h"
+#include "walnutpy_export.h"
 #include "handlers.hpp"
 #include "interrupts.hpp"
 
@@ -248,6 +248,15 @@ WALNUTPY_EXPORT int walnutpie_sample_bridgestan(
     error::check_nonnegative("refresh", refresh);
 
     DynamicStanModel stan_model(bs_dll, json_data, model_seed, callback);
+    // Enforce the public Python precondition here too, before initialization
+    // and before the model is hidden behind a generic log-density callback.
+    // Keep the same policy for one chain: this binding is not a serial API.
+    if (stan_model.stan_threads() != std::optional<bool>(true)) {
+      throw std::invalid_argument(
+          std::string("BridgeStan model '") + bs_dll +
+          "' must report STAN_THREADS=true for this binding; rebuild with "
+          "STAN_THREADS=true. Missing or ambiguous metadata is not accepted.");
+    }
 
     int draws_offset = stan_model.constrained_dimensions() *
                        (max_sampling_iter + max_warmup_iter * save_warmup);

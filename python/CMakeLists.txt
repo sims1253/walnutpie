@@ -8,8 +8,10 @@ set(CMAKE_CXX_VISIBILITY_PRESET "hidden")
 set(CMAKE_VISIBILITY_INLINES_HIDDEN TRUE)
 
 generate_export_header(walnutpy
-  EXPORT_FILE_NAME "${CMAKE_CURRENT_SOURCE_DIR}/src/walnutpie/export.h"
+  EXPORT_FILE_NAME "${CMAKE_CURRENT_BINARY_DIR}/walnutpy_export.h"
 )
+
+target_include_directories(walnutpy PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
 
 install(TARGETS walnutpy
   LIBRARY DESTINATION "${SKBUILD_PLATLIB_DIR}/walnutpie"
