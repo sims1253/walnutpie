@@ -281,8 +281,7 @@ class AdaptiveWalnuts {
    * @param[in] min_micro_steps The minimum number of micro steps.
    * @return The Walnuts sampler with the given trajectory budget.
    */
-  WalnutsSampler<F, RNG, H> sampler_min_micro(
-      std::size_t min_micro_steps) {
+  WalnutsSampler<F, RNG, H> sampler_min_micro(std::size_t min_micro_steps) {
     handler_.get().on_warmup_complete(step_size(), inv_mass());
     return WalnutsSampler<F, RNG, H>(
         rand_.rng(), handler_, logp_grad_.logp_grad_, theta_, inv_mass(),

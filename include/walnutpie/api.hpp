@@ -122,8 +122,8 @@ inline void walnuts(std::size_t seed, std::vector<H>& chain_handlers,
         const double dev = samplers[c].position()[j] - mean_of_means;
         ss += dev * dev;
       }
-      const double f = std::sqrt(ss / static_cast<double>(chains - 1))
-                       / mean_scale;
+      const double f =
+          std::sqrt(ss / static_cast<double>(chains - 1)) / mean_scale;
       worst_f = std::max(worst_f, f);
     }
     if (worst_f > ridge_threshold) {
