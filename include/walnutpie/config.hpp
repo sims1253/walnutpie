@@ -354,7 +354,11 @@ class InitConfigBuilder {
    * @param[in] mass_smoothing The additive smoothing for mass matrices.
    * @param[in] average_masses Set to `true` to geometrically average mass
    * matrices.
-   * @throw std::invalid_argumet If the mass smoothing is not in (0, 1).
+   * @throw std::invalid_argument If mass smoothing is not in (0, 1),
+   * an initial log density or gradient is non-finite, or a gradient has
+   * the wrong size. Chain and gradient indices in errors are zero-based.
+   * If evaluation or validation throws, the builder's masses are unchanged.
+   * Exceptions from `logp_grad` propagate unchanged.
    * @return A reference to this builder for chaining.
    */
   template <LogpGrad F>
@@ -362,22 +366,30 @@ class InitConfigBuilder {
                             bool average_masses = false) {
     detail::validate_probability(mass_smoothing, "mass_smoothing");
     Eigen::VectorXd grad;
-    masses_.resize(num_chains_);
+    std::vector<Eigen::VectorXd> masses(num_chains_);
     for (std::size_t c = 0; c < num_chains_; ++c) {
-      double lp_to_discard;
-      logp_grad(positions_[c], lp_to_discard, grad);
-      masses_[c] = (1 - mass_smoothing) * grad.array().abs() + mass_smoothing;
+      double lp;
+      logp_grad(positions_[c], lp, grad);
+      const std::string chain = "initial evaluation for chain " + std::to_string(c);
+      detail::validate_finite(lp, chain + " log density");
+      detail::validate_size(grad, dims_, chain + " gradient", "dims");
+      for (Eigen::Index i = 0; i < grad.size(); ++i) {
+        detail::validate_finite(
+            grad[i], chain + " gradient[" + std::to_string(i) + "]");
+      }
+      masses[c] = (1 - mass_smoothing) * grad.array().abs() + mass_smoothing;
     }
     if (average_masses) {
-      Eigen::Index D = masses_[0].size();
+      Eigen::Index D = masses[0].size();
       Eigen::VectorXd sum_log_mass = Eigen::VectorXd::Zero(D);
-      for (const auto& mass : masses_) {
+      for (const auto& mass : masses) {
         sum_log_mass += mass.array().log().matrix();
       }
       auto avg_log_mass = sum_log_mass / num_chains_;
       auto geom_mean_mass = avg_log_mass.array().exp().matrix();
-      masses_ = std::vector<Eigen::VectorXd>(num_chains_, geom_mean_mass);
+      masses = std::vector<Eigen::VectorXd>(num_chains_, geom_mean_mass);
     }
+    masses_.swap(masses);
     return *this;
   }
 
