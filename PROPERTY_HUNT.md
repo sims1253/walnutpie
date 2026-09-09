@@ -12,7 +12,10 @@ Build & run:
   tests/property_hunt.cpp -o /tmp/property_hunt && /tmp/property_hunt
 ```
 
-Latest run: `244 checks, 0 failures, 3 REAL BUGS, 2 expected-failures`.
+Latest run (branch tip, after the momentum-draw and Welford fixes landed on this
+branch): `244 checks, 0 failures, 0 REAL BUGS, 2 expected-failures`. The verdict
+table below records the AS-FOUND state at the base commit. The driver now also
+fails (nonzero exit) when a real-bug probe fires, not only on soft-check failures.
 
 ## Verdict table
 

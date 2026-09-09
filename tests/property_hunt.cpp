@@ -727,5 +727,5 @@ int main() {
   std::printf("\n== %d checks, %d failures, %d REAL BUGS, %d expected-failures ==\n",
               g_checks, g_failures, g_bugs, g_xfails);
   for (auto& f : g_failed) std::printf("  FAILED: %s\n", f.c_str());
-  return g_failures == 0 ? 0 : 1;
+  return (g_failures == 0 && g_bugs == 0) ? 0 : 1;
 }
