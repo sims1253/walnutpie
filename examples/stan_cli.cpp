@@ -23,7 +23,7 @@ static void summarize(const std::vector<std::string>& names,
   for (auto d = 0; d < D; ++d) {
     if (d > 3 && d < D - 3) {
       if (d == 4) {
-        std::cout << "... elided " << (D - 6) << " rows ..." << std::endl;
+        std::cout << "... elided " << (D - 7) << " rows ..." << std::endl;
       }
       continue;
     }
