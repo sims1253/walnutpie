@@ -6,6 +6,7 @@
 #include <functional>
 #include <latch>
 #include <limits>
+#include <stdexcept>
 #include <stop_token>
 #include <thread>
 #include <vector>
@@ -160,16 +161,58 @@ struct AdaptResult {
   double step_bar;
 
   /**
-   * @brief Per-chain dispersion of log mass diagonals at the end of
-   * adaptation, a cheap cross-chain disagreement diagnostic.
-   *
-   * Values near 0 indicate the chains converged to the same scale estimate;
-   * large values indicate chains locked into different posterior scales (the
-   * multimodality/scale-lock signature). Intended as the trigger for
-   * mode-aware re-initialization policies in embedding code.
+   * Mean sample variance of log mass across chains, averaged over coordinates.
+   * Only adapt_with_stats() populates this diagnostic. One finite chain gives
+   * zero; nonfinite input or an unrepresentable result gives NaN. This measures
+   * scale disagreement, not convergence or multimodality.
    */
-  double log_mass_dispersion = 0.0;
+  double log_mass_dispersion = std::numeric_limits<double>::quiet_NaN();
 };
+
+/**
+ * @brief Compute mean cross-chain sample variance from log-mass snapshots.
+ *
+ * @throw std::invalid_argument If there are no snapshots, no coordinates,
+ * or inconsistent snapshot dimensions.
+ */
+inline double log_mass_dispersion(const std::vector<AdaptSnapshot>& snapshots) {
+  if (snapshots.empty() || snapshots.front().log_mass.size() == 0) {
+    throw std::invalid_argument("log-mass dispersion needs nonempty snapshots");
+  }
+  const Eigen::Index dims = snapshots.front().log_mass.size();
+  for (const auto& snapshot : snapshots) {
+    if (snapshot.log_mass.size() != dims) {
+      throw std::invalid_argument("log-mass snapshot dimensions must agree");
+    }
+  }
+  for (const auto& snapshot : snapshots) {
+    if (!snapshot.log_mass.allFinite()) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+  }
+  if (snapshots.size() == 1) {
+    return 0.0;
+  }
+  long double sum_variance = 0.0L;
+  for (Eigen::Index d = 0; d < dims; ++d) {
+    long double mean = 0.0L;
+    for (const auto& snapshot : snapshots) {
+      mean += static_cast<long double>(snapshot.log_mass[d]);
+    }
+    mean /= static_cast<long double>(snapshots.size());
+    long double sum_squared = 0.0L;
+    for (const auto& snapshot : snapshots) {
+      const long double delta =
+          static_cast<long double>(snapshot.log_mass[d]) - mean;
+      sum_squared += delta * delta;
+    }
+    sum_variance +=
+        sum_squared / static_cast<long double>(snapshots.size() - 1);
+  }
+  const double result = static_cast<double>(sum_variance / dims);
+  return std::isfinite(result) ? result
+                               : std::numeric_limits<double>::quiet_NaN();
+}
 
 /**
  * @brief The implementation of the control monitor with the adaptation
@@ -180,13 +223,19 @@ struct AdaptResult {
  * @param[in] warmup_cfg The warmup configuration.
  * @return Statistics for the completed adaptation process.
  */
-template <InterruptCallback IC>
+template <InterruptCallback IC, bool CollectStats = false>
 inline AdaptResult controller_loop(
     std::deque<SpscBuffer<AdaptSnapshot>>& buffers,
     const IC& interrupt_callback, const InitConfig& init_cfg,
     const WarmupConfig& warmup_cfg) {
   std::size_t M = init_cfg.num_chains();
   std::size_t D = init_cfg.dims();
+  if constexpr (CollectStats) {
+    if (M == 0 || D == 0 || buffers.size() != M) {
+      throw std::invalid_argument(
+          "adaptation statistics need matching nonempty chains");
+    }
+  }
 
   std::vector<AdaptSnapshot> latest(init_cfg.num_chains());
   Eigen::VectorXd mean_log_mass(D);
@@ -203,6 +252,13 @@ inline AdaptResult controller_loop(
 
     for (std::size_t m = 0; m < M && achieved_min_draws; ++m) {
       latest[m] = buffers[m].read_latest();
+      if constexpr (CollectStats) {
+        if (latest[m].log_mass.size() != static_cast<Eigen::Index>(D) ||
+            latest[m].mass.size() != static_cast<Eigen::Index>(D)) {
+          throw std::invalid_argument(
+              "adaptation snapshot dimensions must agree");
+        }
+      }
       if (latest[m].iter < warmup_cfg.min_iter()) {
         achieved_min_draws = false;
       }
@@ -231,25 +287,11 @@ inline AdaptResult controller_loop(
                        max_rel_diff_step <= warmup_cfg.step_size_converge_tol();
       bool hit_max_iter = num_draws == max_draws;
       if (converged || hit_max_iter) {
-        // Cross-chain scale disagreement: mean over coordinates of the
-        // variance across chains of log mass. Cheap O(M*D); recomputed here
-        // rather than accumulated to keep the loop branch simple.
-        double disp_sum = 0.0;
-        for (std::size_t d = 0; d < D; ++d) {
-          double m_log = 0.0;
-          for (std::size_t m2 = 0; m2 < M; ++m2) {
-            m_log += latest[m2].log_mass[d];
-          }
-          m_log /= static_cast<double>(M);
-          double v = 0.0;
-          for (std::size_t m2 = 0; m2 < M; ++m2) {
-            const double dev = latest[m2].log_mass[d] - m_log;
-            v += dev * dev;
-          }
-          disp_sum += v / static_cast<double>(M - 1);
+        if constexpr (CollectStats) {
+          return {geom_mean_mass, std::exp(mean_log_step),
+                  log_mass_dispersion(latest)};
         }
-        return {geom_mean_mass, std::exp(mean_log_step),
-                disp_sum / static_cast<double>(D)};
+        return {geom_mean_mass, std::exp(mean_log_step)};
       }
     }
 
@@ -288,19 +330,36 @@ inline void adapt(const InitConfig& init_cfg, const WarmupConfig& warmup_cfg,
 }
 
 /**
- * @brief Adaptation returning the adaptation statistics.
+ * @brief Adapt and return statistics from the controller's exit snapshots.
  *
- * Identical to the void overload, but exposes the AdaptResult (including the
- * cross-chain log-mass dispersion) for mode-aware reinitialization policies.
+ * Uses the same stopping rule and worker lifecycle as adapt(). Workers may
+ * advance after the snapshots are read; the returned values are not promised
+ * to describe their final post-join states. Statistics do not change tuning,
+ * but their collection may affect scheduling near an early-stop boundary.
+ * The mean log-mass sample variance is zero for one finite chain and NaN for
+ * nonfinite snapshots. It is not a convergence or multimodality test.
+ *
+ * @throw std::invalid_argument If there are no chains or coordinates, or the
+ * adapter count/dimensions do not match the initialization configuration.
  */
 template <AdaptiveSampler A, InterruptCallback IC>
 inline AdaptResult adapt_with_stats(const InitConfig& init_cfg,
                                     const WarmupConfig& warmup_cfg,
                                     std::vector<A>& adapters,
                                     const IC& interrupt_callback) {
+  if (init_cfg.num_chains() == 0 || init_cfg.dims() == 0 ||
+      adapters.size() != init_cfg.num_chains()) {
+    throw std::invalid_argument(
+        "adaptation statistics need matching nonempty chains");
+  }
+  for (const auto& adapter : adapters) {
+    if (adapter.dim() != init_cfg.dims()) {
+      throw std::invalid_argument(
+          "adapter dimensions must match initialization");
+    }
+  }
   std::deque<SpscBuffer<AdaptSnapshot>> buffers =
       construct_buffers(init_cfg.num_chains(), init_cfg.dims());
-
   std::latch start_gate(static_cast<std::ptrdiff_t>(init_cfg.num_chains() + 1));
   std::vector<std::jthread> threads;
   threads.reserve(init_cfg.num_chains());
@@ -309,8 +368,8 @@ inline AdaptResult adapt_with_stats(const InitConfig& init_cfg,
         AdaptWorker<A>(warmup_cfg, adapters[m], buffers[m], start_gate));
   }
   start_gate.arrive_and_wait();
-
-  return controller_loop(buffers, interrupt_callback, init_cfg, warmup_cfg);
+  return controller_loop<IC, true>(buffers, interrupt_callback, init_cfg,
+                                   warmup_cfg);
 }
 
 }  // namespace walnutpie::detail
