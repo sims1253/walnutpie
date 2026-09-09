@@ -4,6 +4,7 @@
 
 #include <cmath>
 #include <limits>
+#include <random>
 #include <vector>
 
 namespace {
@@ -96,5 +97,40 @@ TEST(MacroStepAdaptation, ConservedEnergyKeepsUnitAcceptance) {
   RecordingAdapter adapter;
   EXPECT_TRUE(take_macro_step<Direction::Forward>(target, adapter));
   EXPECT_EQ(adapter.observed, std::vector<double>{1.0});
+}
+// One transition from the origin on a two-dimensional target.
+template <typename F>
+std::size_t transition_depth(const F& target, double step,
+                             std::size_t max_depth) {
+  std::mt19937 rng(7);
+  walnutpie::detail::Random<std::mt19937> rand(rng);
+  walnutpie::detail::NoOpStepSizeAdapter adapter;
+  Eigen::VectorXd theta = Eigen::VectorXd::Zero(2);
+  Eigen::VectorXd grad(2);
+  double logp;
+  target(theta, logp, grad);
+  std::size_t depth;
+  walnutpie::detail::transition_w(rand, target, Eigen::VectorXd::Ones(2),
+                                  Eigen::VectorXd::Ones(2), step, max_depth,
+                                  std::size_t{5}, std::size_t{1}, 1.0,
+                                  std::move(theta), depth, grad, logp, adapter);
+  return depth;
+}
+
+TEST(TransitionDepth, ReportsCompletedDoublings) {
+  auto gaussian = [](const Eigen::VectorXd& x, double& lp, Eigen::VectorXd& g) {
+    lp = -0.5 * x.squaredNorm();
+    g = -x;
+  };
+  // A small step doubles until the budget is gone.
+  for (std::size_t max_depth : {std::size_t{1}, std::size_t{3}}) {
+    EXPECT_EQ(transition_depth(gaussian, 0.05, max_depth), max_depth);
+  }
+  // A wall at unit radius fails the first macro step.
+  auto wall = [](const Eigen::VectorXd& x, double& lp, Eigen::VectorXd& g) {
+    lp = x.squaredNorm() > 1.0 ? -std::numeric_limits<double>::infinity() : 0.0;
+    g.setZero();
+  };
+  EXPECT_EQ(transition_depth(wall, 10.0, 4), 0u);
 }
 }  // namespace
