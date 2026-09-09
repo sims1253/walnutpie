@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <limits>
 #include <ostream>
 #include <random>
 #include <stdexcept>
@@ -368,14 +369,16 @@ class InitConfigBuilder {
     Eigen::VectorXd grad;
     std::vector<Eigen::VectorXd> masses(num_chains_);
     for (std::size_t c = 0; c < num_chains_; ++c) {
-      double lp;
+      double lp = std::numeric_limits<double>::quiet_NaN();
       logp_grad(positions_[c], lp, grad);
       const std::string chain = "initial evaluation for chain " + std::to_string(c);
       detail::validate_finite(lp, chain + " log density");
       detail::validate_size(grad, dims_, chain + " gradient", "dims");
       for (Eigen::Index i = 0; i < grad.size(); ++i) {
-        detail::validate_finite(
-            grad[i], chain + " gradient[" + std::to_string(i) + "]");
+        if (!std::isfinite(grad[i])) {
+          detail::validate_finite(
+              grad[i], chain + " gradient[" + std::to_string(i) + "]");
+        }
       }
       masses[c] = (1 - mass_smoothing) * grad.array().abs() + mass_smoothing;
     }

@@ -51,6 +51,28 @@ TEST(InitMassValidation, NonfiniteLogDensityLeavesAllMassesUnchanged) {
     }
   }
 }
+TEST(InitMassValidation, MissingLogDensityLeavesMassesUnchanged) {
+  for (bool average : {false, true}) {
+    auto b = builder();
+    int calls = 0;
+    auto f = [&](const Eigen::VectorXd&, double& lp, Eigen::VectorXd& g) {
+      if (++calls == 1) {
+        lp = 0;
+      }
+      g = Eigen::VectorXd::Constant(2, 3);
+    };
+    try {
+      b.masses(f, .1, average);
+      FAIL() << "expected rejection";
+    } catch (const std::invalid_argument& e) {
+      EXPECT_EQ(std::string(e.what()),
+                "initial evaluation for chain 1 log density must be finite");
+    }
+    EXPECT_EQ(calls, 2);
+    expect_unchanged(b);
+  }
+}
+
 TEST(InitMassValidation, NonfiniteGradientReportsChainAndCoordinate) {
   for (bool average : {false, true}) {
     for (double bad : {nan, inf, -inf}) {
