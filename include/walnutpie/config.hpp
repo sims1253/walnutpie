@@ -670,7 +670,13 @@ class WarmupConfig {
       if (dims > cap) {
         return max_iter_;
       }
-      needed = std::max(needed, per_coord * dims);
+      // The estimator discards the opening window of warmup draws before it
+      // counts them, the same window the mass matrix discards, so warmup has
+      // to run that much longer to actually collect the requested number.
+      // Leaving the window out lands the observation count exactly one short
+      // of the request at the boundary, which is where the screen refuses.
+      const std::size_t discarded = static_cast<std::size_t>(mass_init_count_);
+      needed = std::max(needed, per_coord * dims + discarded);
     }
     return std::min(needed, max_iter_);
   }

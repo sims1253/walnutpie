@@ -420,11 +420,13 @@ TEST(WarmupConfig, WarmupFloorRisesToSupplyARequestedFullRankMetric) {
 
   // With one, warmup collects the draws the estimator needs: a covariance has
   // one entry per pair of coordinates.
+  // The estimator discards the opening window of warmup draws before it
+  // counts them, so warmup pays for that window too.
   const auto dense = walnutpie::WarmupConfigBuilder()
-                         .min_max_iter(50, 1000)
+                         .min_max_iter(50, 10000)
                          .metric_dense(true)
                          .build();
-  EXPECT_EQ(dense.min_iter_for(100), 1000u);
+  EXPECT_EQ(dense.min_iter_for(100), 1004u);
   EXPECT_EQ(dense.min_iter_for(3), 50u);
 
   // But never past the configured maximum, or warmup could not terminate.
@@ -440,7 +442,7 @@ TEST(WarmupConfig, WarmupFloorRisesToSupplyARequestedFullRankMetric) {
                           .metric_dense(true)
                           .metric_dense_min_obs(40u)
                           .build();
-  EXPECT_EQ(strict.min_iter_for(100), 4000u);
+  EXPECT_EQ(strict.min_iter_for(100), 4004u);
 }
 
 TEST(WarmupConfig, HugeDimensionalityCannotOverflowTheWarmupFloor) {
