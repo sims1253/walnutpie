@@ -495,6 +495,44 @@ TEST(InitConfigBuilder, AdaptStepBuildConvergesFromLowAndHigh) {
   EXPECT_NEAR(std::log2(low), std::log2(high), 1.01);
 }
 
+static void stiff_normal(const Eigen::VectorXd& x, double& lp,
+                         Eigen::VectorXd& grad) {
+  lp = -5000.0 * x.dot(x);
+  grad = -10000.0 * x;
+}
+
+static void neg_inf(const Eigen::VectorXd& x, double& lp,
+                    Eigen::VectorXd& grad) {
+  lp = -std::numeric_limits<double>::infinity();
+  grad.setZero(x.size());
+}
+
+TEST(InitConfigBuilder, AdaptStepBuildShrinksForStiffTarget) {
+  Eigen::VectorXd pos = Eigen::VectorXd::Constant(3, 0.5);
+  for (double init_step : {1e-4, 1.0}) {
+    std::mt19937 rng(287456);
+    double step = walnutpie::InitConfigBuilder(1, 3)
+                      .step_sizes(init_step)
+                      .positions(pos)
+                      .adapt_step_build(rng, stiff_normal)
+                      .step_size(0);
+    EXPECT_TRUE(std::isfinite(step));
+    EXPECT_GT(step, 0.0);
+    EXPECT_LT(step, 0.01);
+  }
+}
+
+TEST(InitConfigBuilder, AdaptStepBuildNonFiniteTarget) {
+  std::mt19937 rng(287456);
+  double step = walnutpie::InitConfigBuilder(1, 3)
+                    .step_sizes(1.0)
+                    .adapt_step_build(rng, neg_inf)
+                    .step_size(0);
+  EXPECT_TRUE(std::isfinite(step));
+  EXPECT_GT(step, 0.0);
+  EXPECT_LT(step, 1.0);
+}
+
 double geo_mean_adapted_step(std::size_t D, double inv_mass, unsigned base_seed,
                              int num_seeds) {
   Eigen::VectorXd m =
