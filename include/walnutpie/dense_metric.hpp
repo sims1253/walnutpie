@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstddef>
+#include <limits>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -44,7 +45,9 @@ class DenseMetricEstimator {
         init_count_(init_count),
         mean_(Eigen::VectorXd::Zero(dim)),
         M2_(Eigen::MatrixXd::Zero(dim, dim)),
-        n_(0) {
+        n_(0),
+        score_mean_(Eigen::VectorXd::Zero(dim)),
+        score_M2_(Eigen::MatrixXd::Zero(dim, dim)) {
     detail::validate_positive(dim, "dim");
   }
 
@@ -55,6 +58,99 @@ class DenseMetricEstimator {
    * @pre `x.size()` is the dimensionality this estimator was built for.
    */
   void observe(const Eigen::VectorXd& x) {
+    record(x);
+    if (scoring_) {
+      Eigen::VectorXd zero = Eigen::VectorXd::Zero(dim_);
+      score(zero);
+    }
+  }
+
+  /**
+   * @brief Record one observation together with its score.
+   *
+   * Supplying the gradient lets the estimator cross-check itself. At
+   * stationarity the score covariance is the inverse of the target's
+   * covariance, so the draw covariance and the inverse score covariance are
+   * two independent estimates of the same matrix. When they agree, the chain
+   * really has explored and the off-diagonal structure is trustworthy; when
+   * they do not, the chain has not moved and the sample covariance is noise.
+   *
+   * @param[in] x The observed position.
+   * @param[in] g The gradient of the log density at `x`.
+   * @pre `x.size()` and `g.size()` are the dimensionality of this estimator.
+   */
+  void observe(const Eigen::VectorXd& x, const Eigen::VectorXd& g) {
+    record(x);
+    score(g);
+  }
+
+  /**
+   * @brief Return the inverse of the sample score covariance.
+   *
+   * For a target that is locally quadratic this is a second, independent
+   * estimate of the same covariance that `covariance()` produces.
+   *
+   * @param[out] ok Set to `false` if the score covariance could not be
+   * inverted, which happens when the chain has not moved.
+   * @return The inverse score covariance, or a zero matrix on failure.
+   */
+  Eigen::MatrixXd score_precision(bool* ok = nullptr) const {
+    if (ok) {
+      *ok = false;
+    }
+    if (score_n_ < 2) {
+      return Eigen::MatrixXd::Zero(dim_, dim_);
+    }
+    Eigen::MatrixXd G = score_M2_ / static_cast<double>(score_n_ - 1);
+    for (Eigen::Index i = 0; i < dim_; ++i) {
+      const double floor = 1e-12 * std::max(G(i, i), 1.0);
+      if (!(G(i, i) > floor)) {
+        G(i, i) = floor;
+      }
+    }
+    Eigen::LLT<Eigen::MatrixXd> llt(G);
+    if (llt.info() != Eigen::Success) {
+      return Eigen::MatrixXd::Zero(dim_, dim_);
+    }
+    if (ok) {
+      *ok = true;
+    }
+    const Eigen::MatrixXd I = Eigen::MatrixXd::Identity(dim_, dim_);
+    return llt.matrixU().solve(llt.matrixL().solve(I));
+  }
+
+  /**
+   * @brief Return how far the draw covariance and the inverse score
+   * covariance are apart, relative to the latter's norm.
+   *
+   * This is the estimator's own check that the chain has explored. Values
+   * below about `0.5` mean the two independent estimates agree and a
+   * full-rank metric can be trusted; a chain that has not moved produces
+   * values orders of magnitude larger, because the score covariance of a
+   * single repeated point has rank one.
+   *
+   * @return The relative disagreement, or infinity if either estimate is
+   * unavailable.
+   */
+  double agreement() const {
+    if (count() < 2 || score_n_ < 2) {
+      return std::numeric_limits<double>::infinity();
+    }
+    bool ok = false;
+    const Eigen::MatrixXd S = score_precision(&ok);
+    if (!ok) {
+      return std::numeric_limits<double>::infinity();
+    }
+    const double denom = S.norm();
+    if (!(denom > 0.0)) {
+      return std::numeric_limits<double>::infinity();
+    }
+    return (covariance() - S).norm() / denom;
+  }
+
+ private:
+  /** Record a position in the draw statistics. */
+  void record(const Eigen::VectorXd& x) {
     ++n_;
     if (n_ <= init_count_) {
       return;
@@ -66,6 +162,17 @@ class DenseMetricEstimator {
     M2_.noalias() += delta * (x - mean_).transpose();
   }
 
+  /** Record a score in the score statistics. */
+  void score(const Eigen::VectorXd& g) {
+    scoring_ = true;
+    ++score_n_;
+    const double inv_n = 1.0 / static_cast<double>(score_n_);
+    const Eigen::VectorXd delta = g - score_mean_;
+    score_mean_ += inv_n * delta;
+    score_M2_.noalias() += delta * (g - score_mean_).transpose();
+  }
+
+ public:
   /**
    * @brief Return the number of observations retained.
    */
@@ -134,6 +241,11 @@ class DenseMetricEstimator {
    * `[0, 1]` that makes the factorization succeed. The diagonal is always
    * positive by construction, so some `a` always works.
    *
+   * The shrinkage that was needed doubles as a reliability signal. Fewer than
+   * `dim` independent draws leave the sample covariance rank deficient, so a
+   * large `a` means the off-diagonal structure being kept is mostly noise.
+   * `shrinkage()` exposes the value that was used.
+   *
    * @param[in] max_shrink The largest shrinkage to allow. A value of one
    * returns the diagonal, that is, the metric a diagonal estimator would
    * have produced.
@@ -147,6 +259,7 @@ class DenseMetricEstimator {
     if (ok) {
       *ok = false;
     }
+    last_shrinkage_ = 1.0;
     const std::size_t k = count();
     if (k < 2) {
       return Eigen::MatrixXd::Identity(dim_, dim_);
@@ -168,11 +281,20 @@ class DenseMetricEstimator {
         if (ok) {
           *ok = true;
         }
+        last_shrinkage_ = a;
         return Eigen::MatrixXd(llt.matrixL());
       }
     }
     return Eigen::MatrixXd::Identity(dim_, dim_);
   }
+
+  /**
+   * @brief Return the shrinkage the last call to `cholesky()` needed.
+   *
+   * Zero means the sample covariance was already positive definite, so the
+   * off-diagonal structure came from the data rather than from the diagonal.
+   */
+  double shrinkage() const { return last_shrinkage_; }
 
  private:
   /** The number of coordinates. */
@@ -189,6 +311,21 @@ class DenseMetricEstimator {
 
   /** The number of observations made, including discarded ones. */
   std::size_t n_;
+
+  /** The shrinkage the most recent call to `cholesky()` needed. */
+  mutable double last_shrinkage_ = 1.0;
+
+  /** The running mean of the observed scores. */
+  Eigen::VectorXd score_mean_;
+
+  /** The scatter of the observed scores. */
+  Eigen::MatrixXd score_M2_;
+
+  /** The number of scores observed. */
+  std::size_t score_n_ = 0;
+
+  /** Whether any score has been observed. */
+  bool scoring_ = false;
 };
 
 /**

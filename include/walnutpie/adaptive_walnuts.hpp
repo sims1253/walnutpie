@@ -250,7 +250,7 @@ class AdaptiveWalnuts {
                      depth, grad_, logp_, workspace_, adam_);
     mass_estimator_.observe(theta_, grad_, iteration_);
     if (warmup_cfg_.metric_dense()) {
-      dense_estimator_.observe(theta_);
+      dense_estimator_.observe(theta_, grad_);
     }
     min_micro_estimator_.observe(1 << depth);
     handler_.get().on_warmup(theta_, logp_, step_size(), inv_mass);
@@ -304,8 +304,23 @@ class AdaptiveWalnuts {
     if (!warmup_cfg_.metric_dense()) {
       return nullptr;
     }
+    // A diagonal metric already handles targets whose coordinates differ in
+    // scale but are independent, so require something to gain.
     if (dense_estimator_.max_abs_correlation() <
         warmup_cfg_.metric_dense_min_corr()) {
+      return nullptr;
+    }
+    // A sample covariance is only meaningful if the chain actually explored.
+    // Fewer draws than dimensions cannot fill the matrix, and a chain that
+    // never moves yields a rank-one covariance no matter how many draws are
+    // taken. Requiring the draw covariance and the independently estimated
+    // inverse score covariance to agree rules both cases out.
+    const std::size_t dim = static_cast<std::size_t>(theta_.size());
+    if (dense_estimator_.count() < warmup_cfg_.metric_dense_min_obs() * dim) {
+      return nullptr;
+    }
+    if (dense_estimator_.agreement() >
+        warmup_cfg_.metric_dense_max_agreement()) {
       return nullptr;
     }
     bool ok = false;

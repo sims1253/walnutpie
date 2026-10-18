@@ -578,6 +578,24 @@ class WarmupConfig {
   double metric_dense_min_corr() const { return metric_dense_min_corr_; }
 
   /**
+   * @brief Return the multiple of the dimensionality at which a requested
+   * full-rank metric is used.
+   *
+   * @return The minimum number of warmup draws per coordinate.
+   */
+  std::size_t metric_dense_min_obs() const { return metric_dense_min_obs_; }
+
+  /**
+   * @brief Return the largest disagreement between the draw covariance and
+   * the inverse score covariance that still permits a full-rank metric.
+   *
+   * @return The screening threshold on the relative disagreement.
+   */
+  double metric_dense_max_agreement() const {
+    return metric_dense_max_agreement_;
+  }
+
+  /**
    * @brief Return the target acceptance rate.
    *
    * @return The target acceptance rate.
@@ -647,6 +665,8 @@ class WarmupConfig {
   double max_macro_steps_target_ = 15.0;
   bool metric_dense_ = false;
   double metric_dense_min_corr_ = 0.3;
+  std::size_t metric_dense_min_obs_ = 4;
+  double metric_dense_max_agreement_ = 0.5;
   double step_accept_rate_target_ = 0.8;
   double step_learning_rate_ = 0.05;
   double step_gradient_decay_ = 0.8;
@@ -760,6 +780,36 @@ class WarmupConfigBuilder {
   WarmupConfigBuilder& metric_dense_min_corr(double v) {
     detail::validate_finite_positive(v, "metric_dense_min_corr");
     cfg_.metric_dense_min_corr_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the number of warmup draws per coordinate a requested
+   * full-rank metric needs.
+   *
+   * A covariance matrix has one entry per pair of coordinates, so fewer draws
+   * than coordinates cannot fill it.
+   *
+   * @param[in] v The multiple of the dimensionality.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& metric_dense_min_obs(std::size_t v) {
+    cfg_.metric_dense_min_obs_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the largest disagreement between the draw covariance and the
+   * inverse score covariance that still permits a full-rank metric.
+   *
+   * @param[in] v The threshold. A chain that has not explored produces values
+   * orders of magnitude above one.
+   * @return This builder for chaining.
+   * @throw std::invalid_argument If `v` is not finite and positive.
+   */
+  WarmupConfigBuilder& metric_dense_max_agreement(double v) {
+    detail::validate_finite_positive(v, "metric_dense_max_agreement");
+    cfg_.metric_dense_max_agreement_ = v;
     return *this;
   }
 
