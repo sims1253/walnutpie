@@ -368,23 +368,35 @@ static bool uturn(const SpanW& span1, const SpanW& span2,
  * @param[in] num_steps The number of micro steps to take.
  * @param[in] max_error The maximum error in Hamiltonian at macro steps.
  * @param[in] logp_next Initial log density.
- * @param[in,out] theta_next Input initial position, set to final position.
- * @param[in,out] rho_next Input initial momentum, set to final position.
- * @param[in,out] grad_next Input initial gradient, set to final gradient.
+ * @param[in] theta The initial position.
+ * @param[in] rho The initial momentum, used when `rho_sign` is `1.0`.
+ * @param[in] rho_sign `1.0` to start from `rho`, `-1.0` to reverse it.
+ * @param[in] grad The initial gradient.
+ * @param[out] theta_next The final position.
+ * @param[out] rho_next The final momentum.
+ * @param[out] grad_next The final gradient.
  * @param[in,out] scratch A preallocated vector used to accumulate the kinetic
  * energy of the trial state.
  */
 template <LogpGrad F>
-static bool within_tolerance(const F& logp_grad,
-                             const Eigen::VectorXd& inv_mass, double step,
-                             std::size_t num_steps, double max_error,
-                             double logp_next, Eigen::VectorXd& theta_next,
-                             Eigen::VectorXd& rho_next,
-                             Eigen::VectorXd& grad_next,
-                             Eigen::VectorXd& scratch) {
+static bool within_tolerance(
+    const F& logp_grad, const Eigen::VectorXd& inv_mass, double step,
+    std::size_t num_steps, double max_error, double logp_next,
+    const Eigen::VectorXd& theta, const Eigen::VectorXd& rho, double rho_sign,
+    const Eigen::VectorXd& grad, Eigen::VectorXd& theta_next,
+    Eigen::VectorXd& rho_next, Eigen::VectorXd& grad_next,
+    Eigen::VectorXd& scratch) {
   double half_step = 0.5 * step;
   double logp = logp_next;
-  for (std::size_t n = 0; n < num_steps; ++n) {
+  // The first leapfrog step is fused with the prologue, which reads the
+  // gradient of the starting state directly and so does not need `grad_next`
+  // copied first: `logp_grad` overwrites it below.
+  rho_next.array() = rho_sign * rho.array() + half_step * grad.array();
+  theta_next.array() =
+      theta.array() + step * inv_mass.array() * rho_next.array();
+  logp_grad(theta_next, logp_next, grad_next);
+  rho_next += half_step * grad_next;
+  for (std::size_t n = 1; n < num_steps; ++n) {
     rho_next += half_step * grad_next;
     theta_next.array() += step * inv_mass.array() * rho_next.array();
     logp_grad(theta_next, logp_next, grad_next);
@@ -427,14 +439,11 @@ static bool reversible(const F& logp_grad, const Eigen::VectorXd& inv_mass,
   Eigen::VectorXd& rho_next = scratch2;
   Eigen::VectorXd& grad_next = scratch3;
   while (num_steps >= 2 * min_micro_steps) {
-    theta_next = theta;
-    rho_next = -rho;
-    grad_next = grad;
     num_steps /= 2;
     step *= 2;
     if (within_tolerance(logp_grad, inv_mass, step, num_steps, max_error,
-                         logp_next, theta_next, rho_next, grad_next,
-                         scratch1)) {
+                         logp_next, theta, rho, -1.0, grad, theta_next,
+                         rho_next, grad_next, scratch1)) {
       return false;
     }
   }
@@ -484,11 +493,18 @@ static bool macro_step(const F& logp_grad, const Eigen::VectorXd& inv_mass,
   step = is_forward ? step : -step;
   for (std::size_t num_steps = min_micro_steps, halvings = 0;
        halvings < max_step_halvings; ++halvings, num_steps *= 2, step *= 0.5) {
-    theta_next = theta;
-    rho_next = rho;
-    grad_next = grad;
     double half_step = 0.5 * step;
-    for (std::size_t n = 0; n < num_steps; ++n) {
+    // The first leapfrog step is fused with the prologue, which reads the
+    // gradient of the starting state and so does not need `grad_next` to be
+    // copied first: `logp_grad` overwrites it below. This computes the same
+    // values in the same order as copying and then stepping, but saves three
+    // passes over the position, momentum, and gradient vectors per attempt.
+    rho_next.array() = rho.array() + half_step * grad.array();
+    theta_next.array() =
+        theta.array() + step * inv_mass.array() * rho_next.array();
+    logp_grad(theta_next, logp_pos_next, grad_next);
+    rho_next += half_step * grad_next;
+    for (std::size_t n = 1; n < num_steps; ++n) {
       rho_next += half_step * grad_next;
       theta_next.array() += step * inv_mass.array() * rho_next.array();
       logp_grad(theta_next, logp_pos_next, grad_next);
