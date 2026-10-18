@@ -944,8 +944,13 @@ class WalnutsSampler {
     detail::validate_positive(max_step_halvings, "max_step_halvings");
     detail::validate_positive(min_micro_steps, "min_micro_steps");
     detail::validate_positive(max_error, "max_error");
-    logp_grad_(theta_, logp_, grad_);
+    // The transform has to be in place before the starting state is
+    // evaluated: without it the log density and gradient would be the raw
+    // model's at the sampling coordinates rather than those of the
+    // reparametrized density, and the first leapfrog step of the first
+    // trajectory would start from a gradient belonging to neither.
     logp_grad_.set_transform(transform);
+    logp_grad_(theta_, logp_, grad_);
   }
 
   /**
@@ -978,12 +983,13 @@ class WalnutsSampler {
     if (logp_grad_.has_transform()) {
       // The chain runs in reparametrized coordinates; the handler is promised
       // positions of the target, so map back before reporting and keep the
-      // chain in its own coordinates.
-      detail::DenseMetricTransform t = logp_grad_.transform();
-      Eigen::VectorXd z = std::move(theta_);
-      t.forward(z, theta_);
+      // chain in its own coordinates.  Swapping through a member avoids both
+      // an allocation and a copy of the factor on every draw.
+      const detail::DenseMetricTransform& t = logp_grad_.transform();
+      theta_.swap(theta_report_);
+      t.forward(theta_report_, theta_);
       sample_handler_.get().on_sample(theta_, logp_);
-      theta_ = std::move(z);
+      theta_.swap(theta_report_);
     } else {
       sample_handler_.get().on_sample(theta_, logp_);
     }
@@ -1041,6 +1047,9 @@ class WalnutsSampler {
 
   /** The current position. */
   Eigen::VectorXd theta_;
+
+  /** Scratch for reporting a position in the target's own coordinates. */
+  Eigen::VectorXd theta_report_;
 
   /** The gradient of the log density at `theta_`. */
   Eigen::VectorXd grad_;

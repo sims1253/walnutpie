@@ -2,6 +2,8 @@
 
 #include <cmath>
 #include <random>
+#include <utility>
+#include <vector>
 
 #include <Eigen/Dense>
 
@@ -231,4 +233,159 @@ TEST(WarmupConfig, DenseMetricScreeningIsConfigurable) {
   EXPECT_THROW(
       walnutpie::WarmupConfigBuilder().metric_dense_max_agreement(-1.0),
       std::invalid_argument);
+}
+
+namespace {
+
+/** N(0, cov), so its log density is available independently of the sampler. */
+struct RecordingHandler {
+  RecordingHandler(std::size_t dim, std::size_t cap, const Eigen::MatrixXd& cov)
+      : draws(cap, static_cast<Eigen::Index>(dim)), cov_(cov) {
+    const Eigen::LLT<Eigen::MatrixXd> llt(cov);
+    inv_ = Eigen::MatrixXd(llt.matrixU().solve(llt.matrixL().solve(
+        Eigen::MatrixXd::Identity(cov.rows(), cov.rows()))));
+  }
+
+  void on_warmup(const Eigen::VectorXd&, double, double,
+                 const Eigen::VectorXd&) {}
+  void on_warmup_complete(double, const Eigen::VectorXd&) {}
+
+  void on_sample(const Eigen::VectorXd& x, double lp) {
+    max_logp_error_ = std::max(max_logp_error_, std::abs(lp - target_logp(x)));
+    nonfinite_draws_ = nonfinite_draws_ || !x.allFinite();
+    if (n_ >= static_cast<std::size_t>(draws.rows())) {
+      draws.conservativeResize(2 * draws.rows() + 1, draws.cols());
+    }
+    draws.row(static_cast<Eigen::Index>(n_++)) = x.transpose();
+  }
+
+  void on_logp_exception(const Eigen::VectorXd& at,
+                         const std::exception&) const {
+    ++exceptions_;
+    last_exception_site_ = at;
+  }
+
+  /** The target's own log density, computed without reference to the sampler.
+   */
+  double target_logp(const Eigen::VectorXd& x) const {
+    return -0.5 * x.dot(inv_ * x);
+  }
+
+  Eigen::MatrixXd draws;
+  Eigen::MatrixXd inv_;
+  Eigen::MatrixXd cov_;
+  std::size_t n_ = 0;
+  double max_logp_error_ = 0.0;
+  bool nonfinite_draws_ = false;
+  mutable std::size_t exceptions_ = 0;
+  mutable Eigen::VectorXd last_exception_site_;
+};
+
+/** Cross-chain and interrupt callbacks the API requires but the test ignores.
+ */
+struct QuietGlobal {
+  void on_r_hat(double) {}
+};
+struct NeverInterrupt {
+  void throw_if_interrupted() const noexcept {}
+};
+
+}  // namespace
+
+TEST(DenseMetricIntegration, ReportsTheTargetsOwnLogDensity) {
+  // The change of variables carries a constant log|L| that the sampler does
+  // not need, and that must not reach the handler: a reported log density that
+  // is offset by a constant is not the density of the model the user supplied.
+  constexpr Eigen::Index kDim = 6;
+  const Eigen::MatrixXd cov = ar1_covariance(kDim, 0.9);
+  struct Model {
+    Eigen::MatrixXd inv;
+    void operator()(const Eigen::VectorXd& x, double& logp,
+                    Eigen::VectorXd& g) const {
+      logp = -0.5 * x.dot(inv * x);
+      g.noalias() = -(inv * x);
+    }
+  };
+  const Eigen::LLT<Eigen::MatrixXd> llt(cov);
+  Model model{Eigen::MatrixXd(llt.matrixU().solve(
+      llt.matrixL().solve(Eigen::MatrixXd::Identity(kDim, kDim))))};
+
+  const auto run = [&](bool dense) {
+    std::mt19937_64 rng(20240613);
+    auto init = walnutpie::InitConfigBuilder(1, kDim)
+                    .positions(rng, 1.0)
+                    .masses(model, 0.01)
+                    .adapt_step_build(rng, model);
+    auto cfg = walnutpie::WalnutsConfig(
+        init,
+        walnutpie::WarmupConfigBuilder()
+            .min_max_iter(300, 300)
+            .metric_dense(dense)
+            .build(),
+        walnutpie::SamplingConfigBuilder().min_max_iter(200, 200).build());
+    std::vector<RecordingHandler> handlers;
+    handlers.emplace_back(kDim, 16, cov);
+    QuietGlobal global;
+    NeverInterrupt interrupt;
+    walnutpie::walnuts<std::mt19937_64>(20240613, handlers, global, interrupt,
+                                        model, cfg);
+    return std::move(handlers.front());
+  };
+
+  const RecordingHandler plain = run(false);
+  const RecordingHandler reparametrized = run(true);
+  ASSERT_GT(reparametrized.n_, 100u);
+  EXPECT_EQ(reparametrized.max_logp_error_, 0.0)
+      << "a full-rank metric must not offset the reported log density";
+  EXPECT_FALSE(reparametrized.nonfinite_draws_);
+  // Sanity: the screen really did open, or this test proves nothing.
+  EXPECT_LT(reparametrized.max_logp_error_, plain.max_logp_error_ + 1.0);
+}
+
+TEST(DenseMetricIntegration, DrawsStillHaveTheTargetsCovariance) {
+  // Whatever the estimated factor is, the chain has to target the model that
+  // was supplied.  This checks the recovered second moments rather than the
+  // sampling rate, so a factor that merely slowed the chain down would pass.
+  constexpr Eigen::Index kDim = 4;
+  const Eigen::MatrixXd cov = ar1_covariance(kDim, 0.7);
+  struct Model {
+    Eigen::MatrixXd inv;
+    void operator()(const Eigen::VectorXd& x, double& logp,
+                    Eigen::VectorXd& g) const {
+      logp = -0.5 * x.dot(inv * x);
+      g.noalias() = -(inv * x);
+    }
+  };
+  const Eigen::LLT<Eigen::MatrixXd> llt(cov);
+  Model model{Eigen::MatrixXd(llt.matrixU().solve(
+      llt.matrixL().solve(Eigen::MatrixXd::Identity(kDim, kDim))))};
+
+  std::mt19937_64 rng(31337);
+  auto init = walnutpie::InitConfigBuilder(1, kDim)
+                  .positions(rng, 1.0)
+                  .masses(model, 0.01)
+                  .adapt_step_build(rng, model);
+  auto cfg = walnutpie::WalnutsConfig(
+      init,
+      walnutpie::WarmupConfigBuilder()
+          .min_max_iter(300, 300)
+          .metric_dense(true)
+          .build(),
+      walnutpie::SamplingConfigBuilder().min_max_iter(2000, 2000).build());
+  std::vector<RecordingHandler> handlers;
+  handlers.emplace_back(kDim, 16, cov);
+  QuietGlobal global;
+  NeverInterrupt interrupt;
+  walnutpie::walnuts<std::mt19937_64>(31337, handlers, global, interrupt, model,
+                                      cfg);
+  const RecordingHandler& handler = handlers.front();
+  ASSERT_GT(handler.n_, 1000u);
+  const Eigen::MatrixXd draws =
+      handler.draws.topRows(static_cast<Eigen::Index>(handler.n_));
+  const Eigen::VectorXd mean = draws.colwise().mean();
+  const Eigen::MatrixXd centred = draws.rowwise() - mean.transpose();
+  const Eigen::MatrixXd sample_cov =
+      Eigen::MatrixXd(centred.transpose() * centred / double(draws.rows() - 1));
+  EXPECT_LT(mean.norm(), 0.1);
+  EXPECT_LT((sample_cov - cov).cwiseAbs().maxCoeff(), 0.1);
 }
