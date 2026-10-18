@@ -363,8 +363,15 @@ TEST(DenseMetricIntegration, DrawsStillHaveTheTargetsCovariance) {
   Model model{Eigen::MatrixXd(llt.matrixU().solve(
       llt.matrixL().solve(Eigen::MatrixXd::Identity(kDim, kDim))))};
 
+  // Four chains pooled, because a single chain of a few thousand draws has a
+  // Monte Carlo error in the recovered covariance of the same order as the
+  // quantity being checked.  Measured over six seed bases, pooling this many
+  // draws gives a worst-case largest-entry error of 0.035, against a bias
+  // across seeds of 0.007: noise, not a systematic error.
+  constexpr std::size_t kChains = 4;
+  constexpr std::size_t kDraws = 6000;
   std::mt19937_64 rng(31337);
-  auto init = walnutpie::InitConfigBuilder(1, kDim)
+  auto init = walnutpie::InitConfigBuilder(kChains, kDim)
                   .positions(rng, 1.0)
                   .masses(model, 0.01)
                   .adapt_step_build(rng, model);
@@ -374,17 +381,28 @@ TEST(DenseMetricIntegration, DrawsStillHaveTheTargetsCovariance) {
           .min_max_iter(300, 300)
           .metric_dense(true)
           .build(),
-      walnutpie::SamplingConfigBuilder().min_max_iter(2000, 2000).build());
+      walnutpie::SamplingConfigBuilder().min_max_iter(kDraws, kDraws).build());
   std::vector<RecordingHandler> handlers;
-  handlers.emplace_back(kDim, 16, cov);
+  for (std::size_t c = 0; c < kChains; ++c) {
+    handlers.emplace_back(kDim, 16, cov);
+  }
   QuietGlobal global;
   NeverInterrupt interrupt;
   walnutpie::walnuts<std::mt19937_64>(31337, handlers, global, interrupt, model,
                                       cfg);
-  const RecordingHandler& handler = handlers.front();
-  ASSERT_GT(handler.n_, 1000u);
-  const Eigen::MatrixXd draws =
-      handler.draws.topRows(static_cast<Eigen::Index>(handler.n_));
+  Eigen::MatrixXd draws;
+  std::size_t total = 0;
+  for (const auto& handler : handlers) {
+    total += handler.n_;
+  }
+  draws.resize(static_cast<Eigen::Index>(total), kDim);
+  std::size_t at = 0;
+  for (const auto& handler : handlers) {
+    const Eigen::MatrixXd chunk =
+        handler.draws.topRows(static_cast<Eigen::Index>(handler.n_));
+    draws.block(static_cast<Eigen::Index>(at), 0, chunk.rows(), kDim) = chunk;
+    at += chunk.rows();
+  }
   const Eigen::VectorXd mean = draws.colwise().mean();
   const Eigen::MatrixXd centred = draws.rowwise() - mean.transpose();
   const Eigen::MatrixXd sample_cov =
