@@ -102,7 +102,11 @@ int main() {
   std::cout << "\n";
 
   std::cout << "NUMBER OF R-HAT EVALS: " << global_handler.r_hats().size()
-            << ";  FINAL R-HAT: " << global_handler.r_hats().back() << "\n\n";
+            << ";  FINAL R-HAT: "
+            << (global_handler.r_hats().empty()
+                    ? std::string("n/a")
+                    : std::to_string(global_handler.r_hats().back()))
+            << "\n\n";
 
   std::cout << "WRITING BINARY TO FILES: step_size.wal, mass_matrix.wal, "
                "sample.wal\n\n";
