@@ -16,6 +16,27 @@
 using walnutpie::DynamicStanModel;
 using walnutpie::unique_bs_rng;
 
+// --cap-census plumbing: the flag is set once in main() and read by
+// run_walnuts below, so no run_walnuts parameter is threaded through the
+// call. The counters themselves live in
+// walnutpie::detail::g_cap_census (walnuts.hpp) and are enabled ONLY
+// around the post-warmup sampling loop (per SAMPLING phase; warmup is
+// never counted).
+struct CapCensusSettings {
+  bool enabled = false;
+};
+static CapCensusSettings g_cap_census_cli;
+
+// Enables detail::g_cap_census for the guarded scope (exception-safe).
+struct CapCensusGuard {
+  const bool was_;
+  explicit CapCensusGuard(bool on)
+      : was_(walnutpie::detail::g_cap_census.enabled) {
+    walnutpie::detail::g_cap_census.enabled = on;
+  }
+  ~CapCensusGuard() { walnutpie::detail::g_cap_census.enabled = was_; }
+};
+
 static void summarize(const std::vector<std::string>& names,
                       const Eigen::MatrixXd& draws) {
   auto N = draws.cols();
@@ -169,8 +190,12 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
   logp_time = 0.0;
   logp_count = 0;
   global_start = Clock::now();
-  for (std::size_t n = 0; n < num_draws; ++n) {
-    sampler();
+  {
+    // W-97: count cap-pressure only over the sampling-phase transitions.
+    CapCensusGuard census_guard(g_cap_census_cli.enabled);
+    for (std::size_t n = 0; n < num_draws; ++n) {
+      sampler();
+    }
   }
   end_timing();
 
@@ -187,6 +212,7 @@ int main(int argc, char** argv) {
   std::size_t num_warmup = 128;
   std::size_t num_draws = 128;
   bool save_warmup = false;
+  bool cap_census = false;  // W-97: sampling-phase cap-pressure census
 
   walnutpie::WarmupConfig default_warmup =
       walnutpie::WarmupConfigBuilder().build();
@@ -234,6 +260,16 @@ int main(int argc, char** argv) {
     app.add_flag("--save-warmup", save_warmup,
                  "Pass this flag to save the warmup iterations as well.")
         ->default_val(save_warmup);
+
+    app.add_flag("--cap-census", cap_census,
+                 "W-97 instrumentation: count, over SAMPLING-phase macro "
+                 "steps only, how hard --max-hamiltonian-error binds — "
+                 "accepted attempts, attempts whose checked |dlogp| fell "
+                 "within 10% of the cap (\"cap pressure\"), halvings used, "
+                 "and rejected-after-all-halvings attempts (divergence "
+                 "analog). Counters only: draws are bit-identical with and "
+                 "without the flag. Summary on stderr at end of run.")
+        ->default_val(cap_census);
 
     app.add_option("--max-trajectory-doublings", max_trajectory_doublings,
                    "Maximum depth for Nuts trajectory doublings")
@@ -351,6 +387,8 @@ int main(int argc, char** argv) {
 
   unique_bs_rng rng = model.make_rng(seed);
 
+  g_cap_census_cli.enabled = cap_census;
+
   auto init_cfg =
       walnutpie::InitConfigBuilder{1, model.unconstrained_dimensions()}
           .step_sizes(step_size_init)
@@ -361,6 +399,9 @@ int main(int argc, char** argv) {
 
   res.summarize();
   res.write_csv(output_file);
+  if (g_cap_census_cli.enabled) {
+    walnutpie::detail::cap_census_report(std::cerr);
+  }
 
   return 0;
 }
