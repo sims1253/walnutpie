@@ -216,7 +216,7 @@ TEST(WarmupConfig, DenseMetricIsOffByDefault) {
   const auto cfg = walnutpie::WarmupConfigBuilder().build();
   EXPECT_FALSE(cfg.metric_dense());
   EXPECT_DOUBLE_EQ(cfg.metric_dense_min_corr(), 0.3);
-  EXPECT_EQ(cfg.metric_dense_min_obs(), 10u);
+  EXPECT_EQ(cfg.metric_dense_min_obs(), 6u);
   EXPECT_DOUBLE_EQ(cfg.metric_dense_max_agreement(), 4.0);
 }
 
@@ -426,7 +426,7 @@ TEST(WarmupConfig, WarmupFloorRisesToSupplyARequestedFullRankMetric) {
                          .min_max_iter(50, 10000)
                          .metric_dense(true)
                          .build();
-  EXPECT_EQ(dense.min_iter_for(100), 1004u);
+  EXPECT_EQ(dense.min_iter_for(100), 604u);
   EXPECT_EQ(dense.min_iter_for(3), 50u);
 
   // But never past the configured maximum, or warmup could not terminate.

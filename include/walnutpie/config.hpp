@@ -702,10 +702,21 @@ class WarmupConfig {
   double max_macro_steps_target_ = 15.0;
   bool metric_dense_ = false;
   double metric_dense_min_corr_ = 0.3;
-  // Ten draws per coordinate.  Measured on an AR(1) target in 100
-  // dimensions, that many draws give a covariance with 3% relative error,
-  // while two per coordinate give 20%.
-  std::size_t metric_dense_min_obs_ = 10;
+  // Six draws per coordinate.  Chosen as the smallest multiple at which the
+  // screening still separates a correlated target from an uncorrelated one:
+  // at four draws per coordinate the largest sample correlation between
+  // coordinates is inflated by noise enough to look like real correlation,
+  // and forcing the metric onto `ill_normal` at that setting costs 47% of ESS
+  // per draw, interval [0.32, 0.87].  At six, both uncorrelated targets are
+  // declined as they should be.
+  //
+  // It is also the largest multiple walnutpie's own default warmup budget can
+  // satisfy in 100 dimensions.  Ten is self-inconsistent at the defaults: the
+  // floor asks for 1004 iterations, max_iter caps warmup at 1000, the
+  // estimator keeps 996 of them, and the screen declines a request that the
+  // warmup had no budget to meet.  Setting metric_dense alone would then do
+  // nothing at all.
+  std::size_t metric_dense_min_obs_ = 6;
   // A coarse guard against a chain that has not moved at all, not a tuning
   // knob.  Measured on real warmup chains the disagreement stays between 0.29
   // and 1.0 whether the metric it produces turns out to be worth 2x or 74x,
