@@ -706,7 +706,14 @@ class WarmupConfig {
   // dimensions, that many draws give a covariance with 3% relative error,
   // while two per coordinate give 20%.
   std::size_t metric_dense_min_obs_ = 10;
-  double metric_dense_max_agreement_ = 0.5;
+  // A coarse guard against a chain that has not moved at all, not a tuning
+  // knob.  Measured on real warmup chains the disagreement stays between 0.29
+  // and 1.0 whether the metric it produces turns out to be worth 2x or 74x,
+  // so no threshold inside that range discriminates anything.  A chain that has
+  // genuinely not moved disagrees by orders of magnitude more: 47 at a drift
+  // of 0.9 and 324 when frozen, against 0.016 to 0.042 for a chain of
+  // independent draws.
+  double metric_dense_max_agreement_ = 4.0;
   double step_accept_rate_target_ = 0.8;
   double step_learning_rate_ = 0.05;
   double step_gradient_decay_ = 0.8;

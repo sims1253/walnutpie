@@ -217,7 +217,7 @@ TEST(WarmupConfig, DenseMetricIsOffByDefault) {
   EXPECT_FALSE(cfg.metric_dense());
   EXPECT_DOUBLE_EQ(cfg.metric_dense_min_corr(), 0.3);
   EXPECT_EQ(cfg.metric_dense_min_obs(), 10u);
-  EXPECT_DOUBLE_EQ(cfg.metric_dense_max_agreement(), 0.5);
+  EXPECT_DOUBLE_EQ(cfg.metric_dense_max_agreement(), 4.0);
 }
 
 TEST(WarmupConfig, DenseMetricScreeningIsConfigurable) {
