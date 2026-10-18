@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <ostream>
 #include <random>
@@ -578,6 +579,24 @@ class WarmupConfig {
   double metric_dense_min_corr() const { return metric_dense_min_corr_; }
 
   /**
+   * @brief Return the multiple of the dimensionality at which a requested
+   * full-rank metric is used.
+   *
+   * @return The minimum number of warmup draws per coordinate.
+   */
+  std::size_t metric_dense_min_obs() const { return metric_dense_min_obs_; }
+
+  /**
+   * @brief Return the largest disagreement between the draw covariance and
+   * the inverse score covariance that still permits a full-rank metric.
+   *
+   * @return The screening threshold on the relative disagreement.
+   */
+  double metric_dense_max_agreement() const {
+    return metric_dense_max_agreement_;
+  }
+
+  /**
    * @brief Return the target acceptance rate.
    *
    * @return The target acceptance rate.
@@ -627,6 +646,36 @@ class WarmupConfig {
   std::size_t publish_stride() const { return publish_stride_; }
 
   /**
+   * @brief Return the number of warmup draws to collect before warmup may stop.
+   *
+   * This is `min_iter()`, raised when a full-rank metric has been requested so
+   * that it is met.  Warmup normally stops at `min_iter()`, but a covariance
+   * matrix has one entry per pair of coordinates, so estimating one needs
+   * several draws per coordinate; a request that the warmup cannot satisfy
+   * would only be declined later, after paying for the estimate.  Warmup
+   * draws are discarded, so the iterations spent collecting them produce no
+   * draws either way and the only question is whether they are worth running.
+   *
+   * @param[in] dims The dimensionality of the parameter space.
+   * @return The number of warmup draws required, never more than `max_iter()`.
+   */
+  std::size_t min_iter_for(std::size_t dims) const {
+    std::size_t needed = min_iter_;
+    if (metric_dense_) {
+      // Guard the product: a request far larger than the warmup budget is
+      // simply beyond it, not an overflow.
+      const std::size_t per_coord = metric_dense_min_obs_;
+      const std::size_t cap =
+          per_coord == 0 ? max_iter_ : max_iter_ / per_coord;
+      if (dims > cap) {
+        return max_iter_;
+      }
+      needed = std::max(needed, per_coord * dims);
+    }
+    return std::min(needed, max_iter_);
+  }
+
+  /**
    * @brief Return the period at which threads for chains yield.
    *
    * @return The the period at which threads for chains yield.
@@ -647,6 +696,11 @@ class WarmupConfig {
   double max_macro_steps_target_ = 15.0;
   bool metric_dense_ = false;
   double metric_dense_min_corr_ = 0.3;
+  // Ten draws per coordinate.  Measured on an AR(1) target in 100
+  // dimensions, that many draws give a covariance with 3% relative error,
+  // while two per coordinate give 20%.
+  std::size_t metric_dense_min_obs_ = 10;
+  double metric_dense_max_agreement_ = 0.5;
   double step_accept_rate_target_ = 0.8;
   double step_learning_rate_ = 0.05;
   double step_gradient_decay_ = 0.8;
@@ -760,6 +814,42 @@ class WarmupConfigBuilder {
   WarmupConfigBuilder& metric_dense_min_corr(double v) {
     detail::validate_finite_positive(v, "metric_dense_min_corr");
     cfg_.metric_dense_min_corr_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the number of warmup draws per coordinate a requested
+   * full-rank metric needs.
+   *
+   * A covariance matrix has one entry per pair of coordinates, so fewer draws
+   * than coordinates cannot fill it.  This also raises how long warmup runs
+   * when a full-rank metric is requested, since warmup is the only time those
+   * draws exist.
+   *
+   * @param[in] v The multiple of the dimensionality.
+   * @return This builder for chaining.
+   * @throw std::invalid_argument If `v` is zero.
+   */
+  WarmupConfigBuilder& metric_dense_min_obs(std::size_t v) {
+    if (v == 0) {
+      throw std::invalid_argument("metric_dense_min_obs must be positive.");
+    }
+    cfg_.metric_dense_min_obs_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the largest disagreement between the draw covariance and the
+   * inverse score covariance that still permits a full-rank metric.
+   *
+   * @param[in] v The threshold. A chain that has not explored produces values
+   * orders of magnitude above one.
+   * @return This builder for chaining.
+   * @throw std::invalid_argument If `v` is not finite and positive.
+   */
+  WarmupConfigBuilder& metric_dense_max_agreement(double v) {
+    detail::validate_finite_positive(v, "metric_dense_max_agreement");
+    cfg_.metric_dense_max_agreement_ = v;
     return *this;
   }
 

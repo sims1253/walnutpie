@@ -459,10 +459,17 @@ class NoExceptLogpGrad {
       transform_.forward(x, theta_);
       double logp_theta;
       logp_grad_.get()(theta_, logp_theta, grad_theta_);
-      logp = logp_theta + transform_.log_determinant();
+      // The change of variables also contributes the constant log|L|, which is
+      // deliberately left out.  Only differences of the log density enter the
+      // sampler, so the constant cannot affect the trajectory, the acceptance
+      // probability or the energy error, while leaving it out keeps the value
+      // reported to the handler exactly the one the user's model returned.
+      logp = logp_theta;
       transform_.backward(grad_theta_, grad);
     } catch (const std::exception& e) {
-      handler_.get().on_logp_exception(x, e);
+      // Report the position the user's model actually failed at, which under
+      // a transform is not the position the chain holds.
+      handler_.get().on_logp_exception(transform_.active() ? theta_ : x, e);
       // logp_grad failure equivalent to -inf log density
       logp = -std::numeric_limits<double>::infinity();
       grad.setZero(x.size());
