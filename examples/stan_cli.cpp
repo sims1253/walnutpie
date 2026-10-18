@@ -147,11 +147,11 @@ StanHandler run_walnuts(DynamicStanModel& model, unsigned int seed,
     ++logp_count;
   };
 
-  auto init_cfg =
-      init_builder.masses(logp, warmup_cfg.mass_additive_smoothing()).build();
-  auto inits = init_cfg.init_chain_config(0);
-
   std::mt19937_64 rng{seed};
+  auto init_cfg =
+      init_builder.masses(logp, warmup_cfg.mass_additive_smoothing())
+          .adapt_step_build(rng, logp);
+  auto inits = init_cfg.init_chain_config(0);
   walnutpie::AdaptiveWalnuts walnuts(rng, storage, logp, inits, warmup_cfg,
                                      sample_cfg);
   for (std::size_t w = 0; w < num_warmup; ++w) {
@@ -276,7 +276,7 @@ int main(int argc, char** argv) {
         ->check(CLI::PositiveNumber);
 
     app.add_option("--step-size-init", step_size_init,
-                   "Initial step size for the step size adaptation")
+                   "Initial guess for the heuristic step size search")
         ->default_val(step_size_init)
         ->check(CLI::PositiveNumber);
 
