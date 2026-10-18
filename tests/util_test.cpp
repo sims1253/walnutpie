@@ -51,6 +51,23 @@ TEST(DetailRandom, UniformReal01MeanAndVariance) {
   EXPECT_NEAR(var, 1.0 / 12.0, 0.01);  // 8 se tolerance
 }
 
+TEST(DetailRandom, UniformReal01InRangeAndMomentsMt1993764) {
+  std::mt19937_64 rng(RNG_TEST_SEED);
+  walnutpie::detail::Random<std::mt19937_64> r(rng);
+  double sum = 0.0, sum_sq = 0.0;
+  for (int i = 0; i < TEST_SIZE; ++i) {
+    double u = r.uniform_real_01();
+    EXPECT_GE(u, 0.0);
+    EXPECT_LT(u, 1.0);
+    sum += u;
+    sum_sq += u * u;
+  }
+  double mean = sum / TEST_SIZE;
+  double var = sum_sq / TEST_SIZE - mean * mean;
+  EXPECT_NEAR(mean, 0.5, 0.01);
+  EXPECT_NEAR(var, 1.0 / 12.0, 0.01);
+}
+
 // rng() method
 
 TEST(DetailRandom, RngHeldByReference) {
@@ -74,7 +91,35 @@ TEST(DetailRandom, UniformBinaryReturnsBoolWithCorrectMean) {
   EXPECT_NEAR(p_hat, 0.5, 0.02);  // 10 se threshold
 }
 
+TEST(DetailRandom, UniformBinaryCorrectMeanMt1993764) {
+  std::mt19937_64 rng(RNG_TEST_SEED);
+  walnutpie::detail::Random<std::mt19937_64> r(rng);
+  int true_count = 0;
+  for (int i = 0; i < TEST_SIZE; ++i) {
+    if (r.uniform_binary()) {
+      ++true_count;
+    }
+  }
+  double p_hat = static_cast<double>(true_count) / TEST_SIZE;
+  EXPECT_NEAR(p_hat, 0.5, 0.02);
+}
+
 // standard_normal() method
+
+TEST(DetailRandom, StandardNormalScalarMeanAndVariance) {
+  std::mt19937_64 rng(RNG_TEST_SEED);
+  walnutpie::detail::Random<std::mt19937_64> r(rng);
+  double sum = 0.0, sum_sq = 0.0;
+  for (int i = 0; i < TEST_SIZE; ++i) {
+    double z = r.standard_normal();
+    sum += z;
+    sum_sq += z * z;
+  }
+  double mean = sum / TEST_SIZE;
+  double var = sum_sq / TEST_SIZE - mean * mean;
+  EXPECT_NEAR(mean, 0.0, 0.05);
+  EXPECT_NEAR(var, 1.0, 0.05);
+}
 
 TEST(DetailRandom, StandardNormalReturnMeanAndVariance) {
   std::mt19937 rng(RNG_TEST_SEED);
