@@ -923,7 +923,8 @@ class WalnutsSampler {
                  const Eigen::VectorXd& theta, const Eigen::VectorXd& inv_mass,
                  double macro_time, std::size_t max_nuts_depth,
                  std::size_t max_step_halvings, std::size_t min_micro_steps,
-                 double max_error)
+                 double max_error,
+                 const detail::DenseMetricTransform& transform = {})
       : rand_(rng),
         sample_handler_(sample_handler),
         logp_grad_(logp_grad, sample_handler),
@@ -944,6 +945,7 @@ class WalnutsSampler {
     detail::validate_positive(min_micro_steps, "min_micro_steps");
     detail::validate_positive(max_error, "max_error");
     logp_grad_(theta_, logp_, grad_);
+    logp_grad_.set_transform(transform);
   }
 
   /**
@@ -973,7 +975,18 @@ class WalnutsSampler {
                      max_nuts_depth_, max_step_halvings_, min_micro_steps_,
                      max_error_, std::move(theta_), depth, grad_, logp_,
                      workspace_, no_op_step_size_adapter_);
-    sample_handler_.get().on_sample(theta_, logp_);
+    if (logp_grad_.has_transform()) {
+      // The chain runs in reparametrized coordinates; the handler is promised
+      // positions of the target, so map back before reporting and keep the
+      // chain in its own coordinates.
+      detail::DenseMetricTransform t = logp_grad_.transform();
+      Eigen::VectorXd z = std::move(theta_);
+      t.forward(z, theta_);
+      sample_handler_.get().on_sample(theta_, logp_);
+      theta_ = std::move(z);
+    } else {
+      sample_handler_.get().on_sample(theta_, logp_);
+    }
     return logp_;
   }
 

@@ -563,6 +563,21 @@ class WarmupConfig {
   double max_macro_steps_target() const { return max_macro_steps_target_; }
 
   /**
+   * @brief Return whether to sample under a full-rank metric.
+   *
+   * @return `true` if a full-rank metric was requested.
+   */
+  bool metric_dense() const { return metric_dense_; }
+
+  /**
+   * @brief Return the correlation above which a full-rank metric is used.
+   *
+   * @return The screening threshold on the largest absolute off-diagonal
+   * correlation of the estimated covariance.
+   */
+  double metric_dense_min_corr() const { return metric_dense_min_corr_; }
+
+  /**
    * @brief Return the target acceptance rate.
    *
    * @return The target acceptance rate.
@@ -630,6 +645,8 @@ class WarmupConfig {
   double mass_init_count_ = 4.0;
   double mass_additive_smoothing_ = 1e-5;
   double max_macro_steps_target_ = 15.0;
+  bool metric_dense_ = false;
+  double metric_dense_min_corr_ = 0.3;
   double step_accept_rate_target_ = 0.8;
   double step_learning_rate_ = 0.05;
   double step_gradient_decay_ = 0.8;
@@ -711,6 +728,41 @@ class WarmupConfigBuilder {
    * @return This builder for chaining.
    * @throw std::invalid_argument If the smoothing is not finite and positive.
    */
+  /**
+   * @brief Sample under a full-rank metric estimated during warmup instead of
+   * a diagonal one.
+   *
+   * A diagonal metric is the right choice unless the target's coordinates are
+   * correlated, which it cannot represent at all. For an AR(1) target with
+   * correlation 0.99 in 100 dimensions a diagonal metric reaches about 1% of
+   * the effective sample size per draw that a full-rank metric reaches.
+   *
+   * The cost is a triangular solve on every log density evaluation, so this
+   * is off by default and, even when requested, is only applied if the
+   * estimated covariance is correlated enough to be worth it.
+   *
+   * @param[in] v `true` to sample under a full-rank metric.
+   * @return This builder for chaining.
+   */
+  WarmupConfigBuilder& metric_dense(bool v) {
+    cfg_.metric_dense_ = v;
+    return *this;
+  }
+
+  /**
+   * @brief Set the correlation above which a requested full-rank metric is
+   * used.
+   *
+   * @param[in] v The screening threshold, in `[0, 1]`.
+   * @return This builder for chaining.
+   * @throw std::invalid_argument If `v` is not finite and in `[0, 1]`.
+   */
+  WarmupConfigBuilder& metric_dense_min_corr(double v) {
+    detail::validate_finite_positive(v, "metric_dense_min_corr");
+    cfg_.metric_dense_min_corr_ = v;
+    return *this;
+  }
+
   WarmupConfigBuilder& mass_additive_smoothing(double v) {
     detail::validate_finite_positive(v, "mass_additive_smoothing");
     cfg_.mass_additive_smoothing_ = v;
@@ -931,6 +983,12 @@ class SamplingConfig {
    * @return The minimum number of micro steps per macro step.
    */
   std::size_t min_micro_steps() const noexcept { return min_micro_steps_; }
+
+  /**
+   * @brief Return whether to sample under a full-rank metric.
+   *
+   * @return `true` if a full-rank metric was requested.
+   */
 
   /**
    * @brief Return the convergence tolerance for the R-hat statistic.

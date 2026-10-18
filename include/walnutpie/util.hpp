@@ -14,6 +14,7 @@
 #include <Eigen/Dense>
 
 #include "walnutpie/concepts.hpp"
+#include "walnutpie/dense_metric.hpp"
 
 namespace walnutpie::detail {
 
@@ -401,6 +402,37 @@ class NoExceptLogpGrad {
       : logp_grad_(std::cref(logp_grad)), handler_(handler) {}
 
   /**
+   * @brief Sample under a full-rank metric instead of a diagonal one.
+   *
+   * The chain then runs in coordinates `z` related to the target by
+   * `theta = L z`, which makes the target isotropic while leaving the
+   * sampler's own metric and its cost per leapfrog step unchanged. The extra
+   * cost is the triangular solve performed here on every log density
+   * evaluation, so this is only worth enabling when the gradient is expensive
+   * relative to the square of the dimensionality.
+   *
+   * The transform is installed once, before sampling starts, so this is
+   * `const` in the same sense as the callback the wrapper holds.
+   *
+   * @param[in] transform The reparametrization. An inactive transform, which
+   * is the default, leaves the chain in the target's own coordinates.
+   */
+  void set_transform(const DenseMetricTransform& transform) const {
+    transform_ = transform;
+  }
+
+  /**
+   * @brief Return `true` if this functor evaluates in reparametrized
+   * coordinates.
+   */
+  bool has_transform() const noexcept { return transform_.active(); }
+
+  /**
+   * @brief Return the reparametrization in use.
+   */
+  const DenseMetricTransform& transform() const noexcept { return transform_; }
+
+  /**
    * @brief Given the specified position, set the log density and
    * gradient.
    *
@@ -411,7 +443,16 @@ class NoExceptLogpGrad {
   void operator()(const Eigen::VectorXd& x, double& logp,
                   Eigen::VectorXd& grad) const noexcept {
     try {
-      logp_grad_.get()(x, logp, grad);
+      if (!transform_.active()) {
+        logp_grad_.get()(x, logp, grad);
+        return;
+      }
+      // theta = L z, then chain the gradient back through L'.
+      transform_.forward(x, theta_);
+      double logp_theta;
+      logp_grad_.get()(theta_, logp_theta, grad_theta_);
+      logp = logp_theta + transform_.log_determinant();
+      transform_.backward(grad_theta_, grad);
     } catch (const std::exception& e) {
       handler_.get().on_logp_exception(x, e);
       // logp_grad failure equivalent to -inf log density
@@ -423,6 +464,16 @@ class NoExceptLogpGrad {
   /** The log density and gradient function. */
   const std::reference_wrapper<const F> logp_grad_;
   const std::reference_wrapper<H> handler_;
+
+ private:
+  /** The reparametrization, inactive by default. */
+  mutable DenseMetricTransform transform_;
+
+  /** Scratch for the target coordinates. */
+  mutable Eigen::VectorXd theta_;
+
+  /** Scratch for the gradient with respect to the target coordinates. */
+  mutable Eigen::VectorXd grad_theta_;
 };
 
 /**

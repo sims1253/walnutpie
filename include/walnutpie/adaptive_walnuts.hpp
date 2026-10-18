@@ -12,6 +12,7 @@
 #include "walnutpie/adam.hpp"
 #include "walnutpie/concepts.hpp"
 #include "walnutpie/config.hpp"
+#include "walnutpie/dense_metric.hpp"
 #include "walnutpie/online_moments.hpp"
 #include "walnutpie/util.hpp"
 #include "walnutpie/walnuts.hpp"
@@ -205,6 +206,7 @@ class AdaptiveWalnuts {
                   const WarmupConfig& warmup_cfg,
                   const SamplingConfig& sampling_cfg)
       : sampling_cfg_(sampling_cfg),
+        warmup_cfg_(warmup_cfg),
         rand_(rng),
         handler_(handler),
         logp_grad_(logp_grad, handler),
@@ -218,6 +220,9 @@ class AdaptiveWalnuts {
               warmup_cfg.step_stabilization(),
               warmup_cfg.step_learn_rate_decay()),
         mass_estimator_(warmup_cfg, init_chain_cfg),
+        dense_estimator_(
+            init_chain_cfg.position().size(),
+            static_cast<std::size_t>(warmup_cfg.mass_init_count())),
         min_micro_estimator_(warmup_cfg.max_macro_steps_target(),
                              sampling_cfg.min_micro_steps()) {
     logp_grad_(theta_, logp_, grad_);
@@ -244,6 +249,9 @@ class AdaptiveWalnuts {
                      sampling_cfg_.max_hamiltonian_error(), std::move(theta_),
                      depth, grad_, logp_, workspace_, adam_);
     mass_estimator_.observe(theta_, grad_, iteration_);
+    if (warmup_cfg_.metric_dense()) {
+      dense_estimator_.observe(theta_);
+    }
     min_micro_estimator_.observe(1 << depth);
     handler_.get().on_warmup(theta_, logp_, step_size(), inv_mass);
     ++iteration_;
@@ -260,13 +268,53 @@ class AdaptiveWalnuts {
    * @return The Walnuts sampler with current tuning parameter estimates.
    */
   WalnutsSampler<F, RNG, H> sampler() {
-    handler_.get().on_warmup_complete(step_size(), inv_mass());
+    detail::DenseMetricTransform transform;
+    Eigen::VectorXd start = theta_;
+    Eigen::VectorXd mass = inv_mass();
+    double step = step_size();
+    detail::NoExceptLogpGrad<F, H> logp_grad = logp_grad_;
+    if (const detail::DenseMetricTransform* t = dense_transform()) {
+      transform = *t;
+      t->inverse(theta_, start);
+      // The target is isotropic in the reparametrized coordinates, so the mass
+      // matrix adapted in the target's own coordinates does not apply, and the
+      // step size has to be found again.  The search must run through the
+      // reparametrized log density, since `start` is in those coordinates.
+      logp_grad.set_transform(transform);
+      mass = Eigen::VectorXd::Ones(start.size());
+      step = detail::adapt_step(rand_.rng(), logp_grad, start, mass, step,
+                                static_cast<std::size_t>(start.size()));
+    }
+    handler_.get().on_warmup_complete(step, mass);
     return WalnutsSampler<F, RNG, H>(
-        rand_.rng(), handler_, logp_grad_.logp_grad_, theta_, inv_mass(),
-        step_size(), sampling_cfg_.max_trajectory_doublings(),
+        rand_.rng(), handler_, logp_grad_.logp_grad_, start, mass, step,
+        sampling_cfg_.max_trajectory_doublings(),
         sampling_cfg_.max_step_halvings(),
         min_micro_estimator_.min_micro_steps(),
-        sampling_cfg_.max_hamiltonian_error());
+        sampling_cfg_.max_hamiltonian_error(), transform);
+  }
+
+  /**
+   * @brief Return the full-rank reparametrization to sample under, if the
+   * estimated covariance is correlated enough to be worth the cost.
+   *
+   * @return The reparametrization, or `nullptr` to keep the diagonal metric.
+   */
+  const detail::DenseMetricTransform* dense_transform() const {
+    if (!warmup_cfg_.metric_dense()) {
+      return nullptr;
+    }
+    if (dense_estimator_.max_abs_correlation() <
+        warmup_cfg_.metric_dense_min_corr()) {
+      return nullptr;
+    }
+    bool ok = false;
+    const Eigen::MatrixXd L = dense_estimator_.cholesky(1.0, &ok);
+    if (!ok) {
+      return nullptr;
+    }
+    transform_cache_ = detail::DenseMetricTransform(L);
+    return &transform_cache_;
   }
 
   /**
@@ -332,6 +380,9 @@ class AdaptiveWalnuts {
   /** The Walnuts sampler configuration. */
   SamplingConfig sampling_cfg_;
 
+  /** The warmup configuration. */
+  WarmupConfig warmup_cfg_;
+
   /** The random number generator required for Nuts. */
   detail::Random<RNG> rand_;
 
@@ -340,6 +391,12 @@ class AdaptiveWalnuts {
 
   /** The target log density/gradient function. */
   const detail::NoExceptLogpGrad<F, H> logp_grad_;
+
+  /** The full-rank covariance estimator, used when a dense metric is on. */
+  detail::DenseMetricEstimator dense_estimator_;
+
+  /** Storage for the reparametrization returned by `dense_transform()`. */
+  mutable detail::DenseMetricTransform transform_cache_;
 
   /** The preallocated storage for trajectory construction. */
   detail::SpanWorkspace workspace_;
