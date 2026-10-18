@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <random>
 #include <utility>
 #include <vector>
@@ -215,7 +216,7 @@ TEST(WarmupConfig, DenseMetricIsOffByDefault) {
   const auto cfg = walnutpie::WarmupConfigBuilder().build();
   EXPECT_FALSE(cfg.metric_dense());
   EXPECT_DOUBLE_EQ(cfg.metric_dense_min_corr(), 0.3);
-  EXPECT_EQ(cfg.metric_dense_min_obs(), 4u);
+  EXPECT_EQ(cfg.metric_dense_min_obs(), 10u);
   EXPECT_DOUBLE_EQ(cfg.metric_dense_max_agreement(), 0.5);
 }
 
@@ -230,6 +231,8 @@ TEST(WarmupConfig, DenseMetricScreeningIsConfigurable) {
   EXPECT_DOUBLE_EQ(cfg.metric_dense_min_corr(), 0.8);
   EXPECT_EQ(cfg.metric_dense_min_obs(), 10u);
   EXPECT_DOUBLE_EQ(cfg.metric_dense_max_agreement(), 0.25);
+  EXPECT_THROW(walnutpie::WarmupConfigBuilder().metric_dense_min_obs(0u),
+               std::invalid_argument);
   EXPECT_THROW(
       walnutpie::WarmupConfigBuilder().metric_dense_max_agreement(-1.0),
       std::invalid_argument);
@@ -388,4 +391,46 @@ TEST(DenseMetricIntegration, DrawsStillHaveTheTargetsCovariance) {
       Eigen::MatrixXd(centred.transpose() * centred / double(draws.rows() - 1));
   EXPECT_LT(mean.norm(), 0.1);
   EXPECT_LT((sample_cov - cov).cwiseAbs().maxCoeff(), 0.1);
+}
+
+TEST(WarmupConfig, WarmupFloorRisesToSupplyARequestedFullRankMetric) {
+  // Without a request, warmup stops at min_iter however the target looks.
+  const auto plain =
+      walnutpie::WarmupConfigBuilder().min_max_iter(50, 1000).build();
+  EXPECT_EQ(plain.min_iter_for(100), 50u);
+  EXPECT_EQ(plain.min_iter_for(10000), 50u);
+
+  // With one, warmup collects the draws the estimator needs: a covariance has
+  // one entry per pair of coordinates.
+  const auto dense = walnutpie::WarmupConfigBuilder()
+                         .min_max_iter(50, 1000)
+                         .metric_dense(true)
+                         .build();
+  EXPECT_EQ(dense.min_iter_for(100), 1000u);
+  EXPECT_EQ(dense.min_iter_for(3), 50u);
+
+  // But never past the configured maximum, or warmup could not terminate.
+  const auto short_budget = walnutpie::WarmupConfigBuilder()
+                                .min_max_iter(50, 300)
+                                .metric_dense(true)
+                                .build();
+  EXPECT_EQ(short_budget.min_iter_for(100), 300u);
+
+  // A user who asks for a stricter estimate gets a longer warmup.
+  const auto strict = walnutpie::WarmupConfigBuilder()
+                          .min_max_iter(50, 100000)
+                          .metric_dense(true)
+                          .metric_dense_min_obs(40u)
+                          .build();
+  EXPECT_EQ(strict.min_iter_for(100), 4000u);
+}
+
+TEST(WarmupConfig, HugeDimensionalityCannotOverflowTheWarmupFloor) {
+  const auto dense = walnutpie::WarmupConfigBuilder()
+                         .min_max_iter(50, 1000)
+                         .metric_dense(true)
+                         .build();
+  EXPECT_EQ(dense.min_iter_for(std::numeric_limits<std::size_t>::max()), 1000u);
+  EXPECT_EQ(dense.min_iter_for(std::numeric_limits<std::size_t>::max() / 4),
+            1000u);
 }
