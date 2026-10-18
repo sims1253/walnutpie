@@ -308,10 +308,133 @@ TEST(InitConfigBuilder, VectorMassesSetsPerChain) {
   }
 }
 
+TEST(InitConfigBuilder, GradientMassesThrowOnNonfiniteEvaluation) {
+  const Eigen::VectorXd kept_mass = Eigen::VectorXd::Constant(2, 7.0);
+  for (double bad : {std::numeric_limits<double>::quiet_NaN(),
+                     std::numeric_limits<double>::infinity(),
+                     -std::numeric_limits<double>::infinity()}) {
+    for (int index : {0, 1}) {
+      walnutpie::InitConfigBuilder b(2, 2);
+      b.positions(Eigen::VectorXd::Ones(2))
+          .masses(Eigen::VectorXd::Constant(2, 7.0))
+          .step_sizes(0.25);
+      int calls = 0;
+      auto bad_lp = [&](const Eigen::VectorXd&, double& lp,
+                        Eigen::VectorXd& g) {
+        lp = ++calls == 2 ? bad : 0.0;
+        g = Eigen::VectorXd::Constant(2, 3.0);
+      };
+      try {
+        b.masses(bad_lp, 0.1);
+        FAIL() << "expected rejection";
+      } catch (const std::invalid_argument& e) {
+        EXPECT_STREQ(
+            e.what(),
+            "initial evaluation for chain 1 log density must be finite");
+      }
+      EXPECT_EQ(calls, 2);
+      walnutpie::InitConfig probe = walnutpie::InitConfigBuilder(b).build();
+      expect_near(probe.mass(0), kept_mass);
+      expect_near(probe.mass(1), kept_mass);
+
+      calls = 0;
+      auto bad_grad = [&](const Eigen::VectorXd&, double& lp,
+                          Eigen::VectorXd& g) {
+        lp = 0.0;
+        g = Eigen::VectorXd::Constant(2, 3.0);
+        if (++calls == 2) {
+          g[index] = bad;
+        }
+      };
+      try {
+        b.masses(bad_grad, 0.1);
+        FAIL() << "expected rejection";
+      } catch (const std::invalid_argument& e) {
+        EXPECT_EQ(std::string(e.what()),
+                  "initial evaluation for chain 1 gradient[" +
+                      std::to_string(index) + "] must be finite");
+      }
+      EXPECT_EQ(calls, 2);
+      probe = walnutpie::InitConfigBuilder(b).build();
+      expect_near(probe.mass(0), kept_mass);
+      expect_near(probe.mass(1), kept_mass);
+    }
+  }
+}
+
 TEST(InitConfigBuilder, VectorMassesThrowsOnWrongNumberOfChains) {
   walnutpie::InitConfigBuilder b(3, 2);
   std::vector<Eigen::VectorXd> wrong_chains(2, Eigen::VectorXd::Ones(2));
   EXPECT_THROW(b.masses(wrong_chains), std::invalid_argument);
+}
+
+TEST(InitConfigBuilder, GradientMassesThrowOnWrongGradientSize) {
+  const Eigen::VectorXd kept_mass = Eigen::VectorXd::Constant(2, 7.0);
+  for (int size : {0, 1, 3}) {
+    walnutpie::InitConfigBuilder b(2, 2);
+    b.positions(Eigen::VectorXd::Ones(2))
+        .masses(Eigen::VectorXd::Constant(2, 7.0))
+        .step_sizes(0.25);
+    int calls = 0;
+    auto wrong_size = [&](const Eigen::VectorXd&, double& lp,
+                          Eigen::VectorXd& g) {
+      lp = 0.0;
+      g = Eigen::VectorXd::Ones(++calls == 2 ? size : 2);
+    };
+    try {
+      b.masses(wrong_size, 0.1);
+      FAIL() << "expected rejection";
+    } catch (const std::invalid_argument& e) {
+      EXPECT_STREQ(
+          e.what(),
+          "initial evaluation for chain 1 gradient size must match dims");
+    }
+    EXPECT_EQ(calls, 2);
+    auto kept = b.build();
+    expect_near(kept.mass(0), kept_mass);
+    expect_near(kept.mass(1), kept_mass);
+  }
+}
+
+TEST(InitConfigBuilder, GradientMassesRetryAfterEvaluationFailure) {
+  const Eigen::VectorXd kept_mass = Eigen::VectorXd::Constant(2, 7.0);
+  for (bool average : {false, true}) {
+    walnutpie::InitConfigBuilder b(2, 2);
+    b.positions(Eigen::VectorXd::Ones(2))
+        .masses(Eigen::VectorXd::Constant(2, 7.0))
+        .step_sizes(0.25);
+    int calls = 0;
+    auto failing = [&](const Eigen::VectorXd&, double& lp, Eigen::VectorXd& g) {
+      if (++calls == 2) {
+        throw std::runtime_error("sentinel");
+      }
+      lp = 0.0;
+      g = Eigen::VectorXd::Zero(2);
+    };
+    EXPECT_THROW(b.masses(failing, 0.1, average), std::runtime_error);
+    walnutpie::InitConfig probe = walnutpie::InitConfigBuilder(b).build();
+    expect_near(probe.mass(0), kept_mass);
+    expect_near(probe.mass(1), kept_mass);
+    calls = 0;
+    auto good = [&](const Eigen::VectorXd&, double& lp, Eigen::VectorXd& g) {
+      lp = 0.0;
+      g = Eigen::VectorXd::Zero(2);
+      if (++calls == 2) {
+        g[1] = -3.0;
+      } else {
+        g[1] = 5.0;
+      }
+    };
+    walnutpie::InitConfig cfg = b.masses(good, 0.1, average).build();
+    Eigen::VectorXd m0(2), m1(2);
+    m0 << 0.1, 0.9 * 5.0 + 0.1;
+    m1 << 0.1, 0.9 * 3.0 + 0.1;
+    if (average) {
+      m0[1] = m1[1] = std::sqrt(m0[1] * m1[1]);
+    }
+    expect_near(cfg.mass(0), m0);
+    expect_near(cfg.mass(1), m1);
+  }
 }
 
 TEST(InitConfigBuilder, VectorMassesThrowsOnWrongDims) {
