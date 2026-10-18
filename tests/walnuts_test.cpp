@@ -4,11 +4,14 @@
 #include <walnutpie/config.hpp>
 #include <walnutpie/walnuts.hpp>
 
+#include "test_util.hpp"
+
 #include <cmath>
 #include <deque>
 #include <limits>
 #include <stdexcept>
 #include <random>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -41,6 +44,24 @@ bool take_macro_step(const F& logp_grad, A& adapter,
   return walnutpie::detail::macro_step<D>(
       logp_grad, Eigen::VectorXd::Ones(1), 1.0, max_halvings, 1, 1.0, span,
       theta, rho, grad, logp_pos, logp, workspace, adapter);
+}
+
+// Reference leapfrog that copies its initial state, as the integrators
+// did before the first step was fused into the prologue.
+template <typename F>
+std::tuple<Eigen::VectorXd, Eigen::VectorXd, Eigen::VectorXd, double> leapfrog(
+    const F& logp_grad, const Eigen::VectorXd& inv_mass, double step,
+    std::size_t num_steps, Eigen::VectorXd theta, Eigen::VectorXd rho,
+    Eigen::VectorXd grad) {
+  double logp_pos = 0.0;
+  double half_step = 0.5 * step;
+  for (std::size_t n = 0; n < num_steps; ++n) {
+    rho += half_step * grad;
+    theta.array() += step * inv_mass.array() * rho.array();
+    logp_grad(theta, logp_pos, grad);
+    rho += half_step * grad;
+  }
+  return {theta, rho, grad, logp_pos};
 }
 
 template <typename F>
@@ -126,6 +147,82 @@ TEST(MacroStepAdaptation, ConservedEnergyKeepsUnitAcceptance) {
   RecordingAdapter adapter;
   EXPECT_TRUE(take_macro_step<Direction::Forward>(target, adapter));
   EXPECT_EQ(adapter.observed, std::vector<double>{1.0});
+}
+
+TEST(WithinTolerance, MatchesCopiedLeapfrogWithAndWithoutReversal) {
+  Eigen::VectorXd inv_mass(2), theta(2), rho(2), grad(2);
+  inv_mass << 2.0, 0.5;
+  theta << 0.3, -0.7;
+  rho << 1.2, 0.4;
+  double logp_pos;
+  gaussian(theta, logp_pos, grad);
+  double logp =
+      logp_pos - 0.5 * (inv_mass.array() * rho.array().square()).sum();
+  Eigen::VectorXd theta0 = theta, rho0 = rho, grad0 = grad;
+  for (bool reverse_rho : {false, true}) {
+    for (std::size_t num_steps : {std::size_t{1}, std::size_t{4}}) {
+      // Poison the outputs: the fused first step must not read them.
+      double nan = std::numeric_limits<double>::quiet_NaN();
+      Eigen::VectorXd theta_next = Eigen::VectorXd::Constant(2, nan);
+      Eigen::VectorXd rho_next = Eigen::VectorXd::Constant(2, nan);
+      Eigen::VectorXd grad_next = Eigen::VectorXd::Constant(2, nan);
+      EXPECT_TRUE(walnutpie::detail::within_tolerance(
+          gaussian, inv_mass, 0.1, num_steps, 1e9, logp, theta, rho, reverse_rho,
+          grad, theta_next, rho_next, grad_next));
+      auto [theta_ref, rho_ref, grad_ref, logp_ref] =
+          leapfrog(gaussian, inv_mass, 0.1, num_steps, theta,
+                   reverse_rho ? Eigen::VectorXd(-rho) : rho, grad);
+      (void)logp_ref;
+      expect_near(theta_next, theta_ref, 1e-12);
+      expect_near(rho_next, rho_ref, 1e-12);
+      expect_near(grad_next, grad_ref, 1e-12);
+      EXPECT_TRUE(theta == theta0 && rho == rho0 && grad == grad0);
+    }
+  }
+  Eigen::VectorXd theta_next(2), rho_next(2), grad_next(2);
+  EXPECT_FALSE(walnutpie::detail::within_tolerance(
+      gaussian, inv_mass, 0.5, 4, 1e-12, logp, theta, rho, false, grad,
+      theta_next, rho_next, grad_next));
+}
+
+TEST(MacroStep, MatchesCopiedLeapfrogInBothDirections) {
+  Eigen::VectorXd inv_mass(2), theta(2), rho(2), grad(2);
+  inv_mass << 2.0, 0.5;
+  theta << 0.3, -0.7;
+  rho << 1.2, 0.4;
+  double logp_pos;
+  gaussian(theta, logp_pos, grad);
+  double logp =
+      logp_pos - 0.5 * (inv_mass.array() * rho.array().square()).sum();
+  walnutpie::detail::SpanWorkspace workspace(2, 0);
+  SpanW& span = workspace.span(0, 0);
+  span.init_from(Eigen::VectorXd(theta), Eigen::VectorXd(rho),
+                 Eigen::VectorXd(grad), logp_pos, logp);
+  for (double step : {0.1, -0.1}) {
+    double nan = std::numeric_limits<double>::quiet_NaN();
+    Eigen::VectorXd theta_next = Eigen::VectorXd::Constant(2, nan);
+    Eigen::VectorXd rho_next = Eigen::VectorXd::Constant(2, nan);
+    Eigen::VectorXd grad_next = Eigen::VectorXd::Constant(2, nan);
+    double logp_pos_next = nan, logp_next = nan;
+    walnutpie::detail::NoOpStepSizeAdapter adapter;
+    bool ok;
+    if (step > 0) {
+      ok = walnutpie::detail::macro_step<Direction::Forward>(
+          gaussian, inv_mass, step, 1, 4, 1.0, span, theta_next, rho_next,
+          grad_next, logp_pos_next, logp_next, workspace, adapter);
+    } else {
+      ok = walnutpie::detail::macro_step<Direction::Backward>(
+          gaussian, inv_mass, -step, 1, 4, 1.0, span, theta_next, rho_next,
+          grad_next, logp_pos_next, logp_next, workspace, adapter);
+    }
+    EXPECT_TRUE(ok);
+    auto [theta_ref, rho_ref, grad_ref, logp_pos_ref] =
+        leapfrog(gaussian, inv_mass, step, 4, theta, rho, grad);
+    expect_near(theta_next, theta_ref, 1e-12);
+    expect_near(rho_next, rho_ref, 1e-12);
+    expect_near(grad_next, grad_ref, 1e-12);
+    EXPECT_NEAR(logp_pos_next, logp_pos_ref, 1e-12);
+  }
 }
 
 struct StopPolling {
