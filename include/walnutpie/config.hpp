@@ -701,7 +701,16 @@ class WarmupConfig {
   double mass_additive_smoothing_ = 1e-5;
   double max_macro_steps_target_ = 15.0;
   bool metric_dense_ = false;
-  double metric_dense_min_corr_ = 0.3;
+  // Halfway between the noise floor and the weakest real correlation.  The
+  // statistic is the largest absolute correlation over all pairs of
+  // coordinates, so on an uncorrelated target it is the largest of roughly
+  // dim^2/2 noise values.  Measured over sixteen seeds at the default six
+  // draws per coordinate, `std_normal` reaches 0.225 to 0.291 and
+  // `ill_normal` 0.218 to 0.300, while AR(1) targets start at 0.576.  The
+  // previous threshold of 0.3 sat inside that noise, with less than one part
+  // in a thousand of headroom on `ill_normal`, so a seed or two in a hundred
+  // would have let the metric onto a target with nothing to gain.
+  double metric_dense_min_corr_ = 0.45;
   // Six draws per coordinate.  Chosen as the smallest multiple at which the
   // screening still separates a correlated target from an uncorrelated one:
   // at four draws per coordinate the largest sample correlation between

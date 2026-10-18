@@ -215,7 +215,7 @@ TEST(DenseMetricTransform, RejectsNonSquareFactor) {
 TEST(WarmupConfig, DenseMetricIsOffByDefault) {
   const auto cfg = walnutpie::WarmupConfigBuilder().build();
   EXPECT_FALSE(cfg.metric_dense());
-  EXPECT_DOUBLE_EQ(cfg.metric_dense_min_corr(), 0.3);
+  EXPECT_DOUBLE_EQ(cfg.metric_dense_min_corr(), 0.45);
   EXPECT_EQ(cfg.metric_dense_min_obs(), 6u);
   EXPECT_DOUBLE_EQ(cfg.metric_dense_max_agreement(), 4.0);
 }
