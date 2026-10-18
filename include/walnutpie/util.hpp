@@ -339,11 +339,16 @@ double leapfrog_error(const F& logp_grad, const Eigen::VectorXd& theta,
  * step size, given an initial position and inverse mass matrix.
  *
  * The algorithm randomly generates a momentum. Then until
- * the Metropolis acceptance rate is below 0.9, it continues
- * to double the step size. Then until the Metropolis accept
- * rate is above 0.6, it continues to divide it by sqrt(2).
- * This is a slightly more fine-grained version of the heuristic
- * step size initialization used by Nuts.
+ * the acceptance statistic `exp(-|error|)` of a single leapfrog
+ * step is below 0.9, it continues to double the step size. Then
+ * until the statistic is above 0.6, it continues to divide it
+ * by sqrt(2). The absolute error matches the tolerance applied
+ * to leapfrog steps during sampling, so steps whose leapfrog
+ * gains a large amount of energy are also rejected. A non-finite
+ * error counts as an infinitely large error. Each phase is
+ * bounded so the search terminates even if the statistic never
+ * crosses its threshold. This is a slightly more fine-grained
+ * version of the heuristic step size initialization used by Nuts.
  *
  * There is no error testing here for consistency because this
  * function is called from a controlled setting.
@@ -367,12 +372,15 @@ double adapt_step(RNG& rng, const F& logp_grad, const Eigen::VectorXd& theta,
       (rand.standard_normal(static_cast<Eigen::Index>(D)).array() *
        M.array().sqrt())
           .matrix();
-  while (detail::leapfrog_error(logp_grad, theta, rho, inv_M, step) >
-         std::log(0.9)) {
+  auto log_accept = [&](double s) {
+    double error = detail::leapfrog_error(logp_grad, theta, rho, inv_M, s);
+    return std::isfinite(error) ? -std::abs(error)
+                                : -std::numeric_limits<double>::infinity();
+  };
+  for (std::size_t n = 0; n < 100 && log_accept(step) > std::log(0.9); ++n) {
     step *= 2;
   }
-  while (detail::leapfrog_error(logp_grad, theta, rho, inv_M, step) <
-         std::log(0.6)) {
+  for (std::size_t n = 0; n < 200 && log_accept(step) < std::log(0.6); ++n) {
     step *= std::sqrt(0.5);
   }
   return step;

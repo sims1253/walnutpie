@@ -182,6 +182,9 @@ inline AdaptResult controller_loop(
   Eigen::VectorXd geom_mean_mass(D);
   Eigen::VectorXd scratch_mass(D);
 
+  // A full-rank metric needs enough draws to fill a covariance matrix, so the
+  // floor rises to meet it when one has been requested.
+  const std::size_t required_iters = warmup_cfg.min_iter_for(D);
   std::size_t max_draws = M * warmup_cfg.max_iter();
   while (true) {
     bool achieved_min_draws = true;
@@ -192,7 +195,7 @@ inline AdaptResult controller_loop(
 
     for (std::size_t m = 0; m < M && achieved_min_draws; ++m) {
       latest[m] = buffers[m].read_latest();
-      if (latest[m].iter < warmup_cfg.min_iter()) {
+      if (latest[m].iter < required_iters) {
         achieved_min_draws = false;
       }
       num_draws += latest[m].iter;

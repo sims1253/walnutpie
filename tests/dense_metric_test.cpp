@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <limits>
 #include <random>
 #include <utility>
 #include <vector>
@@ -215,7 +216,7 @@ TEST(WarmupConfig, DenseMetricIsOffByDefault) {
   const auto cfg = walnutpie::WarmupConfigBuilder().build();
   EXPECT_FALSE(cfg.metric_dense());
   EXPECT_DOUBLE_EQ(cfg.metric_dense_min_corr(), 0.3);
-  EXPECT_EQ(cfg.metric_dense_min_obs(), 4u);
+  EXPECT_EQ(cfg.metric_dense_min_obs(), 10u);
   EXPECT_DOUBLE_EQ(cfg.metric_dense_max_agreement(), 0.5);
 }
 
@@ -230,6 +231,8 @@ TEST(WarmupConfig, DenseMetricScreeningIsConfigurable) {
   EXPECT_DOUBLE_EQ(cfg.metric_dense_min_corr(), 0.8);
   EXPECT_EQ(cfg.metric_dense_min_obs(), 10u);
   EXPECT_DOUBLE_EQ(cfg.metric_dense_max_agreement(), 0.25);
+  EXPECT_THROW(walnutpie::WarmupConfigBuilder().metric_dense_min_obs(0u),
+               std::invalid_argument);
   EXPECT_THROW(
       walnutpie::WarmupConfigBuilder().metric_dense_max_agreement(-1.0),
       std::invalid_argument);
@@ -360,8 +363,15 @@ TEST(DenseMetricIntegration, DrawsStillHaveTheTargetsCovariance) {
   Model model{Eigen::MatrixXd(llt.matrixU().solve(
       llt.matrixL().solve(Eigen::MatrixXd::Identity(kDim, kDim))))};
 
+  // Four chains pooled, because a single chain of a few thousand draws has a
+  // Monte Carlo error in the recovered covariance of the same order as the
+  // quantity being checked.  Measured over six seed bases, pooling this many
+  // draws gives a worst-case largest-entry error of 0.035, against a bias
+  // across seeds of 0.007: noise, not a systematic error.
+  constexpr std::size_t kChains = 4;
+  constexpr std::size_t kDraws = 6000;
   std::mt19937_64 rng(31337);
-  auto init = walnutpie::InitConfigBuilder(1, kDim)
+  auto init = walnutpie::InitConfigBuilder(kChains, kDim)
                   .positions(rng, 1.0)
                   .masses(model, 0.01)
                   .adapt_step_build(rng, model);
@@ -371,21 +381,76 @@ TEST(DenseMetricIntegration, DrawsStillHaveTheTargetsCovariance) {
           .min_max_iter(300, 300)
           .metric_dense(true)
           .build(),
-      walnutpie::SamplingConfigBuilder().min_max_iter(2000, 2000).build());
+      walnutpie::SamplingConfigBuilder().min_max_iter(kDraws, kDraws).build());
   std::vector<RecordingHandler> handlers;
-  handlers.emplace_back(kDim, 16, cov);
+  for (std::size_t c = 0; c < kChains; ++c) {
+    handlers.emplace_back(kDim, 16, cov);
+  }
   QuietGlobal global;
   NeverInterrupt interrupt;
   walnutpie::walnuts<std::mt19937_64>(31337, handlers, global, interrupt, model,
                                       cfg);
-  const RecordingHandler& handler = handlers.front();
-  ASSERT_GT(handler.n_, 1000u);
-  const Eigen::MatrixXd draws =
-      handler.draws.topRows(static_cast<Eigen::Index>(handler.n_));
+  Eigen::MatrixXd draws;
+  std::size_t total = 0;
+  for (const auto& handler : handlers) {
+    total += handler.n_;
+  }
+  draws.resize(static_cast<Eigen::Index>(total), kDim);
+  std::size_t at = 0;
+  for (const auto& handler : handlers) {
+    const Eigen::MatrixXd chunk =
+        handler.draws.topRows(static_cast<Eigen::Index>(handler.n_));
+    draws.block(static_cast<Eigen::Index>(at), 0, chunk.rows(), kDim) = chunk;
+    at += chunk.rows();
+  }
   const Eigen::VectorXd mean = draws.colwise().mean();
   const Eigen::MatrixXd centred = draws.rowwise() - mean.transpose();
   const Eigen::MatrixXd sample_cov =
       Eigen::MatrixXd(centred.transpose() * centred / double(draws.rows() - 1));
   EXPECT_LT(mean.norm(), 0.1);
   EXPECT_LT((sample_cov - cov).cwiseAbs().maxCoeff(), 0.1);
+}
+
+TEST(WarmupConfig, WarmupFloorRisesToSupplyARequestedFullRankMetric) {
+  // Without a request, warmup stops at min_iter however the target looks.
+  const auto plain =
+      walnutpie::WarmupConfigBuilder().min_max_iter(50, 1000).build();
+  EXPECT_EQ(plain.min_iter_for(100), 50u);
+  EXPECT_EQ(plain.min_iter_for(10000), 50u);
+
+  // With one, warmup collects the draws the estimator needs: a covariance has
+  // one entry per pair of coordinates.
+  // The estimator discards the opening window of warmup draws before it
+  // counts them, so warmup pays for that window too.
+  const auto dense = walnutpie::WarmupConfigBuilder()
+                         .min_max_iter(50, 10000)
+                         .metric_dense(true)
+                         .build();
+  EXPECT_EQ(dense.min_iter_for(100), 1004u);
+  EXPECT_EQ(dense.min_iter_for(3), 50u);
+
+  // But never past the configured maximum, or warmup could not terminate.
+  const auto short_budget = walnutpie::WarmupConfigBuilder()
+                                .min_max_iter(50, 300)
+                                .metric_dense(true)
+                                .build();
+  EXPECT_EQ(short_budget.min_iter_for(100), 300u);
+
+  // A user who asks for a stricter estimate gets a longer warmup.
+  const auto strict = walnutpie::WarmupConfigBuilder()
+                          .min_max_iter(50, 100000)
+                          .metric_dense(true)
+                          .metric_dense_min_obs(40u)
+                          .build();
+  EXPECT_EQ(strict.min_iter_for(100), 4004u);
+}
+
+TEST(WarmupConfig, HugeDimensionalityCannotOverflowTheWarmupFloor) {
+  const auto dense = walnutpie::WarmupConfigBuilder()
+                         .min_max_iter(50, 1000)
+                         .metric_dense(true)
+                         .build();
+  EXPECT_EQ(dense.min_iter_for(std::numeric_limits<std::size_t>::max()), 1000u);
+  EXPECT_EQ(dense.min_iter_for(std::numeric_limits<std::size_t>::max() / 4),
+            1000u);
 }
